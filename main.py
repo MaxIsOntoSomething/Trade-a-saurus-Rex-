@@ -10,7 +10,7 @@ from telegram.ext import Updater, CommandHandler
 from strategies.price_drop import PriceDropStrategy
 from utils.logger import setup_logger
 
-# Laden der Konfiguration aus der JSON-Datei
+# Load configuration from JSON file
 with open('config/config.json') as config_file:
     config = json.load(config_file)
 
@@ -43,10 +43,10 @@ class BinanceBot:
             for symbol in TRADING_SYMBOLS:
                 ticker = self.client.get_symbol_ticker(symbol=symbol)
                 price = ticker['price']
-                print(f"Verbindung erfolgreich. Aktueller Preis von {symbol}: {price}")
+                print(f"Connection successful. Current price of {symbol}: {price}")
         except Exception as e:
-            print(f"Fehler beim Testen der Verbindung: {str(e)}")
-            self.logger.error(f"Fehler beim Testen der Verbindung: {str(e)}")
+            print(f"Error testing connection: {str(e)}")
+            self.logger.error(f"Error testing connection: {str(e)}")
             raise
 
     def get_historical_data(self, symbol):
@@ -74,29 +74,29 @@ class BinanceBot:
                 )
                 self.total_bought[symbol] += quantity
                 self.total_spent[symbol] += quantity * float(price)
-                self.logger.info(f"KAUF-ORDER für {symbol}: {order}")
-                print(f"KAUF-ORDER für {symbol}: {order}")
-                self.telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"KAUF-ORDER für {symbol}: {order}")
+                self.logger.info(f"BUY ORDER for {symbol}: {order}")
+                print(f"BUY ORDER for {symbol}: {order}")
+                self.telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"BUY ORDER for {symbol}: {order}")
         except Exception as e:
-            self.logger.error(f"Fehler beim Ausführen des Handels für {symbol}: {str(e)}")
-            print(f"Fehler beim Ausführen des Handels für {symbol}: {str(e)}")
+            self.logger.error(f"Error executing trade for {symbol}: {str(e)}")
+            print(f"Error executing trade for {symbol}: {str(e)}")
 
     def fetch_current_price(self, symbol):
         try:
             ticker = self.client.get_symbol_ticker(symbol=symbol)
             current_price = ticker['price']
-            print(f"Aktueller Preis von {symbol}: {current_price}")
+            print(f"Current price of {symbol}: {current_price}")
         except Exception as e:
-            print(f"Fehler beim Abrufen des aktuellen Preises von {symbol}: {str(e)}")
-            self.logger.error(f"Fehler beim Abrufen des aktuellen Preises von {symbol}: {str(e)}")
+            print(f"Error fetching current price of {symbol}: {str(e)}")
+            self.logger.error(f"Error fetching current price of {symbol}: {str(e)}")
 
     def get_balance(self):
         try:
             balance = self.client.get_asset_balance(asset='USDT')
             return balance['free']
         except Exception as e:
-            print(f"Fehler beim Abrufen des Kontostands: {str(e)}")
-            self.logger.error(f"Fehler beim Abrufen des Kontostands: {str(e)}")
+            print(f"Error fetching balance: {str(e)}")
+            self.logger.error(f"Error fetching balance: {str(e)}")
             return None
 
     def get_profits(self):
@@ -109,28 +109,28 @@ class BinanceBot:
                 profits[symbol] = profit
             return profits
         except Exception as e:
-            print(f"Fehler beim Berechnen des Gewinns: {str(e)}")
-            self.logger.error(f"Fehler beim Berechnen des Gewinns: {str(e)}")
+            print(f"Error calculating profits: {str(e)}")
+            self.logger.error(f"Error calculating profits: {str(e)}")
             return None
 
     def handle_balance(self, update, context):
         balance = self.get_balance()
         if balance is not None:
-            update.message.reply_text(f"Aktueller Kontostand: {balance} USDT")
+            update.message.reply_text(f"Current balance: {balance} USDT")
         else:
-            update.message.reply_text("Fehler beim Abrufen des Kontostands.")
+            update.message.reply_text("Error fetching balance.")
 
     def handle_profits(self, update, context):
         profits = self.get_profits()
         if profits is not None:
             profit_message = "\n".join([f"{symbol}: {profit} USDT" for symbol, profit in profits.items()])
-            update.message.reply_text(f"Aktueller Gewinn:\n{profit_message}")
+            update.message.reply_text(f"Current profits:\n{profit_message}")
         else:
-            update.message.reply_text("Fehler beim Berechnen des Gewinns.")
+            update.message.reply_text("Error calculating profits.")
 
     def run(self):
-        fetch_price_interval = 20 * 60  # 20 Minuten in Sekunden
-        last_price_fetch_time = time.time() - fetch_price_interval  # Sicherstellen, dass der Preis sofort beim Start abgerufen wird
+        fetch_price_interval = 20 * 60  # 20 minutes in seconds
+        last_price_fetch_time = time.time() - fetch_price_interval  # Ensure the price is fetched immediately on start
 
         updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
         dispatcher = updater.dispatcher
@@ -147,24 +147,24 @@ class BinanceBot:
                     last_price_fetch_time = current_time
 
                 for symbol in TRADING_SYMBOLS:
-                    print(f"Abrufen historischer Daten für {symbol}...")
+                    print(f"Fetching historical data for {symbol}...")
                     historical_data = self.get_historical_data(symbol)
                     signal, price = self.strategy.generate_signal(historical_data)
                     
                     if signal:
-                        print(f"Signal generiert für {symbol}: {signal} zum Preis {price}")
+                        print(f"Signal generated for {symbol}: {signal} at price {price}")
                         self.execute_trade(symbol, signal, price)
-                        self.logger.info(f"Signal generiert für {symbol}: {signal} zum Preis {price}")
+                        self.logger.info(f"Signal generated for {symbol}: {signal} at price {price}")
                 
-                time.sleep(60)  # Jede Minute prüfen
+                time.sleep(60)  # Check every minute
                 
             except Exception as e:
-                self.logger.error(f"Fehler in der Hauptschleife: {str(e)}")
-                print(f"Fehler in der Hauptschleife: {str(e)}")
+                self.logger.error(f"Error in main loop: {str(e)}")
+                print(f"Error in main loop: {str(e)}")
                 time.sleep(60)
 
 if __name__ == "__main__":
-    use_testnet = input("Möchten Sie das Testnet verwenden? (ja/nein): ").strip().lower() == 'ja'
+    use_testnet = input("Do you want to use the testnet? (yes/no): ").strip().lower() == 'yes'
     bot = BinanceBot(use_testnet)
     bot.test_connection()
     bot.run()
