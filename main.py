@@ -7,9 +7,22 @@ import json
 import telegram
 from telegram.ext import Updater, CommandHandler
 
-from config.config import *
 from strategies.price_drop import PriceDropStrategy
 from utils.logger import setup_logger
+
+# Laden der Konfiguration aus der JSON-Datei
+with open('config/config.json') as config_file:
+    config = json.load(config_file)
+
+BINANCE_API_KEY = config['BINANCE_API_KEY']
+BINANCE_API_SECRET = config['BINANCE_API_SECRET']
+TESTNET_API_KEY = config['TESTNET_API_KEY']
+TESTNET_API_SECRET = config['TESTNET_API_SECRET']
+TRADING_SYMBOLS = config['TRADING_SYMBOLS']
+QUANTITY_PERCENTAGE = config['QUANTITY_PERCENTAGE']
+TIME_INTERVAL = config['TIME_INTERVAL']
+TELEGRAM_TOKEN = config['TELEGRAM_TOKEN']
+TELEGRAM_CHAT_ID = config['TELEGRAM_CHAT_ID']
 
 class BinanceBot:
     def __init__(self, use_testnet):
