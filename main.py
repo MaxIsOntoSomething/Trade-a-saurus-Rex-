@@ -23,13 +23,12 @@ BINANCE_API_SECRET = config['BINANCE_API_SECRET']
 TESTNET_API_KEY = config['TESTNET_API_KEY']
 TESTNET_API_SECRET = config['TESTNET_API_SECRET']
 TRADING_SYMBOLS = config['TRADING_SYMBOLS']
-QUANTITY_PERCENTAGE = config['QUANTITY_PERCENTAGE']
 TIME_INTERVAL = config['TIME_INTERVAL']
 TELEGRAM_TOKEN = config['TELEGRAM_TOKEN']
 TELEGRAM_CHAT_ID = config['TELEGRAM_CHAT_ID']
 
 class BinanceBot:
-    def __init__(self, use_testnet, use_telegram, drop_thresholds, order_type):
+    def __init__(self, use_testnet, use_telegram, drop_thresholds, order_type, use_percentage, trade_amount):
         if use_testnet:
             self.client = Client(TESTNET_API_KEY, TESTNET_API_SECRET, testnet=True)
             self.client.API_URL = 'https://testnet.binance.vision/api'
@@ -40,6 +39,8 @@ class BinanceBot:
         self.logger = setup_logger()
         self.use_telegram = use_telegram
         self.order_type = order_type
+        self.use_percentage = use_percentage
+        self.trade_amount = trade_amount
         if self.use_telegram:
             self.telegram_bot = telegram.Bot(token=TELEGRAM_TOKEN)
         
@@ -138,7 +139,13 @@ class BinanceBot:
             if available_balance < 100:
                 print(f"Insufficient balance to place order for {symbol}. Available balance: {available_balance} USDT")
                 return
-            quantity = 100 / current_price  # Use 100 USDT for each order
+            
+            if self.use_percentage:
+                trade_amount = available_balance * self.trade_amount
+            else:
+                trade_amount = self.trade_amount
+            
+            quantity = trade_amount / current_price  # Calculate quantity based on trade amount
             quantity = self.adjust_quantity(symbol, quantity)
             
             if self.order_type == "limit":
@@ -281,6 +288,11 @@ if __name__ == "__main__":
     num_thresholds = int(input("Enter the number of drop thresholds: ").strip())
     drop_thresholds = [float(input(f"Enter drop threshold {i+1} percentage (e.g., 1 for 1%): ").strip()) / 100 for i in range(num_thresholds)]
     order_type = input("Do you want to use limit orders or market orders? (limit/market): ").strip().lower()
-    bot = BinanceBot(use_testnet, use_telegram, drop_thresholds, order_type)
+    use_percentage = input("Do you want to use a percentage of USDT per trade? (yes/no): ").strip().lower() == 'yes'
+    if use_percentage:
+        trade_amount = float(input("Enter the percentage of USDT to use per trade (e.g., 10 for 10%): ").strip()) / 100
+    else:
+        trade_amount = float(input("Enter the amount of USDT to use per trade: ").strip())
+    bot = BinanceBot(use_testnet, use_telegram, drop_thresholds, order_type, use_percentage, trade_amount)
     bot.test_connection()
     bot.run()
