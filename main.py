@@ -6,9 +6,13 @@ import time
 import json
 import telegram
 from telegram.ext import Updater, CommandHandler
+from colorama import Fore, Style, init
 
 from strategies.price_drop import PriceDropStrategy
 from utils.logger import setup_logger
+
+# Initialize colorama
+init(autoreset=True)
 
 # Load configuration from JSON file
 with open('config/config.json') as config_file:
@@ -41,7 +45,7 @@ class BinanceBot:
             self.telegram_bot = telegram.Bot(token=TELEGRAM_TOKEN)
         
         self.last_order_time = {symbol: None for symbol in TRADING_SYMBOLS}
-        self.orders_placed_today = {symbol: 0 for symbol in TRADING_SYMBOLS}  # Track the number of orders placed today per symbol
+        self.orders_placed_today = {symbol: {threshold: False for threshold in drop_thresholds} for symbol in TRADING_SYMBOLS}  # Track the orders placed today per symbol per threshold
         self.lot_size_info = self.get_lot_size_info()
         self.total_bought = {symbol: 0 for symbol in TRADING_SYMBOLS}
         self.total_spent = {symbol: 0 for symbol in TRADING_SYMBOLS}
@@ -117,9 +121,9 @@ class BinanceBot:
     def print_balance_report(self):
         balance_report = self.get_balance()
         if balance_report:
-            print("Balance Report:")
+            print(Fore.BLUE + "Balance Report:")
             for asset, total in balance_report.items():
-                print(f"{asset}: {total}")
+                print(Fore.BLUE + f"{asset}: {total}")
             self.logger.info("Balance Report:")
             for asset, total in balance_report.items():
                 self.logger.info(f"{asset}: {total}")
@@ -156,10 +160,9 @@ class BinanceBot:
                     if order_status['status'] == 'FILLED':
                         self.total_bought[symbol] += quantity
                         self.total_spent[symbol] += quantity * current_price
-                        self.orders_placed_today[symbol] += 1  # Increment the count of orders placed today for the symbol
                         self.logger.info(f"BUY ORDER for {symbol}: {order}")
-                        print(f"BUY ORDER for {symbol}: {order}")
-                        print(f"Bought {quantity} {symbol.replace('USDT', '')}")
+                        print(Fore.GREEN + f"BUY ORDER for {symbol}: {order}")
+                        print(Fore.GREEN + f"Bought {quantity} {symbol.replace('USDT', '')}")
                         if self.use_telegram:
                             self.telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"BUY ORDER for {symbol}: {order}")
                         self.print_balance_report()  # Print balance report after each buy
@@ -176,10 +179,9 @@ class BinanceBot:
                 )
                 self.total_bought[symbol] += quantity
                 self.total_spent[symbol] += quantity * current_price
-                self.orders_placed_today[symbol] += 1  # Increment the count of orders placed today for the symbol
                 self.logger.info(f"BUY ORDER for {symbol}: {order}")
-                print(f"BUY ORDER for {symbol}: {order}")
-                print(f"Bought {quantity} {symbol.replace('USDT', '')}")
+                print(Fore.GREEN + f"BUY ORDER for {symbol}: {order}")
+                print(Fore.GREEN + f"Bought {quantity} {symbol.replace('USDT', '')}")
                 if self.use_telegram:
                     self.telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"BUY ORDER for {symbol}: {order}")
                 self.print_balance_report()  # Print balance report after each buy
@@ -214,7 +216,7 @@ class BinanceBot:
             update.message.reply_text("Error calculating profits.")
 
     def run(self):
-        fetch_price_interval = 24 * 60 * 60  # 24 hours in seconds
+        fetch_price_interval = 60  # Check every minute to catch flash trades
         last_price_fetch_time = time.time() - fetch_price_interval  # Ensure the price is fetched immediately on start
         next_daily_open_check = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
 
@@ -240,12 +242,12 @@ class BinanceBot:
                     self.print_daily_open_price()
                     next_daily_open_check += timedelta(days=1)
                     self.last_order_time = {symbol: None for symbol in TRADING_SYMBOLS}  # Reset last order time at 00:00 UTC
-                    self.orders_placed_today = {symbol: 0 for symbol in TRADING_SYMBOLS}  # Reset orders placed today count
+                    self.orders_placed_today = {symbol: {threshold: False for threshold in self.strategy.drop_thresholds} for symbol in TRADING_SYMBOLS}  # Reset orders placed today count
                     self.max_trades_executed = False  # Reset max trades executed flag
 
                 if not self.max_trades_executed:
                     for symbol in TRADING_SYMBOLS:
-                        if self.orders_placed_today[symbol] < self.max_orders_per_symbol:
+                        if any(not placed for placed in self.orders_placed_today[symbol].values()):
                             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                             print(f"[{timestamp}] Fetching historical data for {symbol}...")
                             historical_data = self.get_historical_data(symbol, TIME_INTERVAL, "1 day ago UTC")
@@ -253,11 +255,12 @@ class BinanceBot:
                             signals = self.strategy.generate_signals(historical_data['close'].astype(float).values, daily_open_price)
                             
                             for threshold, price in signals:
-                                if self.orders_placed_today[symbol] < self.max_orders_per_symbol:
+                                if not self.orders_placed_today[symbol][threshold]:
                                     print(f"Signal generated for {symbol} at threshold {threshold}: BUY at price {price}")
                                     self.execute_trade(symbol, price)
+                                    self.orders_placed_today[symbol][threshold] = True
                                     self.logger.info(f"Signal generated for {symbol} at threshold {threshold}: BUY at price {price}")
-                    self.max_trades_executed = all(self.orders_placed_today[symbol] >= self.max_orders_per_symbol for symbol in TRADING_SYMBOLS)
+                    self.max_trades_executed = all(all(placed for placed in self.orders_placed_today[symbol].values()) for symbol in TRADING_SYMBOLS)
                 else:
                     next_reset_time = next_daily_open_check - datetime.now(timezone.utc)
                     print(f"Max trades executed for the day. Next reset in {next_reset_time}.")

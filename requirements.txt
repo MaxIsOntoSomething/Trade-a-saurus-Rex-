@@ -3,3 +3,4 @@ pandas
 numpy
 python-telegram-bot
 mathploit
+colorama
