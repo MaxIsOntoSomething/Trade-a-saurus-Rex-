@@ -8,3 +8,6 @@
 2025-01-07 10:07:12,139 - Signal generated for BTCUSDT: BUY at price 101874.73
 2025-01-07 10:07:15,093 - Error executing trade for ETHUSDT: APIError(code=-1111): Parameter 'quantity' has too much precision.
 2025-01-07 10:07:15,093 - Signal generated for ETHUSDT: BUY at price 3674.44
+2025-01-07 10:11:42,969 - Daily open price for BTCUSDT at 00:00 UTC: 102235.6
+2025-01-07 10:11:43,472 - Daily open price for ETHUSDT at 00:00 UTC: 3687.44
+2025-01-07 10:11:43,729 - Error fetching balance: APIError(code=-2014): API-key format invalid.

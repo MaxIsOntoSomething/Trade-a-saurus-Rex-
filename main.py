@@ -41,7 +41,7 @@ class BinanceBot:
     def test_connection(self):
         try:
             for symbol in TRADING_SYMBOLS:
-                ticker = self.client.get_symbol_ticker(symbol=symbol)
+                ticker = self.client.get_symbol_ticker(symbol=symbol, recvWindow=5000)
                 price = ticker['price']
                 print(f"Connection successful. Current price of {symbol}: {price}")
         except Exception as e:
@@ -53,7 +53,8 @@ class BinanceBot:
         klines = self.client.get_historical_klines(
             symbol,
             interval,
-            start_str
+            start_str,
+            recvWindow=5000
         )
         df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_av', 'trades', 'tb_base_av', 'tb_quote_av', 'ignore'])
         return df
@@ -70,7 +71,7 @@ class BinanceBot:
 
     def get_balance(self):
         try:
-            balances = self.client.get_account()['balances']
+            balances = self.client.get_account(recvWindow=5000)['balances']
             balance_report = {}
             for balance in balances:
                 asset = balance['asset']
@@ -98,7 +99,7 @@ class BinanceBot:
     def execute_trade(self, symbol, signal, price):
         try:
             if signal == "BUY":
-                balance = self.client.get_asset_balance(asset='USDT')
+                balance = self.client.get_asset_balance(asset='USDT', recvWindow=5000)
                 available_balance = float(balance['free'])
                 quantity = (available_balance * QUANTITY_PERCENTAGE) / float(price)
                 quantity = round(quantity, 6)  # Round to 6 decimal places to avoid precision error
@@ -108,7 +109,8 @@ class BinanceBot:
                     type=ORDER_TYPE_LIMIT,
                     timeInForce=TIME_IN_FORCE_GTC,
                     quantity=quantity,
-                    price=str(price)
+                    price=str(price),
+                    recvWindow=5000
                 )
                 self.total_bought[symbol] += quantity
                 self.total_spent[symbol] += quantity * float(price)
@@ -123,7 +125,7 @@ class BinanceBot:
 
     def fetch_current_price(self, symbol):
         try:
-            ticker = self.client.get_symbol_ticker(symbol=symbol)
+            ticker = self.client.get_symbol_ticker(symbol=symbol, recvWindow=5000)
             current_price = ticker['price']
             print(f"Current price of {symbol}: {current_price}")
         except Exception as e:
