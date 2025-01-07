@@ -40,6 +40,8 @@ class BinanceBot:
         
         self.last_order_time = {symbol: None for symbol in TRADING_SYMBOLS}
         self.lot_size_info = self.get_lot_size_info()
+        self.total_bought = {symbol: 0 for symbol in TRADING_SYMBOLS}
+        self.total_spent = {symbol: 0 for symbol in TRADING_SYMBOLS}
 
     def get_lot_size_info(self):
         lot_size_info = {}
@@ -123,7 +125,10 @@ class BinanceBot:
             if signal == "BUY":
                 balance = self.client.get_asset_balance(asset='USDT', recvWindow=5000)
                 available_balance = float(balance['free'])
-                quantity = (available_balance * QUANTITY_PERCENTAGE) / float(price)
+                if available_balance < 100:
+                    print(f"Insufficient balance to place order for {symbol}. Available balance: {available_balance} USDT")
+                    return
+                quantity = 100 / float(price)  # Use 100 USDT for each order
                 quantity = self.adjust_quantity(symbol, quantity)
                 order = self.client.create_order(
                     symbol=symbol,
@@ -138,6 +143,7 @@ class BinanceBot:
                 self.total_spent[symbol] += quantity * float(price)
                 self.logger.info(f"BUY ORDER for {symbol}: {order}")
                 print(f"BUY ORDER for {symbol}: {order}")
+                print(f"Bought {quantity} {symbol.replace('USDT', '')}")
                 if self.use_telegram:
                     self.telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"BUY ORDER for {symbol}: {order}")
                 self.print_balance_report()  # Print balance report after each buy
