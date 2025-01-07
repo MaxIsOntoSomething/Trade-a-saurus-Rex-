@@ -87,7 +87,7 @@ class BinanceBot:
             interval,
             start_str
         )
-        df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'close_time', 'quote_av', 'trades', 'tb_base_av', 'tb_quote_av', 'ignore'])
+        df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_av', 'trades', 'tb_base_av', 'tb_quote_av', 'ignore'])
         return df
 
     def get_daily_open_price(self, symbol):
@@ -286,7 +286,15 @@ if __name__ == "__main__":
     use_testnet = input("Do you want to use the testnet? (yes/no): ").strip().lower() == 'yes'
     use_telegram = input("Do you want to use Telegram notifications? (yes/no): ").strip().lower() == 'yes'
     num_thresholds = int(input("Enter the number of drop thresholds: ").strip())
-    drop_thresholds = [float(input(f"Enter drop threshold {i+1} percentage (e.g., 1 for 1%): ").strip()) / 100 for i in range(num_thresholds)]
+    drop_thresholds = []
+    for i in range(num_thresholds):
+        while True:
+            threshold = float(input(f"Enter drop threshold {i+1} percentage (e.g., 1 for 1%): ").strip()) / 100
+            if i == 0 or threshold < drop_thresholds[-1]:
+                drop_thresholds.append(threshold)
+                break
+            else:
+                print(f"Threshold {i+1} must be lower than threshold {i}. Please enter a valid value.")
     order_type = input("Do you want to use limit orders or market orders? (limit/market): ").strip().lower()
     use_percentage = input("Do you want to use a percentage of USDT per trade? (yes/no): ").strip().lower() == 'yes'
     if use_percentage:
