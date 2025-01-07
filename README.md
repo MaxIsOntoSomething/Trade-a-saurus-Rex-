@@ -4,7 +4,7 @@
 
 - Python 3.7 or higher
 - A Binance account
-- A Telegram account for notifications
+- A Telegram account for notifications (optional)
 
 ### Installation
 
@@ -25,8 +25,11 @@
     pip install -r requirements.txt
     ```
 
-4. **Edit the configuration file**
-    Edit the file `config/config.json` and add your Binance and Telegram API keys:
+4. **Copy the configuration template and edit the configuration file**
+    ```sh
+    cp config/config_template.json config/config.json
+    ```
+    Edit the file [config.json](http://_vscodecontentref_/3) and add your Binance and Telegram API keys:
     ```json
     {
          "BINANCE_API_KEY": "YOUR_BINANCE_API_KEY",
@@ -51,7 +54,10 @@
 2. **Select Testnet or Live Network**
     When starting, you will be asked if you want to use the Testnet. Answer with `yes` or `no`.
 
-3. **Telegram commands**
+3. **Select Telegram notifications**
+    When starting, you will be asked if you want to use Telegram notifications. Answer with `yes` or `no`.
+
+4. **Telegram commands** (if Telegram is enabled)
     - `/balance`: Shows the current account balance.
     - `/profits`: Shows the current profits.
 

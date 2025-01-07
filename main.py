@@ -32,7 +32,7 @@ class BinanceBot:
         else:
             self.client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
         
-        self.strategy = PriceDropStrategy()
+        self.strategy = PriceDropStrategy(drop_threshold=0.05)  # Updated drop threshold to 5%
         self.logger = setup_logger()
         self.use_telegram = use_telegram
         if self.use_telegram:
@@ -49,14 +49,18 @@ class BinanceBot:
             self.logger.error(f"Error testing connection: {str(e)}")
             raise
 
-    def get_historical_data(self, symbol):
+    def get_historical_data(self, symbol, interval, start_str):
         klines = self.client.get_historical_klines(
             symbol,
-            Client.KLINE_INTERVAL_4HOUR,
-            "8 hours ago UTC"
+            interval,
+            start_str
         )
         df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_av', 'trades', 'tb_base_av', 'tb_quote_av', 'ignore'])
-        return df['close'].astype(float).values
+        return df
+
+    def get_daily_open_price(self, symbol):
+        df = self.get_historical_data(symbol, Client.KLINE_INTERVAL_1DAY, "1 day ago UTC")
+        return float(df['open'].iloc[-1])
 
     def execute_trade(self, symbol, signal, price):
         try:
@@ -150,8 +154,9 @@ class BinanceBot:
 
                 for symbol in TRADING_SYMBOLS:
                     print(f"Fetching historical data for {symbol}...")
-                    historical_data = self.get_historical_data(symbol)
-                    signal, price = self.strategy.generate_signal(historical_data)
+                    historical_data = self.get_historical_data(symbol, Client.KLINE_INTERVAL_4HOUR, "8 hours ago UTC")
+                    daily_open_price = self.get_daily_open_price(symbol)
+                    signal, price = self.strategy.generate_signal(historical_data['close'].astype(float).values, daily_open_price)
                     
                     if signal:
                         print(f"Signal generated for {symbol}: {signal} at price {price}")
