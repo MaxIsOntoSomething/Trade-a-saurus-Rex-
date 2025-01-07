@@ -41,7 +41,7 @@ class BinanceBot:
     def test_connection(self):
         try:
             for symbol in TRADING_SYMBOLS:
-                ticker = self.client.get_symbol_ticker(symbol=symbol, recvWindow=5000)
+                ticker = self.client.get_symbol_ticker(symbol=symbol)
                 price = ticker['price']
                 print(f"Connection successful. Current price of {symbol}: {price}")
         except Exception as e:
@@ -125,7 +125,7 @@ class BinanceBot:
 
     def fetch_current_price(self, symbol):
         try:
-            ticker = self.client.get_symbol_ticker(symbol=symbol, recvWindow=5000)
+            ticker = self.client.get_symbol_ticker(symbol=symbol)
             current_price = ticker['price']
             print(f"Current price of {symbol}: {current_price}")
         except Exception as e:

@@ -11,3 +11,4 @@
 2025-01-07 10:11:42,969 - Daily open price for BTCUSDT at 00:00 UTC: 102235.6
 2025-01-07 10:11:43,472 - Daily open price for ETHUSDT at 00:00 UTC: 3687.44
 2025-01-07 10:11:43,729 - Error fetching balance: APIError(code=-2014): API-key format invalid.
+2025-01-07 10:19:01,571 - Error testing connection: APIError(code=-1104): Not all sent parameters were read; read '1' parameter(s) but was sent '2'.
