@@ -211,7 +211,7 @@ class BinanceBot:
             update.message.reply_text("Error calculating profits.")
 
     def run(self):
-        fetch_price_interval = 20 * 60  # 20 minutes in seconds
+        fetch_price_interval = 24 * 60 * 60  # 24 hours in seconds
         last_price_fetch_time = time.time() - fetch_price_interval  # Ensure the price is fetched immediately on start
         next_daily_open_check = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
 
@@ -244,7 +244,7 @@ class BinanceBot:
                         if self.last_order_time[symbol] is None or (datetime.now(timezone.utc) - self.last_order_time[symbol]).days >= 1:
                             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                             print(f"[{timestamp}] Fetching historical data for {symbol}...")
-                            historical_data = self.get_historical_data(symbol, TIME_INTERVAL, "8 hours ago UTC")
+                            historical_data = self.get_historical_data(symbol, TIME_INTERVAL, "1 day ago UTC")
                             daily_open_price = self.get_daily_open_price(symbol)
                             signal, _ = self.strategy.generate_signal(historical_data['close'].astype(float).values, daily_open_price)
                             
