@@ -139,15 +139,23 @@ class BinanceBot:
                     price=str(price),
                     recvWindow=5000
                 )
-                self.total_bought[symbol] += quantity
-                self.total_spent[symbol] += quantity * float(price)
-                self.logger.info(f"BUY ORDER for {symbol}: {order}")
-                print(f"BUY ORDER for {symbol}: {order}")
-                print(f"Bought {quantity} {symbol.replace('USDT', '')}")
-                if self.use_telegram:
-                    self.telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"BUY ORDER for {symbol}: {order}")
-                self.print_balance_report()  # Print balance report after each buy
-                self.last_order_time[symbol] = datetime.now(timezone.utc)  # Update last order time
+                print(f"Limit order set at price {price}")
+                self.logger.info(f"Limit order set at price {price}")
+                # Wait for the order to be filled
+                while True:
+                    order_status = self.client.get_order(symbol=symbol, orderId=order['orderId'])
+                    if order_status['status'] == 'FILLED':
+                        self.total_bought[symbol] += quantity
+                        self.total_spent[symbol] += quantity * float(price)
+                        self.logger.info(f"BUY ORDER for {symbol}: {order}")
+                        print(f"BUY ORDER for {symbol}: {order}")
+                        print(f"Bought {quantity} {symbol.replace('USDT', '')}")
+                        if self.use_telegram:
+                            self.telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"BUY ORDER for {symbol}: {order}")
+                        self.print_balance_report()  # Print balance report after each buy
+                        self.last_order_time[symbol] = datetime.now(timezone.utc)  # Update last order time
+                        break
+                    time.sleep(1)  # Check order status every second
         except Exception as e:
             self.logger.error(f"Error executing trade for {symbol}: {str(e)}")
             print(f"Error executing trade for {symbol}: {str(e)}")
