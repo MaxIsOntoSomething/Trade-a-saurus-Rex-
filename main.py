@@ -25,7 +25,7 @@ TELEGRAM_TOKEN = config['TELEGRAM_TOKEN']
 TELEGRAM_CHAT_ID = config['TELEGRAM_CHAT_ID']
 
 class BinanceBot:
-    def __init__(self, use_testnet, use_telegram, drop_threshold):
+    def __init__(self, use_testnet, use_telegram, drop_threshold, order_type):
         if use_testnet:
             self.client = Client(TESTNET_API_KEY, TESTNET_API_SECRET, testnet=True)
             self.client.API_URL = 'https://testnet.binance.vision/api'
@@ -35,6 +35,7 @@ class BinanceBot:
         self.strategy = PriceDropStrategy(drop_threshold=drop_threshold)
         self.logger = setup_logger()
         self.use_telegram = use_telegram
+        self.order_type = order_type
         if self.use_telegram:
             self.telegram_bot = telegram.Bot(token=TELEGRAM_TOKEN)
         
@@ -130,32 +131,51 @@ class BinanceBot:
                     return
                 quantity = 100 / float(price)  # Use 100 USDT for each order
                 quantity = self.adjust_quantity(symbol, quantity)
-                order = self.client.create_order(
-                    symbol=symbol,
-                    side=SIDE_BUY,
-                    type=ORDER_TYPE_LIMIT,
-                    timeInForce=TIME_IN_FORCE_GTC,
-                    quantity=quantity,
-                    price=str(price),
-                    recvWindow=5000
-                )
-                print(f"Limit order set at price {price}")
-                self.logger.info(f"Limit order set at price {price}")
-                # Wait for the order to be filled
-                while True:
-                    order_status = self.client.get_order(symbol=symbol, orderId=order['orderId'])
-                    if order_status['status'] == 'FILLED':
-                        self.total_bought[symbol] += quantity
-                        self.total_spent[symbol] += quantity * float(price)
-                        self.logger.info(f"BUY ORDER for {symbol}: {order}")
-                        print(f"BUY ORDER for {symbol}: {order}")
-                        print(f"Bought {quantity} {symbol.replace('USDT', '')}")
-                        if self.use_telegram:
-                            self.telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"BUY ORDER for {symbol}: {order}")
-                        self.print_balance_report()  # Print balance report after each buy
-                        self.last_order_time[symbol] = datetime.now(timezone.utc)  # Update last order time
-                        break
-                    time.sleep(1)  # Check order status every second
+                
+                if self.order_type == "limit":
+                    order = self.client.create_order(
+                        symbol=symbol,
+                        side=SIDE_BUY,
+                        type=ORDER_TYPE_LIMIT,
+                        timeInForce=TIME_IN_FORCE_GTC,
+                        quantity=quantity,
+                        price=str(price),
+                        recvWindow=5000
+                    )
+                    print(f"Limit order set at price {price}")
+                    self.logger.info(f"Limit order set at price {price}")
+                    # Wait for the order to be filled
+                    while True:
+                        order_status = self.client.get_order(symbol=symbol, orderId=order['orderId'])
+                        if order_status['status'] == 'FILLED':
+                            self.total_bought[symbol] += quantity
+                            self.total_spent[symbol] += quantity * float(price)
+                            self.logger.info(f"BUY ORDER for {symbol}: {order}")
+                            print(f"BUY ORDER for {symbol}: {order}")
+                            print(f"Bought {quantity} {symbol.replace('USDT', '')}")
+                            if self.use_telegram:
+                                self.telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"BUY ORDER for {symbol}: {order}")
+                            self.print_balance_report()  # Print balance report after each buy
+                            self.last_order_time[symbol] = datetime.now(timezone.utc)  # Update last order time
+                            break
+                        time.sleep(1)  # Check order status every second
+                elif self.order_type == "market":
+                    order = self.client.create_order(
+                        symbol=symbol,
+                        side=SIDE_BUY,
+                        type=ORDER_TYPE_MARKET,
+                        quantity=quantity,
+                        recvWindow=5000
+                    )
+                    self.total_bought[symbol] += quantity
+                    self.total_spent[symbol] += quantity * float(price)
+                    self.logger.info(f"BUY ORDER for {symbol}: {order}")
+                    print(f"BUY ORDER for {symbol}: {order}")
+                    print(f"Bought {quantity} {symbol.replace('USDT', '')}")
+                    if self.use_telegram:
+                        self.telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"BUY ORDER for {symbol}: {order}")
+                    self.print_balance_report()  # Print balance report after each buy
+                    self.last_order_time[symbol] = datetime.now(timezone.utc)  # Update last order time
         except Exception as e:
             self.logger.error(f"Error executing trade for {symbol}: {str(e)}")
             print(f"Error executing trade for {symbol}: {str(e)}")
@@ -237,6 +257,7 @@ if __name__ == "__main__":
     use_testnet = input("Do you want to use the testnet? (yes/no): ").strip().lower() == 'yes'
     use_telegram = input("Do you want to use Telegram notifications? (yes/no): ").strip().lower() == 'yes'
     drop_threshold = float(input("Enter the drop threshold percentage (e.g., 5 for 5%): ").strip()) / 100
-    bot = BinanceBot(use_testnet, use_telegram, drop_threshold)
+    order_type = input("Do you want to use limit orders or market orders? (limit/market): ").strip().lower()
+    bot = BinanceBot(use_testnet, use_telegram, drop_threshold, order_type)
     bot.test_connection()
     bot.run()
