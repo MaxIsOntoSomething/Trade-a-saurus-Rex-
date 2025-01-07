@@ -49,6 +49,7 @@ class BinanceBot:
         self.lot_size_info = self.get_lot_size_info()
         self.total_bought = {symbol: 0 for symbol in TRADING_SYMBOLS}
         self.total_spent = {symbol: 0 for symbol in TRADING_SYMBOLS}
+        self.total_trades = 0  # Track the total number of trades
         self.max_trades_executed = False
 
     def get_lot_size_info(self):
@@ -166,6 +167,7 @@ class BinanceBot:
                     if order_status['status'] == 'FILLED':
                         self.total_bought[symbol] += quantity
                         self.total_spent[symbol] += quantity * current_price
+                        self.total_trades += 1  # Increment total trades
                         self.logger.info(f"BUY ORDER for {symbol}: {order}")
                         print(Fore.GREEN + f"BUY ORDER for {symbol}: {order}")
                         print(Fore.YELLOW + f"Bought {quantity} {symbol.replace('USDT', '')}")
@@ -185,6 +187,7 @@ class BinanceBot:
                 )
                 self.total_bought[symbol] += quantity
                 self.total_spent[symbol] += quantity * current_price
+                self.total_trades += 1  # Increment total trades
                 self.logger.info(f"BUY ORDER for {symbol}: {order}")
                 print(Fore.GREEN + f"BUY ORDER for {symbol}: {order}")
                 print(Fore.YELLOW + f"Bought {quantity} {symbol.replace('USDT', '')}")
@@ -213,6 +216,9 @@ class BinanceBot:
         else:
             update.message.reply_text("Error fetching balance.")
 
+    def handle_trades(self, update, context):
+        update.message.reply_text(f"Total number of trades done: {self.total_trades}")
+
     def handle_profits(self, update, context):
         profits = self.get_profits()
         if profits is not None:
@@ -230,6 +236,7 @@ class BinanceBot:
             updater = Updater(TELEGRAM_TOKEN)  # Corrected initialization
             dispatcher = updater.dispatcher
             dispatcher.add_handler(CommandHandler("balance", self.handle_balance))
+            dispatcher.add_handler(CommandHandler("trades", self.handle_trades))
             dispatcher.add_handler(CommandHandler("profits", self.handle_profits))
             updater.start_polling()
 
