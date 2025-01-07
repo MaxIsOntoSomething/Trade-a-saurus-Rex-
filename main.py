@@ -122,15 +122,19 @@ class BinanceBot:
             for asset, total in balance_report.items():
                 self.logger.info(f"{asset}: {total}")
 
-    def execute_trade(self, symbol, signal, price):
+    def execute_trade(self, symbol, signal):
         try:
             if signal == "BUY":
+                # Fetch the current price right before placing the order
+                ticker = self.client.get_symbol_ticker(symbol=symbol)
+                current_price = float(ticker['price'])
+                
                 balance = self.client.get_asset_balance(asset='USDT', recvWindow=5000)
                 available_balance = float(balance['free'])
                 if available_balance < 100:
                     print(f"Insufficient balance to place order for {symbol}. Available balance: {available_balance} USDT")
                     return
-                quantity = 100 / float(price)  # Use 100 USDT for each order
+                quantity = 100 / current_price  # Use 100 USDT for each order
                 quantity = self.adjust_quantity(symbol, quantity)
                 
                 if self.order_type == "limit":
@@ -140,17 +144,17 @@ class BinanceBot:
                         type=ORDER_TYPE_LIMIT,
                         timeInForce=TIME_IN_FORCE_GTC,
                         quantity=quantity,
-                        price=str(price),
+                        price=str(current_price),
                         recvWindow=5000
                     )
-                    print(f"Limit order set at price {price}")
-                    self.logger.info(f"Limit order set at price {price}")
+                    print(f"Limit order set at price {current_price}")
+                    self.logger.info(f"Limit order set at price {current_price}")
                     # Wait for the order to be filled
                     while True:
                         order_status = self.client.get_order(symbol=symbol, orderId=order['orderId'])
                         if order_status['status'] == 'FILLED':
                             self.total_bought[symbol] += quantity
-                            self.total_spent[symbol] += quantity * float(price)
+                            self.total_spent[symbol] += quantity * current_price
                             self.logger.info(f"BUY ORDER for {symbol}: {order}")
                             print(f"BUY ORDER for {symbol}: {order}")
                             print(f"Bought {quantity} {symbol.replace('USDT', '')}")
@@ -169,7 +173,7 @@ class BinanceBot:
                         recvWindow=5000
                     )
                     self.total_bought[symbol] += quantity
-                    self.total_spent[symbol] += quantity * float(price)
+                    self.total_spent[symbol] += quantity * current_price
                     self.logger.info(f"BUY ORDER for {symbol}: {order}")
                     print(f"BUY ORDER for {symbol}: {order}")
                     print(f"Bought {quantity} {symbol.replace('USDT', '')}")
@@ -242,12 +246,12 @@ class BinanceBot:
                             print(f"[{timestamp}] Fetching historical data for {symbol}...")
                             historical_data = self.get_historical_data(symbol, TIME_INTERVAL, "8 hours ago UTC")
                             daily_open_price = self.get_daily_open_price(symbol)
-                            signal, price = self.strategy.generate_signal(historical_data['close'].astype(float).values, daily_open_price)
+                            signal, _ = self.strategy.generate_signal(historical_data['close'].astype(float).values, daily_open_price)
                             
                             if signal:
-                                print(f"Signal generated for {symbol}: {signal} at price {price}")
-                                self.execute_trade(symbol, signal, price)
-                                self.logger.info(f"Signal generated for {symbol}: {signal} at price {price}")
+                                print(f"Signal generated for {symbol}: {signal}")
+                                self.execute_trade(symbol, signal)
+                                self.logger.info(f"Signal generated for {symbol}: {signal}")
                     self.max_trades_executed = all(self.last_order_time[symbol] is not None for symbol in TRADING_SYMBOLS)
                 else:
                     next_reset_time = next_daily_open_check - datetime.now(timezone.utc)
