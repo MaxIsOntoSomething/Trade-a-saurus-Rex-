@@ -1,6 +1,6 @@
 from binance.client import Client
 from binance.enums import *
-from datetime import datetime
+from datetime import datetime, timedelta
 import pandas as pd
 import time
 import json
@@ -61,6 +61,12 @@ class BinanceBot:
     def get_daily_open_price(self, symbol):
         df = self.get_historical_data(symbol, Client.KLINE_INTERVAL_1DAY, "1 day ago UTC")
         return float(df['open'].iloc[-1])
+
+    def print_daily_open_price(self):
+        for symbol in TRADING_SYMBOLS:
+            daily_open_price = self.get_daily_open_price(symbol)
+            print(f"Daily open price for {symbol} at 00:00 UTC: {daily_open_price}")
+            self.logger.info(f"Daily open price for {symbol} at 00:00 UTC: {daily_open_price}")
 
     def execute_trade(self, symbol, signal, price):
         try:
@@ -136,6 +142,7 @@ class BinanceBot:
     def run(self):
         fetch_price_interval = 20 * 60  # 20 minutes in seconds
         last_price_fetch_time = time.time() - fetch_price_interval  # Ensure the price is fetched immediately on start
+        next_daily_open_check = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
 
         if self.use_telegram:
             updater = Updater(TELEGRAM_TOKEN)  # Corrected initialization
@@ -144,6 +151,8 @@ class BinanceBot:
             dispatcher.add_handler(CommandHandler("profits", self.handle_profits))
             updater.start_polling()
 
+        self.print_daily_open_price()  # Print daily open price at startup
+
         while True:
             try:
                 current_time = time.time()
@@ -151,6 +160,10 @@ class BinanceBot:
                     for symbol in TRADING_SYMBOLS:
                         self.fetch_current_price(symbol)
                     last_price_fetch_time = current_time
+
+                if datetime.utcnow() >= next_daily_open_check:
+                    self.print_daily_open_price()
+                    next_daily_open_check += timedelta(days=1)
 
                 for symbol in TRADING_SYMBOLS:
                     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
