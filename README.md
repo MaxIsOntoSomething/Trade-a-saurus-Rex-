@@ -57,7 +57,10 @@
 3. **Select Telegram notifications**
     When starting, you will be asked if you want to use Telegram notifications. Answer with `yes` or `no`.
 
-4. **Telegram commands** (if Telegram is enabled)
+4. **Set the drop threshold percentage**
+    When starting, you will be asked to enter the drop threshold percentage (e.g., 5 for 5%).
+
+5. **Telegram commands** (if Telegram is enabled)
     - `/balance`: Shows the current account balance.
     - `/profits`: Shows the current profits.
 

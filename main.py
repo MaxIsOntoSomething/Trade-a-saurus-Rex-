@@ -25,14 +25,14 @@ TELEGRAM_TOKEN = config['TELEGRAM_TOKEN']
 TELEGRAM_CHAT_ID = config['TELEGRAM_CHAT_ID']
 
 class BinanceBot:
-    def __init__(self, use_testnet, use_telegram):
+    def __init__(self, use_testnet, use_telegram, drop_threshold):
         if use_testnet:
             self.client = Client(TESTNET_API_KEY, TESTNET_API_SECRET, testnet=True)
             self.client.API_URL = 'https://testnet.binance.vision/api'
         else:
             self.client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
         
-        self.strategy = PriceDropStrategy(drop_threshold=0.05)  # Updated drop threshold to 5%
+        self.strategy = PriceDropStrategy(drop_threshold=drop_threshold)
         self.logger = setup_logger()
         self.use_telegram = use_telegram
         if self.use_telegram:
@@ -153,7 +153,8 @@ class BinanceBot:
                     last_price_fetch_time = current_time
 
                 for symbol in TRADING_SYMBOLS:
-                    print(f"Fetching historical data for {symbol}...")
+                    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    print(f"[{timestamp}] Fetching historical data for {symbol}...")
                     historical_data = self.get_historical_data(symbol, Client.KLINE_INTERVAL_4HOUR, "8 hours ago UTC")
                     daily_open_price = self.get_daily_open_price(symbol)
                     signal, price = self.strategy.generate_signal(historical_data['close'].astype(float).values, daily_open_price)
@@ -173,6 +174,7 @@ class BinanceBot:
 if __name__ == "__main__":
     use_testnet = input("Do you want to use the testnet? (yes/no): ").strip().lower() == 'yes'
     use_telegram = input("Do you want to use Telegram notifications? (yes/no): ").strip().lower() == 'yes'
-    bot = BinanceBot(use_testnet, use_telegram)
+    drop_threshold = float(input("Enter the drop threshold percentage (e.g., 5 for 5%): ").strip()) / 100
+    bot = BinanceBot(use_testnet, use_telegram, drop_threshold)
     bot.test_connection()
     bot.run()
