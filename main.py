@@ -23,10 +23,9 @@ QUANTITY_PERCENTAGE = config['QUANTITY_PERCENTAGE']
 TIME_INTERVAL = config['TIME_INTERVAL']
 TELEGRAM_TOKEN = config['TELEGRAM_TOKEN']
 TELEGRAM_CHAT_ID = config['TELEGRAM_CHAT_ID']
-DROP_THRESHOLDS = config['DROP_THRESHOLDS']
 
 class BinanceBot:
-    def __init__(self, use_testnet, use_telegram, drop_thresholds, order_type):
+    def __init__(self, use_testnet, use_telegram, drop_thresholds, max_orders_per_symbol, order_type):
         if use_testnet:
             self.client = Client(TESTNET_API_KEY, TESTNET_API_SECRET, testnet=True)
             self.client.API_URL = 'https://testnet.binance.vision/api'
@@ -37,6 +36,7 @@ class BinanceBot:
         self.logger = setup_logger()
         self.use_telegram = use_telegram
         self.order_type = order_type
+        self.max_orders_per_symbol = max_orders_per_symbol
         if self.use_telegram:
             self.telegram_bot = telegram.Bot(token=TELEGRAM_TOKEN)
         
@@ -245,7 +245,7 @@ class BinanceBot:
 
                 if not self.max_trades_executed:
                     for symbol in TRADING_SYMBOLS:
-                        if self.orders_placed_today[symbol] < len(DROP_THRESHOLDS):
+                        if self.orders_placed_today[symbol] < self.max_orders_per_symbol:
                             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                             print(f"[{timestamp}] Fetching historical data for {symbol}...")
                             historical_data = self.get_historical_data(symbol, TIME_INTERVAL, "1 day ago UTC")
@@ -253,11 +253,11 @@ class BinanceBot:
                             signals = self.strategy.generate_signals(historical_data['close'].astype(float).values, daily_open_price)
                             
                             for threshold, price in signals:
-                                if self.orders_placed_today[symbol] < len(DROP_THRESHOLDS):
+                                if self.orders_placed_today[symbol] < self.max_orders_per_symbol:
                                     print(f"Signal generated for {symbol} at threshold {threshold}: BUY at price {price}")
                                     self.execute_trade(symbol, price)
                                     self.logger.info(f"Signal generated for {symbol} at threshold {threshold}: BUY at price {price}")
-                    self.max_trades_executed = all(self.orders_placed_today[symbol] >= len(DROP_THRESHOLDS) for symbol in TRADING_SYMBOLS)
+                    self.max_trades_executed = all(self.orders_placed_today[symbol] >= self.max_orders_per_symbol for symbol in TRADING_SYMBOLS)
                 else:
                     next_reset_time = next_daily_open_check - datetime.now(timezone.utc)
                     print(f"Max trades executed for the day. Next reset in {next_reset_time}.")
@@ -276,8 +276,10 @@ class BinanceBot:
 if __name__ == "__main__":
     use_testnet = input("Do you want to use the testnet? (yes/no): ").strip().lower() == 'yes'
     use_telegram = input("Do you want to use Telegram notifications? (yes/no): ").strip().lower() == 'yes'
-    drop_thresholds = [float(x) / 100 for x in input("Enter the drop thresholds percentages separated by commas (e.g., 1,2,3 for 1%, 2%, 3%): ").strip().split(',')]
+    num_thresholds = int(input("Enter the number of drop thresholds: ").strip())
+    drop_thresholds = [float(input(f"Enter drop threshold {i+1} percentage (e.g., 1 for 1%): ").strip()) / 100 for i in range(num_thresholds)]
+    max_orders_per_symbol = int(input("Enter the maximum number of orders per symbol per day: ").strip())
     order_type = input("Do you want to use limit orders or market orders? (limit/market): ").strip().lower()
-    bot = BinanceBot(use_testnet, use_telegram, drop_thresholds, order_type)
+    bot = BinanceBot(use_testnet, use_telegram, drop_thresholds, max_orders_per_symbol, order_type)
     bot.test_connection()
     bot.run()
