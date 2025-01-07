@@ -36,11 +36,12 @@
          "BINANCE_API_SECRET": "YOUR_BINANCE_API_SECRET",
          "TESTNET_API_KEY": "YOUR_TESTNET_API_KEY",
          "TESTNET_API_SECRET": "YOUR_TESTNET_API_SECRET",
-         "TRADING_SYMBOLS": ["BTCUSDT", "ETHUSDT"], 
+         "TRADING_SYMBOLS": ["BTCUSDT", "ETHUSDT", "SOLUSDT"], 
          "QUANTITY_PERCENTAGE": 0.1, 
-         "TIME_INTERVAL": "4h",
+         "TIME_INTERVAL": "1d",
          "TELEGRAM_TOKEN": "YOUR_TELEGRAM_BOT_TOKEN",
-         "TELEGRAM_CHAT_ID": "YOUR_TELEGRAM_CHAT_ID"
+         "TELEGRAM_CHAT_ID": "YOUR_TELEGRAM_CHAT_ID",
+         "DROP_THRESHOLDS": [0.01, 0.02, 0.03]  
     }
     ```
 
@@ -57,12 +58,27 @@
 3. **Select Telegram notifications**
     When starting, you will be asked if you want to use Telegram notifications. Answer with `yes` or `no`.
 
-4. **Set the drop threshold percentage**
-    When starting, you will be asked to enter the drop threshold percentage (e.g., 5 for 5%).
+4. **Set the drop thresholds**
+    When starting, you will be asked to enter the number of drop thresholds and their percentages in ascending order (e.g., 1 for 1%, 2 for 2%, etc.).
 
-5. **Telegram commands** (if Telegram is enabled)
+5. **Select order type**
+    When starting, you will be asked if you want to use limit orders or market orders. Answer with `limit` or `market`.
+
+6. **Set trade amount**
+    When starting, you will be asked if you want to use a percentage of USDT per trade or a fixed amount. Enter the percentage or the fixed amount accordingly.
+
+7. **Telegram commands** (if Telegram is enabled)
     - `/balance`: Shows the current account balance.
+    - `/trades`: Shows the total number of trades done.
     - `/profits`: Shows the current profits.
+
+### Example Screenshots
+
+#### Bot Starting
+![Bot Starting](img/bot_starting.png)
+
+#### Bot Buying
+![Bot Buying](img/bot_buying.png)
 
 ### Disclaimer
 
@@ -71,8 +87,10 @@ This bot is available to everyone. Losses and usage are at your own risk.
 ### TODO
 
 - Fully manageable via Telegram
-- Implementing new strategies
+- Implement multiple strategies
 - Support for other exchanges
+- Backtesting capabilities
+- Local UI for management
 
 ### Contact
 
