@@ -68,6 +68,33 @@ class BinanceBot:
             print(f"Daily open price for {symbol} at 00:00 UTC: {daily_open_price}")
             self.logger.info(f"Daily open price for {symbol} at 00:00 UTC: {daily_open_price}")
 
+    def get_balance(self):
+        try:
+            balances = self.client.get_account()['balances']
+            balance_report = {}
+            for balance in balances:
+                asset = balance['asset']
+                free = float(balance['free'])
+                locked = float(balance['locked'])
+                total = free + locked
+                if total > 0:
+                    balance_report[asset] = total
+            return balance_report
+        except Exception as e:
+            print(f"Error fetching balance: {str(e)}")
+            self.logger.error(f"Error fetching balance: {str(e)}")
+            return None
+
+    def print_balance_report(self):
+        balance_report = self.get_balance()
+        if balance_report:
+            print("Balance Report:")
+            for asset, total in balance_report.items():
+                print(f"{asset}: {total}")
+            self.logger.info("Balance Report:")
+            for asset, total in balance_report.items():
+                self.logger.info(f"{asset}: {total}")
+
     def execute_trade(self, symbol, signal, price):
         try:
             if signal == "BUY":
@@ -89,6 +116,7 @@ class BinanceBot:
                 print(f"BUY ORDER for {symbol}: {order}")
                 if self.use_telegram:
                     self.telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"BUY ORDER for {symbol}: {order}")
+                self.print_balance_report()  # Print balance report after each buy
         except Exception as e:
             self.logger.error(f"Error executing trade for {symbol}: {str(e)}")
             print(f"Error executing trade for {symbol}: {str(e)}")
@@ -102,33 +130,11 @@ class BinanceBot:
             print(f"Error fetching current price of {symbol}: {str(e)}")
             self.logger.error(f"Error fetching current price of {symbol}: {str(e)}")
 
-    def get_balance(self):
-        try:
-            balance = self.client.get_asset_balance(asset='USDT')
-            return balance['free']
-        except Exception as e:
-            print(f"Error fetching balance: {str(e)}")
-            self.logger.error(f"Error fetching balance: {str(e)}")
-            return None
-
-    def get_profits(self):
-        try:
-            profits = {}
-            for symbol in TRADING_SYMBOLS:
-                current_price = float(self.client.get_symbol_ticker(symbol=symbol)['price'])
-                average_price = self.total_spent[symbol] / self.total_bought[symbol] if self.total_bought[symbol] > 0 else 0
-                profit = (current_price - average_price) * self.total_bought[symbol]
-                profits[symbol] = profit
-            return profits
-        except Exception as e:
-            print(f"Error calculating profits: {str(e)}")
-            self.logger.error(f"Error calculating profits: {str(e)}")
-            return None
-
     def handle_balance(self, update, context):
-        balance = self.get_balance()
-        if balance is not None:
-            update.message.reply_text(f"Current balance: {balance} USDT")
+        balance_report = self.get_balance()
+        if balance_report:
+            balance_message = "\n".join([f"{asset}: {total}" for asset, total in balance_report.items()])
+            update.message.reply_text(f"Current balance:\n{balance_message}")
         else:
             update.message.reply_text("Error fetching balance.")
 
@@ -153,6 +159,7 @@ class BinanceBot:
             updater.start_polling()
 
         self.print_daily_open_price()  # Print daily open price at startup
+        self.print_balance_report()  # Print balance report at startup
 
         while True:
             try:
