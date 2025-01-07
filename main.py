@@ -290,11 +290,11 @@ if __name__ == "__main__":
     for i in range(num_thresholds):
         while True:
             threshold = float(input(f"Enter drop threshold {i+1} percentage (e.g., 1 for 1%): ").strip()) / 100
-            if i == 0 or threshold < drop_thresholds[-1]:
+            if i == 0 or threshold > drop_thresholds[-1]:
                 drop_thresholds.append(threshold)
                 break
             else:
-                print(f"Threshold {i+1} must be lower than threshold {i}. Please enter a valid value.")
+                print(f"Threshold {i+1} must be higher than threshold {i}. Please enter a valid value.")
     order_type = input("Do you want to use limit orders or market orders? (limit/market): ").strip().lower()
     use_percentage = input("Do you want to use a percentage of USDT per trade? (yes/no): ").strip().lower() == 'yes'
     if use_percentage:
