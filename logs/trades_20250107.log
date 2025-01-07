@@ -419,3 +419,17 @@
 2025-01-07 10:27:33,320 - ETH: 1.0
 2025-01-07 10:27:33,320 - BTC: 1.0
 2025-01-07 10:27:33,320 - USDT: 10000.0
+2025-01-07 10:33:53,508 - Daily open price for BTCUSDT at 00:00 UTC: 102161.41
+2025-01-07 10:33:54,923 - Daily open price for ETHUSDT at 00:00 UTC: 3683.41
+2025-01-07 10:33:55,635 - Balance Report:
+2025-01-07 10:33:55,635 - ETH: 1.0
+2025-01-07 10:33:55,635 - BTC: 1.0
+2025-01-07 10:33:55,635 - USDT: 10000.0
+2025-01-07 10:33:59,607 - Error executing trade for BTCUSDT: APIError(code=-1013): Filter failure: LOT_SIZE
+2025-01-07 10:33:59,608 - Signal generated for BTCUSDT: BUY at price 101810.4
+2025-01-07 10:34:01,255 - Error executing trade for ETHUSDT: APIError(code=-1013): Filter failure: LOT_SIZE
+2025-01-07 10:34:01,256 - Signal generated for ETHUSDT: BUY at price 3664.53
+2025-01-07 10:35:04,142 - Error executing trade for BTCUSDT: APIError(code=-1013): Filter failure: LOT_SIZE
+2025-01-07 10:35:04,143 - Signal generated for BTCUSDT: BUY at price 101798.55
+2025-01-07 10:35:06,560 - Error executing trade for ETHUSDT: APIError(code=-1013): Filter failure: LOT_SIZE
+2025-01-07 10:35:06,560 - Signal generated for ETHUSDT: BUY at price 3665.01

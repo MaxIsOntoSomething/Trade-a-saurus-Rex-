@@ -39,6 +39,26 @@ class BinanceBot:
             self.telegram_bot = telegram.Bot(token=TELEGRAM_TOKEN)
         
         self.last_order_time = {symbol: None for symbol in TRADING_SYMBOLS}
+        self.lot_size_info = self.get_lot_size_info()
+
+    def get_lot_size_info(self):
+        lot_size_info = {}
+        exchange_info = self.client.get_exchange_info()
+        for symbol_info in exchange_info['symbols']:
+            symbol = symbol_info['symbol']
+            if symbol in TRADING_SYMBOLS:
+                for filter in symbol_info['filters']:
+                    if filter['filterType'] == 'LOT_SIZE':
+                        lot_size_info[symbol] = {
+                            'minQty': float(filter['minQty']),
+                            'maxQty': float(filter['maxQty']),
+                            'stepSize': float(filter['stepSize'])
+                        }
+        return lot_size_info
+
+    def adjust_quantity(self, symbol, quantity):
+        step_size = self.lot_size_info[symbol]['stepSize']
+        return round(quantity // step_size * step_size, 8)
 
     def test_connection(self):
         try:
@@ -104,7 +124,7 @@ class BinanceBot:
                 balance = self.client.get_asset_balance(asset='USDT', recvWindow=5000)
                 available_balance = float(balance['free'])
                 quantity = (available_balance * QUANTITY_PERCENTAGE) / float(price)
-                quantity = round(quantity, 6)  # Round to 6 decimal places to avoid precision error
+                quantity = self.adjust_quantity(symbol, quantity)
                 order = self.client.create_order(
                     symbol=symbol,
                     side=SIDE_BUY,
@@ -183,7 +203,7 @@ class BinanceBot:
                     if self.last_order_time[symbol] is None or (datetime.now(timezone.utc) - self.last_order_time[symbol]).days >= 1:
                         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                         print(f"[{timestamp}] Fetching historical data for {symbol}...")
-                        historical_data = self.get_historical_data(symbol, Client.KLINE_INTERVAL_4HOUR, "8 hours ago UTC")
+                        historical_data = self.get_historical_data(symbol, TIME_INTERVAL, "8 hours ago UTC")
                         daily_open_price = self.get_daily_open_price(symbol)
                         signal, price = self.strategy.generate_signal(historical_data['close'].astype(float).values, daily_open_price)
                         
