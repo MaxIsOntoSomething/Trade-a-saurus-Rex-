@@ -37,6 +37,8 @@ class BinanceBot:
         self.use_telegram = use_telegram
         if self.use_telegram:
             self.telegram_bot = telegram.Bot(token=TELEGRAM_TOKEN)
+        
+        self.last_order_time = {symbol: None for symbol in TRADING_SYMBOLS}
 
     def test_connection(self):
         try:
@@ -119,6 +121,7 @@ class BinanceBot:
                 if self.use_telegram:
                     self.telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"BUY ORDER for {symbol}: {order}")
                 self.print_balance_report()  # Print balance report after each buy
+                self.last_order_time[symbol] = datetime.now(timezone.utc)  # Update last order time
         except Exception as e:
             self.logger.error(f"Error executing trade for {symbol}: {str(e)}")
             print(f"Error executing trade for {symbol}: {str(e)}")
@@ -174,18 +177,20 @@ class BinanceBot:
                 if datetime.now(timezone.utc) >= next_daily_open_check:
                     self.print_daily_open_price()
                     next_daily_open_check += timedelta(days=1)
+                    self.last_order_time = {symbol: None for symbol in TRADING_SYMBOLS}  # Reset last order time at 00:00 UTC
 
                 for symbol in TRADING_SYMBOLS:
-                    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                    print(f"[{timestamp}] Fetching historical data for {symbol}...")
-                    historical_data = self.get_historical_data(symbol, Client.KLINE_INTERVAL_4HOUR, "8 hours ago UTC")
-                    daily_open_price = self.get_daily_open_price(symbol)
-                    signal, price = self.strategy.generate_signal(historical_data['close'].astype(float).values, daily_open_price)
-                    
-                    if signal:
-                        print(f"Signal generated for {symbol}: {signal} at price {price}")
-                        self.execute_trade(symbol, signal, price)
-                        self.logger.info(f"Signal generated for {symbol}: {signal} at price {price}")
+                    if self.last_order_time[symbol] is None or (datetime.now(timezone.utc) - self.last_order_time[symbol]).days >= 1:
+                        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        print(f"[{timestamp}] Fetching historical data for {symbol}...")
+                        historical_data = self.get_historical_data(symbol, Client.KLINE_INTERVAL_4HOUR, "8 hours ago UTC")
+                        daily_open_price = self.get_daily_open_price(symbol)
+                        signal, price = self.strategy.generate_signal(historical_data['close'].astype(float).values, daily_open_price)
+                        
+                        if signal:
+                            print(f"Signal generated for {symbol}: {signal} at price {price}")
+                            self.execute_trade(symbol, signal, price)
+                            self.logger.info(f"Signal generated for {symbol}: {signal} at price {price}")
                 
                 time.sleep(60)  # Check every minute
                 
