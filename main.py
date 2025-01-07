@@ -1,6 +1,6 @@
 from binance.client import Client
 from binance.enums import *
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import pandas as pd
 import time
 import json
@@ -74,6 +74,7 @@ class BinanceBot:
                 balance = self.client.get_asset_balance(asset='USDT')
                 available_balance = float(balance['free'])
                 quantity = (available_balance * QUANTITY_PERCENTAGE) / float(price)
+                quantity = round(quantity, 6)  # Round to 6 decimal places to avoid precision error
                 order = self.client.create_order(
                     symbol=symbol,
                     side=SIDE_BUY,
@@ -142,7 +143,7 @@ class BinanceBot:
     def run(self):
         fetch_price_interval = 20 * 60  # 20 minutes in seconds
         last_price_fetch_time = time.time() - fetch_price_interval  # Ensure the price is fetched immediately on start
-        next_daily_open_check = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        next_daily_open_check = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
 
         if self.use_telegram:
             updater = Updater(TELEGRAM_TOKEN)  # Corrected initialization
@@ -161,7 +162,7 @@ class BinanceBot:
                         self.fetch_current_price(symbol)
                     last_price_fetch_time = current_time
 
-                if datetime.utcnow() >= next_daily_open_check:
+                if datetime.now(timezone.utc) >= next_daily_open_check:
                     self.print_daily_open_price()
                     next_daily_open_check += timedelta(days=1)
 
