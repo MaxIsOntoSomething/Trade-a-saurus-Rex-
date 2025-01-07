@@ -53,8 +53,7 @@ class BinanceBot:
         klines = self.client.get_historical_klines(
             symbol,
             interval,
-            start_str,
-            recvWindow=5000
+            start_str
         )
         df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_av', 'trades', 'tb_base_av', 'tb_quote_av', 'ignore'])
         return df
@@ -75,11 +74,12 @@ class BinanceBot:
             balance_report = {}
             for balance in balances:
                 asset = balance['asset']
-                free = float(balance['free'])
-                locked = float(balance['locked'])
-                total = free + locked
-                if total > 0:
-                    balance_report[asset] = total
+                if asset == 'USDT' or asset in [symbol.replace('USDT', '') for symbol in TRADING_SYMBOLS]:
+                    free = float(balance['free'])
+                    locked = float(balance['locked'])
+                    total = free + locked
+                    if total > 0:
+                        balance_report[asset] = total
             return balance_report
         except Exception as e:
             print(f"Error fetching balance: {str(e)}")
