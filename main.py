@@ -86,7 +86,7 @@ class BinanceBot:
             interval,
             start_str
         )
-        df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_av', 'trades', 'tb_base_av', 'tb_quote_av', 'ignore'])
+        df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'close_time', 'quote_av', 'trades', 'tb_base_av', 'tb_quote_av', 'ignore'])
         return df
 
     def get_daily_open_price(self, symbol):
@@ -161,7 +161,7 @@ class BinanceBot:
                         self.total_spent[symbol] += quantity * current_price
                         self.logger.info(f"BUY ORDER for {symbol}: {order}")
                         print(Fore.GREEN + f"BUY ORDER for {symbol}: {order}")
-                        print(Fore.GREEN + f"Bought {quantity} {symbol.replace('USDT', '')}")
+                        print(Fore.YELLOW + f"Bought {quantity} {symbol.replace('USDT', '')}")
                         if self.use_telegram:
                             self.telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"BUY ORDER for {symbol}: {order}")
                         self.print_balance_report()  # Print balance report after each buy
@@ -180,7 +180,7 @@ class BinanceBot:
                 self.total_spent[symbol] += quantity * current_price
                 self.logger.info(f"BUY ORDER for {symbol}: {order}")
                 print(Fore.GREEN + f"BUY ORDER for {symbol}: {order}")
-                print(Fore.GREEN + f"Bought {quantity} {symbol.replace('USDT', '')}")
+                print(Fore.YELLOW + f"Bought {quantity} {symbol.replace('USDT', '')}")
                 if self.use_telegram:
                     self.telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"BUY ORDER for {symbol}: {order}")
                 self.print_balance_report()  # Print balance report after each buy
