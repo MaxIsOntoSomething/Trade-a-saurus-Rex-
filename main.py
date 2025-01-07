@@ -43,6 +43,7 @@ class BinanceBot:
         self.lot_size_info = self.get_lot_size_info()
         self.total_bought = {symbol: 0 for symbol in TRADING_SYMBOLS}
         self.total_spent = {symbol: 0 for symbol in TRADING_SYMBOLS}
+        self.max_trades_executed = False
 
     def get_lot_size_info(self):
         lot_size_info = {}
@@ -232,19 +233,29 @@ class BinanceBot:
                     self.print_daily_open_price()
                     next_daily_open_check += timedelta(days=1)
                     self.last_order_time = {symbol: None for symbol in TRADING_SYMBOLS}  # Reset last order time at 00:00 UTC
+                    self.max_trades_executed = False  # Reset max trades executed flag
 
-                for symbol in TRADING_SYMBOLS:
-                    if self.last_order_time[symbol] is None or (datetime.now(timezone.utc) - self.last_order_time[symbol]).days >= 1:
-                        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                        print(f"[{timestamp}] Fetching historical data for {symbol}...")
-                        historical_data = self.get_historical_data(symbol, TIME_INTERVAL, "8 hours ago UTC")
-                        daily_open_price = self.get_daily_open_price(symbol)
-                        signal, price = self.strategy.generate_signal(historical_data['close'].astype(float).values, daily_open_price)
-                        
-                        if signal:
-                            print(f"Signal generated for {symbol}: {signal} at price {price}")
-                            self.execute_trade(symbol, signal, price)
-                            self.logger.info(f"Signal generated for {symbol}: {signal} at price {price}")
+                if not self.max_trades_executed:
+                    for symbol in TRADING_SYMBOLS:
+                        if self.last_order_time[symbol] is None or (datetime.now(timezone.utc) - self.last_order_time[symbol]).days >= 1:
+                            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            print(f"[{timestamp}] Fetching historical data for {symbol}...")
+                            historical_data = self.get_historical_data(symbol, TIME_INTERVAL, "8 hours ago UTC")
+                            daily_open_price = self.get_daily_open_price(symbol)
+                            signal, price = self.strategy.generate_signal(historical_data['close'].astype(float).values, daily_open_price)
+                            
+                            if signal:
+                                print(f"Signal generated for {symbol}: {signal} at price {price}")
+                                self.execute_trade(symbol, signal, price)
+                                self.logger.info(f"Signal generated for {symbol}: {signal} at price {price}")
+                    self.max_trades_executed = all(self.last_order_time[symbol] is not None for symbol in TRADING_SYMBOLS)
+                else:
+                    next_reset_time = next_daily_open_check - datetime.now(timezone.utc)
+                    print(f"Max trades executed for the day. Next reset in {next_reset_time}.")
+                    self.logger.info(f"Max trades executed for the day. Next reset in {next_reset_time}.")
+                    if self.use_telegram:
+                        self.telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"Max trades executed for the day. Next reset in {next_reset_time}.")
+                    time.sleep(3600)  # Sleep for an hour before checking again
                 
                 time.sleep(60)  # Check every minute
                 
