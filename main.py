@@ -29,7 +29,7 @@ TELEGRAM_TOKEN = config['TELEGRAM_TOKEN']
 TELEGRAM_CHAT_ID = config['TELEGRAM_CHAT_ID']
 
 class BinanceBot:
-    def __init__(self, use_testnet, use_telegram, drop_thresholds, max_orders_per_symbol, order_type):
+    def __init__(self, use_testnet, use_telegram, drop_thresholds, order_type):
         if use_testnet:
             self.client = Client(TESTNET_API_KEY, TESTNET_API_SECRET, testnet=True)
             self.client.API_URL = 'https://testnet.binance.vision/api'
@@ -40,7 +40,6 @@ class BinanceBot:
         self.logger = setup_logger()
         self.use_telegram = use_telegram
         self.order_type = order_type
-        self.max_orders_per_symbol = max_orders_per_symbol
         if self.use_telegram:
             self.telegram_bot = telegram.Bot(token=TELEGRAM_TOKEN)
         
@@ -281,8 +280,7 @@ if __name__ == "__main__":
     use_telegram = input("Do you want to use Telegram notifications? (yes/no): ").strip().lower() == 'yes'
     num_thresholds = int(input("Enter the number of drop thresholds: ").strip())
     drop_thresholds = [float(input(f"Enter drop threshold {i+1} percentage (e.g., 1 for 1%): ").strip()) / 100 for i in range(num_thresholds)]
-    max_orders_per_symbol = int(input("Enter the maximum number of orders per symbol per day: ").strip())
     order_type = input("Do you want to use limit orders or market orders? (limit/market): ").strip().lower()
-    bot = BinanceBot(use_testnet, use_telegram, drop_thresholds, max_orders_per_symbol, order_type)
+    bot = BinanceBot(use_testnet, use_telegram, drop_thresholds, order_type)
     bot.test_connection()
     bot.run()
