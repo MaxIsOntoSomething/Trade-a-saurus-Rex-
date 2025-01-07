@@ -25,7 +25,7 @@ TELEGRAM_TOKEN = config['TELEGRAM_TOKEN']
 TELEGRAM_CHAT_ID = config['TELEGRAM_CHAT_ID']
 
 class BinanceBot:
-    def __init__(self, use_testnet):
+    def __init__(self, use_testnet, use_telegram):
         if use_testnet:
             self.client = Client(TESTNET_API_KEY, TESTNET_API_SECRET, testnet=True)
             self.client.API_URL = 'https://testnet.binance.vision/api'
@@ -34,9 +34,9 @@ class BinanceBot:
         
         self.strategy = PriceDropStrategy()
         self.logger = setup_logger()
-        self.telegram_bot = telegram.Bot(token=TELEGRAM_TOKEN)
-        self.total_bought = {symbol: 0 for symbol in TRADING_SYMBOLS}
-        self.total_spent = {symbol: 0 for symbol in TRADING_SYMBOLS}
+        self.use_telegram = use_telegram
+        if self.use_telegram:
+            self.telegram_bot = telegram.Bot(token=TELEGRAM_TOKEN)
 
     def test_connection(self):
         try:
@@ -76,7 +76,8 @@ class BinanceBot:
                 self.total_spent[symbol] += quantity * float(price)
                 self.logger.info(f"BUY ORDER for {symbol}: {order}")
                 print(f"BUY ORDER for {symbol}: {order}")
-                self.telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"BUY ORDER for {symbol}: {order}")
+                if self.use_telegram:
+                    self.telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"BUY ORDER for {symbol}: {order}")
         except Exception as e:
             self.logger.error(f"Error executing trade for {symbol}: {str(e)}")
             print(f"Error executing trade for {symbol}: {str(e)}")
@@ -132,11 +133,12 @@ class BinanceBot:
         fetch_price_interval = 20 * 60  # 20 minutes in seconds
         last_price_fetch_time = time.time() - fetch_price_interval  # Ensure the price is fetched immediately on start
 
-        updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
-        dispatcher = updater.dispatcher
-        dispatcher.add_handler(CommandHandler("balance", self.handle_balance))
-        dispatcher.add_handler(CommandHandler("profits", self.handle_profits))
-        updater.start_polling()
+        if self.use_telegram:
+            updater = Updater(TELEGRAM_TOKEN)  # Corrected initialization
+            dispatcher = updater.dispatcher
+            dispatcher.add_handler(CommandHandler("balance", self.handle_balance))
+            dispatcher.add_handler(CommandHandler("profits", self.handle_profits))
+            updater.start_polling()
 
         while True:
             try:
@@ -165,6 +167,7 @@ class BinanceBot:
 
 if __name__ == "__main__":
     use_testnet = input("Do you want to use the testnet? (yes/no): ").strip().lower() == 'yes'
-    bot = BinanceBot(use_testnet)
+    use_telegram = input("Do you want to use Telegram notifications? (yes/no): ").strip().lower() == 'yes'
+    bot = BinanceBot(use_testnet, use_telegram)
     bot.test_connection()
     bot.run()
