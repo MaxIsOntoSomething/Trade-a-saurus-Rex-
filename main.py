@@ -7,6 +7,7 @@ import json
 import telegram
 from telegram.ext import Updater, CommandHandler
 from colorama import Fore, Style, init
+from binance.exceptions import BinanceAPIException
 
 from strategies.price_drop import PriceDropStrategy
 from utils.logger import setup_logger
@@ -80,7 +81,7 @@ class BinanceBot:
                     price = ticker['price']
                     print(f"Connection successful. Current price of {symbol}: {price}")
                 return
-            except Exception as e:
+            except BinanceAPIException as e:
                 if "502 Bad Gateway" in str(e):
                     print(Fore.RED + "Binance testnet spot servers are under maintenance.")
                     print(Fore.RED + "Waiting 5 minutes to try again...")
@@ -90,6 +91,10 @@ class BinanceBot:
                     print(f"Error testing connection: {str(e)}")
                     self.logger.error(f"Error testing connection: {str(e)}")
                     raise
+            except Exception as e:
+                print(f"Unexpected error: {str(e)}")
+                self.logger.error(f"Unexpected error: {str(e)}")
+                raise
         print(Fore.RED + "Server maintenance might take longer. Shutting down the bot.")
         self.logger.error("Server maintenance might take longer. Shutting down the bot.")
         exit(1)
