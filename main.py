@@ -72,15 +72,27 @@ class BinanceBot:
         return round(quantity // step_size * step_size, 8)
 
     def test_connection(self):
-        try:
-            for symbol in TRADING_SYMBOLS:
-                ticker = self.client.get_symbol_ticker(symbol=symbol)
-                price = ticker['price']
-                print(f"Connection successful. Current price of {symbol}: {price}")
-        except Exception as e:
-            print(f"Error testing connection: {str(e)}")
-            self.logger.error(f"Error testing connection: {str(e)}")
-            raise
+        retries = 12
+        while retries > 0:
+            try:
+                for symbol in TRADING_SYMBOLS:
+                    ticker = self.client.get_symbol_ticker(symbol=symbol)
+                    price = ticker['price']
+                    print(f"Connection successful. Current price of {symbol}: {price}")
+                return
+            except Exception as e:
+                if "502 Bad Gateway" in str(e):
+                    print(Fore.RED + "Binance testnet spot servers are under maintenance.")
+                    print(Fore.RED + "Waiting 5 minutes to try again...")
+                    time.sleep(300)  # Wait for 5 minutes
+                    retries -= 1
+                else:
+                    print(f"Error testing connection: {str(e)}")
+                    self.logger.error(f"Error testing connection: {str(e)}")
+                    raise
+        print(Fore.RED + "Server maintenance might take longer. Shutting down the bot.")
+        self.logger.error("Server maintenance might take longer. Shutting down the bot.")
+        exit(1)
 
     def get_historical_data(self, symbol, interval, start_str):
         klines = self.client.get_historical_klines(
