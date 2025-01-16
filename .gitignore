@@ -1,4 +1,5 @@
 .vscode/
+config/old_config.json
 config/config.json
 logs/
 __pycache__/

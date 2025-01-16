@@ -86,11 +86,16 @@ This bot is available to everyone. Losses and usage are at your own risk.
 
 ### TODO
 
-- Fully manageable via Telegram
 - Implement multiple strategies
 - Support for other exchanges
 - Backtesting capabilities
 - Local UI for management
+- Docker Implementation so it works on Ubuntu Server and Windows Docker
+- More drops to choose from: Monthly, weekly, yearly and also drops for each of them
+- Stock Updates from stocks chosen in config.json
+- More Telegram features
+- More buying settings like Bollinger Bands, Ichimoku Cloud, EMA, etc.
+- Put invalid symbols in a file and ignore them
 
 ### Contact
 
