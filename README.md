@@ -175,4 +175,4 @@ This bot is provided for educational purposes. Trading cryptocurrencies carries 
 
 ## License
 
-MIT License - Feel free to use and modify as needed.
+MIT License - Feel free to use and modify as needed
