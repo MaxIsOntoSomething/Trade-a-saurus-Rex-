@@ -5,9 +5,15 @@ import pandas as pd
 import time
 import json
 import telegram
-from telegram.ext import Updater, CommandHandler
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram import BotCommand
 from colorama import Fore, Style, init
 from binance.exceptions import BinanceAPIException
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import psutil  # Add missing import
+import logging  # Add missing import
+import os  # Add missing import
 
 from strategies.price_drop import PriceDropStrategy
 from utils.logger import setup_logger
@@ -29,29 +35,127 @@ TELEGRAM_TOKEN = config['TELEGRAM_TOKEN']
 TELEGRAM_CHAT_ID = config['TELEGRAM_CHAT_ID']
 
 class BinanceBot:
-    def __init__(self, use_testnet, use_telegram, drop_thresholds, order_type, use_percentage, trade_amount):
+    # Class-level variables
+    valid_trading_symbols = []
+    insufficient_balance_timestamp = None
+    balance_check_cooldown = timedelta(hours=24)
+    balance_pause_reason = None  # New variable to track why trading is paused
+
+    def __init__(self, use_testnet, use_telegram, timeframe_config, order_type, use_percentage, trade_amount, reserve_balance_usdt):
+        # Add timestamp sync
+        self.recv_window = 60000
+        self.time_offset = 0
+        self.start_time = datetime.now()
+        self.valid_symbols = []  # Add this to track valid symbols
+        self.invalid_symbols = []  # Add this to track invalid symbols
+        self.invalid_symbols_file = 'data/invalid_symbols.txt'  # Add new class variable
+        
         if use_testnet:
             self.client = Client(TESTNET_API_KEY, TESTNET_API_SECRET, testnet=True)
             self.client.API_URL = 'https://testnet.binance.vision/api'
         else:
             self.client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
         
-        self.strategy = PriceDropStrategy(drop_thresholds=drop_thresholds)
+        # Sync time with Binance servers
+        server_time = self.client.get_server_time()
+        self.time_offset = server_time['serverTime'] - int(time.time() * 1000)
+        
+        # Add timeframe_config as instance variable
+        self.timeframe_config = timeframe_config
+        
+        # Fix the strategy initialization
+        self.strategy = PriceDropStrategy(timeframe_config)
         self.logger = setup_logger()
         self.use_telegram = use_telegram
         self.order_type = order_type
         self.use_percentage = use_percentage
         self.trade_amount = trade_amount
+        self.reserve_balance_usdt = reserve_balance_usdt
+
+        # Add GraphGenerator
+        from utils.graph_generator import GraphGenerator
+        self.graph_generator = GraphGenerator()
+
         if self.use_telegram:
-            self.telegram_bot = telegram.Bot(token=TELEGRAM_TOKEN)
+            self.telegram_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+            # Add handlers for commands
+            self.telegram_app.add_handler(CommandHandler("positions", self.handle_positions))
+            self.telegram_app.add_handler(CommandHandler("balance", self.handle_balance))
+            self.telegram_app.add_handler(CommandHandler("trades", self.handle_trades))
+            self.telegram_app.add_handler(CommandHandler("profits", self.handle_profits))
+            self.telegram_app.add_handler(CommandHandler("start", self.handle_start))
+            self.telegram_app.add_handler(CommandHandler("stats", self.handle_stats))
+            # Add new handlers
+            self.telegram_app.add_handler(CommandHandler("distribution", self.handle_distribution))
+            self.telegram_app.add_handler(CommandHandler("stacking", self.handle_stacking))
+            self.telegram_app.add_handler(CommandHandler("buytimes", self.handle_buy_times))
+            self.telegram_app.add_handler(CommandHandler("portfolio", self.handle_portfolio))
+            self.telegram_app.add_handler(CommandHandler("allocation", self.handle_allocation))
+            # Remove async setup from __init__
+            self.commands_setup = False
         
-        self.last_order_time = {symbol: None for symbol in TRADING_SYMBOLS}
-        self.orders_placed_today = {symbol: {threshold: False for threshold in drop_thresholds} for symbol in TRADING_SYMBOLS}  # Track the orders placed today per symbol per threshold
-        self.lot_size_info = self.get_lot_size_info()
-        self.total_bought = {symbol: 0 for symbol in TRADING_SYMBOLS}
-        self.total_spent = {symbol: 0 for symbol in TRADING_SYMBOLS}
+        self.last_order_time = {}
+        self.orders_placed_today = {}
+        self.total_bought = {}
+        self.total_spent = {}
+        self.orders_placed = {}
         self.total_trades = 0  # Track the total number of trades
         self.max_trades_executed = False
+        self.pending_orders = {}  # Add this to track pending orders
+        self.executor = ThreadPoolExecutor(max_workers=10)  # For running async tasks
+        self.limit_order_timeout = timedelta(hours=8)
+        self.next_reset_times = {
+            'daily': datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1),
+            'weekly': self.get_next_weekly_reset(),
+            'monthly': self.get_next_monthly_reset()
+        }
+
+        # Initialize orders_placed with correct structure
+        self.orders_placed = {
+            symbol: {
+                timeframe: {} for timeframe in timeframe_config.keys()
+            } for symbol in TRADING_SYMBOLS
+        }
+
+    async def setup_telegram_commands(self):
+        """Setup the Telegram bot commands menu"""
+        if self.commands_setup:
+            return
+            
+        try:
+            commands = [
+                BotCommand("start", "Show available commands and bot status"),
+                BotCommand("positions", "Show available trading opportunities"),
+                BotCommand("balance", "Show current balance"),
+                BotCommand("trades", "Show total number of trades"),
+                BotCommand("profits", "Show current profits"),
+                BotCommand("stats", "Show system stats and bot information"),
+                BotCommand("distribution", "Show entry price distribution"),
+                BotCommand("stacking", "Show position building over time"),
+                BotCommand("buytimes", "Show time between buys"),
+                BotCommand("portfolio", "Show portfolio value evolution"),
+                BotCommand("allocation", "Show asset allocation")
+            ]
+            
+            await self.telegram_app.bot.set_my_commands(commands)
+            print(f"{Fore.GREEN}Telegram command menu setup successfully!")
+            self.logger.info("Telegram command menu setup successfully!")
+            self.commands_setup = True
+        except Exception as e:
+            print(f"{Fore.RED}Error setting up Telegram commands: {e}")
+            self.logger.error(f"Error setting up Telegram commands: {e}")
+
+    def get_next_weekly_reset(self):
+        now = datetime.now(timezone.utc)
+        return (now + timedelta(days=(7 - now.weekday()))).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    def get_next_monthly_reset(self):
+        now = datetime.now(timezone.utc)
+        if now.month == 12:
+            next_month = datetime(now.year + 1, 1, 1, tzinfo=timezone.utc)
+        else:
+            next_month = datetime(now.year, now.month + 1, 1, tzinfo=timezone.utc)
+        return next_month
 
     def get_lot_size_info(self):
         lot_size_info = {}
@@ -72,15 +176,78 @@ class BinanceBot:
         step_size = self.lot_size_info[symbol]['stepSize']
         return round(quantity // step_size * step_size, 8)
 
+    def update_config_file(self):
+        """Update config.json with valid symbols only"""
+        try:
+            with open('config/config.json', 'r') as f:
+                config_data = json.load(f)
+            
+            config_data['TRADING_SYMBOLS'] = self.valid_symbols
+            
+            with open('config/config.json', 'w') as f:
+                json.dump(config_data, f, indent=4)
+            
+            print(f"{Fore.GREEN}Updated config.json with valid symbols only")
+        except Exception as e:
+            print(f"{Fore.RED}Error updating config file: {e}")
+            self.logger.error(f"Error updating config file: {e}")
+
+    def update_invalid_symbols_file(self):
+        """Update invalid_symbols.txt with invalid symbols"""
+        try:
+            # Create data directory if it doesn't exist
+            os.makedirs('data', exist_ok=True)
+            
+            # Write invalid symbols to file
+            with open(self.invalid_symbols_file, 'w') as f:
+                f.write(f"# List of invalid symbols (one per line)\n")
+                f.write(f"# Last updated: {datetime.now()}\n")
+                for symbol in self.invalid_symbols:
+                    f.write(f"{symbol}\n")
+            
+            print(f"{Fore.YELLOW}Invalid symbols saved to {self.invalid_symbols_file}")
+        except Exception as e:
+            print(f"{Fore.RED}Error updating invalid symbols file: {e}")
+            self.logger.error(f"Error updating invalid symbols file: {e}")
+
     def test_connection(self):
         retries = 12
         while retries > 0:
             try:
-                for symbol in TRADING_SYMBOLS:
-                    ticker = self.client.get_symbol_ticker(symbol=symbol)
-                    price = ticker['price']
-                    print(f"Connection successful. Current price of {symbol}: {price}")
-                return
+                self.valid_symbols = []
+                self.invalid_symbols = []
+                
+                for symbol in list(TRADING_SYMBOLS):
+                    try:
+                        ticker = self.client.get_symbol_ticker(symbol=symbol)
+                        price = ticker['price']
+                        print(f"Connection successful. Current price of {symbol}: {price}")
+                        self.valid_symbols.append(symbol)
+                    except BinanceAPIException as symbol_error:
+                        if (symbol_error.code == -1121):  # Invalid symbol error code
+                            print(f"{Fore.RED}Invalid symbol detected: {symbol}")
+                            self.logger.warning(f"Invalid symbol detected: {symbol}")
+                            self.invalid_symbols.append(symbol)
+                            continue
+                        else:
+                            raise symbol_error
+
+                if self.valid_symbols:  # If we have at least one valid symbol
+                    print(f"\n{Fore.GREEN}Successfully connected with valid symbols: {', '.join(self.valid_symbols)}")
+                    if self.invalid_symbols:
+                        print(f"{Fore.YELLOW}Skipping invalid symbols: {', '.join(self.invalid_symbols)}")
+                        
+                        # Update config and invalid symbols files
+                        self.update_config_file()
+                        self.update_invalid_symbols_file()
+                    
+                    # Update class variable
+                    BinanceBot.valid_trading_symbols = self.valid_symbols
+                    self._initialize_data_structures()
+                    return True
+                else:
+                    raise Exception("No valid trading symbols found")
+                    
             except BinanceAPIException as e:
                 if "502 Bad Gateway" in str(e):
                     print(Fore.RED + "Binance testnet spot servers are under maintenance.")
@@ -95,9 +262,44 @@ class BinanceBot:
                 print(f"Unexpected error: {str(e)}")
                 self.logger.error(f"Unexpected error: {str(e)}")
                 raise
+
         print(Fore.RED + "Server maintenance might take longer. Shutting down the bot.")
         self.logger.error("Server maintenance might take longer. Shutting down the bot.")
         exit(1)
+
+    def _initialize_data_structures(self):
+        """Initialize data structures with validated symbols"""
+        self.last_order_time = {symbol: None for symbol in self.valid_symbols}
+        self.orders_placed_today = {
+            symbol: {
+                timeframe: {
+                    threshold: False 
+                    for threshold in self.timeframe_config[timeframe]['thresholds']
+                } for timeframe in self.timeframe_config if self.timeframe_config[timeframe]['enabled']
+            } for symbol in self.valid_symbols
+        }
+        self.total_bought = {symbol: 0 for symbol in self.valid_symbols}
+        self.total_spent = {symbol: 0 for symbol in self.valid_symbols}
+        self.orders_placed = {
+            symbol: {
+                timeframe: {} for timeframe in self.timeframe_config.keys()
+            } for symbol in self.valid_symbols
+        }
+        self.lot_size_info = self.get_lot_size_info()
+
+    async def _shutdown_telegram(self):
+        """Improved Telegram shutdown"""
+        if self.use_telegram and hasattr(self, 'telegram_app'):
+            try:
+                if hasattr(self.telegram_app, 'updater'):
+                    if getattr(self.telegram_app.updater, '_running', False):
+                        await self.telegram_app.updater.stop()
+                if getattr(self.telegram_app, 'running', False):
+                    await self.telegram_app.stop()
+                print(f"{Fore.GREEN}Telegram bot stopped successfully")
+            except Exception as e:
+                print(f"{Fore.YELLOW}Note: Telegram was already stopped or not running")
+                self.logger.info("Telegram was already stopped or not running")
 
     def get_historical_data(self, symbol, interval, start_str):
         klines = self.client.get_historical_klines(
@@ -113,18 +315,22 @@ class BinanceBot:
         return float(df['open'].iloc[-1])
 
     def print_daily_open_price(self):
-        for symbol in TRADING_SYMBOLS:
+        for symbol in self.valid_symbols:  # Changed from TRADING_SYMBOLS
             daily_open_price = self.get_daily_open_price(symbol)
             print(f"Daily open price for {symbol} at 00:00 UTC: {daily_open_price}")
             self.logger.info(f"Daily open price for {symbol} at 00:00 UTC: {daily_open_price}")
 
     def get_balance(self):
         try:
-            balances = self.client.get_account(recvWindow=5000)['balances']
+            timestamp = int(time.time() * 1000) + self.time_offset
+            balances = self.client.get_account(
+                recvWindow=self.recv_window,
+                timestamp=timestamp
+            )['balances']
             balance_report = {}
             for balance in balances:
                 asset = balance['asset']
-                if asset == 'USDT' or asset in [symbol.replace('USDT', '') for symbol in TRADING_SYMBOLS]:
+                if asset == 'USDT' or asset in [symbol.replace('USDT', '') for symbol in self.valid_symbols]:
                     free = float(balance['free'])
                     locked = float(balance['locked'])
                     total = free + locked
@@ -146,25 +352,132 @@ class BinanceBot:
             for asset, total in balance_report.items():
                 self.logger.info(f"{asset}: {total}")
 
-    def execute_trade(self, symbol, price):
+    async def monitor_order(self, symbol, order_id, price, placed_time):
+        """Asynchronously monitor an order until it's filled"""
+        while True:
+            try:
+                if datetime.now(timezone.utc) - placed_time > self.limit_order_timeout:
+                    # Cancel order if timeout reached
+                    self.client.cancel_order(symbol=symbol, orderId=order_id)
+                    print(f"Order {order_id} canceled due to timeout")
+                    break
+                order_status = self.client.get_order(symbol=symbol, orderId=order_id, recvWindow=self.recv_window)
+                if order_status['status'] == 'FILLED':
+                    quantity = float(order_status['executedQty'])
+                    self.total_bought[symbol] += quantity
+                    self.total_spent[symbol] += quantity * price
+                    self.total_trades += 1
+                    
+                    print(Fore.GREEN + f"Order filled for {symbol}: {order_status}")
+                    self.logger.info(f"Order filled for {symbol}: {order_status}")
+                    
+                    if self.use_telegram:
+                        await self.send_telegram_message(f"Order filled for {symbol}: {order_status}")
+                    
+                    self.print_balance_report()
+                    break
+                elif order_status['status'] == 'CANCELED':
+                    print(f"Order canceled for {symbol}")
+                    break
+                    
+                await asyncio.sleep(1)  # Non-blocking sleep
+                
+            except Exception as e:
+                print(f"Error monitoring order: {e}")
+                self.logger.error(f"Error monitoring order: {e}")
+                break
+                
+        # Remove from pending orders once complete
+        if symbol in self.pending_orders:
+            del self.pending_orders[symbol]
+
+    async def get_available_usdt(self):
+        """Enhanced balance check with reserve protection"""
         try:
-            # Fetch the current price right before placing the order
+            timestamp = int(time.time() * 1000) + self.time_offset
+            balance = self.client.get_asset_balance(
+                asset='USDT',
+                recvWindow=self.recv_window,
+                timestamp=timestamp
+            )
+            total_usdt = float(balance['free'])
+            available_usdt = total_usdt - self.reserve_balance_usdt
+            
+            if total_usdt < self.reserve_balance_usdt:
+                self.balance_pause_reason = "reserve"
+                return 0
+            return max(available_usdt, 0)
+        except Exception as e:
+            self.logger.error(f"Error getting USDT balance: {e}")
+            return 0
+
+    async def check_balance_status(self):
+        """Check if trading should be paused due to balance"""
+        if self.insufficient_balance_timestamp:
+            time_since_insufficient = datetime.now(timezone.utc) - self.insufficient_balance_timestamp
+            if time_since_insufficient < self.balance_check_cooldown:
+                remaining_time = self.balance_check_cooldown - time_since_insufficient
+                hours, remainder = divmod(remaining_time.seconds, 3600)
+                minutes, seconds = divmod(remainder, 60)
+                pause_message = (
+                    f"{Fore.YELLOW}Trading paused: "
+                    f"{'Below reserve' if self.balance_pause_reason == 'reserve' else 'Insufficient balance'}. "
+                    f"Resuming in {hours}h {minutes}m {seconds}s"
+                )
+                print(pause_message)
+                return False
+            else:
+                self.insufficient_balance_timestamp = None
+                self.balance_pause_reason = None
+        return True
+
+    async def execute_trade(self, symbol, price):
+        try:
+            # Check balance status first
+            if not await self.check_balance_status():
+                return
+
             ticker = self.client.get_symbol_ticker(symbol=symbol)
             current_price = float(ticker['price'])
             
-            balance = self.client.get_asset_balance(asset='USDT', recvWindow=5000)
-            available_balance = float(balance['free'])
-            if available_balance < 100:
-                print(f"Insufficient balance to place order for {symbol}. Available balance: {available_balance} USDT")
+            available_usdt = await self.get_available_usdt()
+            if available_usdt < self.trade_amount:
+                print(f"{Fore.RED}Balance issue detected:")
+                print(f"Available: {available_usdt} USDT")
+                print(f"Required: {self.trade_amount} USDT")
+                print(f"Reserve: {self.reserve_balance_usdt} USDT")
+                
+                # Set cooldown timestamp and reason
+                self.insufficient_balance_timestamp = datetime.now(timezone.utc)
+                self.balance_pause_reason = "insufficient" if available_usdt > 0 else "reserve"
+                
+                # Cancel all pending orders
+                await self.cancel_all_orders()
+                
+                pause_message = (
+                    "🚨 Trading paused for 24 hours\n"
+                    f"Reason: {'Balance below reserve' if self.balance_pause_reason == 'reserve' else 'Insufficient balance'}\n"
+                    f"Available: {available_usdt} USDT\n"
+                    f"Required: {self.trade_amount} USDT\n"
+                    f"Reserve: {self.reserve_balance_usdt} USDT\n"
+                    "All pending orders have been cancelled."
+                )
+                
+                print(f"{Fore.YELLOW}{pause_message}")
+                
+                if self.use_telegram:
+                    await self.send_telegram_message(pause_message)
                 return
             
             if self.use_percentage:
-                trade_amount = available_balance * self.trade_amount
+                trade_amount = available_usdt * self.trade_amount
             else:
-                trade_amount = self.trade_amount
+                trade_amount = min(self.trade_amount, available_usdt)
             
-            quantity = trade_amount / current_price  # Calculate quantity based on trade amount
+            quantity = trade_amount / current_price
             quantity = self.adjust_quantity(symbol, quantity)
+            
+            timestamp = int(time.time() * 1000) + self.time_offset
             
             if self.order_type == "limit":
                 order = self.client.create_order(
@@ -174,33 +487,22 @@ class BinanceBot:
                     timeInForce=TIME_IN_FORCE_GTC,
                     quantity=quantity,
                     price=str(current_price),
-                    recvWindow=5000
+                    recvWindow=self.recv_window,
+                    timestamp=timestamp
                 )
                 print(f"Limit order set at price {current_price}")
                 self.logger.info(f"Limit order set at price {current_price}")
-                # Wait for the order to be filled
-                while True:
-                    order_status = self.client.get_order(symbol=symbol, orderId=order['orderId'])
-                    if order_status['status'] == 'FILLED':
-                        self.total_bought[symbol] += quantity
-                        self.total_spent[symbol] += quantity * current_price
-                        self.total_trades += 1  # Increment total trades
-                        self.logger.info(f"BUY ORDER for {symbol}: {order}")
-                        print(Fore.GREEN + f"BUY ORDER for {symbol}: {order}")
-                        print(Fore.YELLOW + f"Bought {quantity} {symbol.replace('USDT', '')}")
-                        if self.use_telegram:
-                            self.telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"BUY ORDER for {symbol}: {order}")
-                        self.print_balance_report()  # Print balance report after each buy
-                        self.last_order_time[symbol] = datetime.now(timezone.utc)  # Update last order time
-                        break
-                    time.sleep(1)  # Check order status every second
+                
+                self.pending_orders[symbol] = order['orderId']
+                await self.monitor_order(symbol, order['orderId'], current_price, datetime.now(timezone.utc))
+                
             elif self.order_type == "market":
                 order = self.client.create_order(
                     symbol=symbol,
                     side=SIDE_BUY,
                     type=ORDER_TYPE_MARKET,
                     quantity=quantity,
-                    recvWindow=5000
+                    recvWindow=self.recv_window
                 )
                 self.total_bought[symbol] += quantity
                 self.total_spent[symbol] += quantity * current_price
@@ -209,122 +511,674 @@ class BinanceBot:
                 print(Fore.GREEN + f"BUY ORDER for {symbol}: {order}")
                 print(Fore.YELLOW + f"Bought {quantity} {symbol.replace('USDT', '')}")
                 if self.use_telegram:
-                    self.telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"BUY ORDER for {symbol}: {order}")
+                    asyncio.run(self.send_telegram_message(f"BUY ORDER for {symbol}: {order}"))
                 self.print_balance_report()  # Print balance report after each buy
                 self.last_order_time[symbol] = datetime.now(timezone.utc)  # Update last order time
         except Exception as e:
             self.logger.error(f"Error executing trade for {symbol}: {str(e)}")
             print(f"Error executing trade for {symbol}: {str(e)}")
 
+    async def cancel_all_orders(self):
+        """Cancel all pending orders"""
+        try:
+            for symbol in self.valid_symbols:
+                try:
+                    # Get all open orders for the symbol
+                    open_orders = self.client.get_open_orders(symbol=symbol)
+                    for order in open_orders:
+                        self.client.cancel_order(
+                            symbol=symbol,
+                            orderId=order['orderId']
+                        )
+                        print(f"{Fore.YELLOW}Cancelled order {order['orderId']} for {symbol}")
+                except Exception as e:
+                    print(f"{Fore.RED}Error cancelling orders for {symbol}: {e}")
+                    continue
+        except Exception as e:
+            print(f"{Fore.RED}Error in cancel_all_orders: {e}")
+            self.logger.error(f"Error in cancel_all_orders: {e}")
+
     def fetch_current_price(self, symbol):
         try:
+            # Show clean loading animation
+            print(f"\r{Fore.CYAN}Loading {symbol} price... ⟳", end="")
+            
+            # Get current price and 24h stats
             ticker = self.client.get_symbol_ticker(symbol=symbol)
-            current_price = ticker['price']
-            print(f"Current price of {symbol}: {current_price}")
+            stats_24h = self.client.get_ticker(symbol=symbol)
+            current_price = float(ticker['price'])
+            price_change = float(stats_24h['priceChangePercent'])
+            
+            # Determine trend direction and color based on price change
+            trend_arrow = "↑" if price_change >= 0 else "↓"
+            trend_color = Fore.GREEN if price_change >= 0 else Fore.RED
+            
+            # Print clean price info
+            print(f"\r{Fore.CYAN}[{datetime.now().strftime('%H:%M:%S')}] {symbol}:")
+            print(f"  Price: {trend_color}{current_price:.2f} USDT {trend_arrow}")
+            print(f"  24h Change: {trend_color}{price_change:+.2f}% {trend_arrow}")
+            
+            # Get and format reference prices
+            reference_prices = self.get_reference_prices(symbol)
+            print(f"{Fore.CYAN}Reference Prices for {symbol}:")
+            for timeframe, prices in reference_prices.items():
+                # Calculate percentage change from open
+                change_from_open = ((current_price - prices['open']) / prices['open']) * 100
+                
+                # If price is higher than open: GREEN, ↑, positive percentage
+                # If price is lower than open: RED, ↓, negative percentage
+                price_color = Fore.GREEN if change_from_open >= 0 else Fore.RED
+                price_arrow = "↑" if change_from_open >= 0 else "↓"
+                
+                print(f"  {timeframe.capitalize()}:")
+                print(f"    Open: {prices['open']:.2f} USDT")
+                print(f"    High: {prices['high']:.2f} USDT")
+                print(f"    Low: {prices['low']:.2f} USDT")
+                print(f"    Change: {price_color}{change_from_open:+.2f}% {price_arrow}")
+            
+            return current_price
         except Exception as e:
-            print(f"Error fetching current price of {symbol}: {str(e)}")
+            print(f"\r{Fore.RED}Error fetching price for {symbol}: {str(e)}")
             self.logger.error(f"Error fetching current price of {symbol}: {str(e)}")
+            return None
 
-    def handle_balance(self, update, context):
+    async def handle_balance(self, update, context):
         balance_report = self.get_balance()
         if balance_report:
             balance_message = "\n".join([f"{asset}: {total}" for asset, total in balance_report.items()])
-            update.message.reply_text(f"Current balance:\n{balance_message}")
+            await update.message.reply_text(f"Current balance:\n{balance_message}")
         else:
-            update.message.reply_text("Error fetching balance.")
+            await update.message.reply_text("Error fetching balance.")
 
-    def handle_trades(self, update, context):
-        update.message.reply_text(f"Total number of trades done: {self.total_trades}")
+    async def handle_trades(self, update, context):
+        await update.message.reply_text(f"Total number of trades done: {self.total_trades}")
 
-    def handle_profits(self, update, context):
+    async def handle_profits(self, update, context):
         profits = self.get_profits()
         if profits is not None:
             profit_message = "\n".join([f"{symbol}: {profit} USDT" for symbol, profit in profits.items()])
-            update.message.reply_text(f"Current profits:\n{profit_message}")
+            await update.message.reply_text(f"Current profits:\n{profit_message}")
         else:
-            update.message.reply_text("Error calculating profits.")
+            await update.message.reply_text("Error calculating profits.")
+
+    async def handle_start(self, update, context):
+        welcome_msg = (
+            "🤖 Bot is running!\n\n"
+            "Available commands:\n"
+            "/positions - Show available trade opportunities\n"
+            "/balance - Show current balance\n"
+            "/trades - Show total trades\n"
+            "/profits - Show current profits\n"
+            "/stats - Show system stats and bot information"
+        )
+        await update.message.reply_text(welcome_msg)
+
+    async def handle_positions(self, update, context):
+        """Handle /positions command - Show available trade opportunities"""
+        try:
+            message = "🎯 Available Trading Positions:\n\n"
+            
+            for symbol in self.valid_symbols:  # Changed from TRADING_SYMBOLS
+                message += f"📊 {symbol}:\n"
+                
+                for timeframe in ['daily', 'weekly', 'monthly']:
+                    if self.timeframe_config[timeframe]['enabled']:
+                        message += f"\n{timeframe.capitalize()}:\n"
+                        
+                        # Get available thresholds
+                        available_thresholds = []
+                        for threshold in self.timeframe_config[timeframe]['thresholds']:
+                            if not self.strategy.order_history[timeframe].get(symbol, {}).get(threshold):
+                                available_thresholds.append(f"{threshold*100}%")
+                        
+                        if available_thresholds:
+                            message += f"  Available drops: {', '.join(available_thresholds)}\n"
+                        else:
+                            message += "  ❌ All positions filled\n"
+                
+                message += "\n" + "-"*20 + "\n"
+            
+            # Add current prices
+            message += "\n📈 Current Prices:\n"
+            for symbol in self.valid_symbols:  # Changed from TRADING_SYMBOLS
+                price = self.client.get_symbol_ticker(symbol=symbol)['price']
+                message += f"{symbol}: {price}\n"
+            
+            await update.message.reply_text(message)
+            
+        except Exception as e:
+            error_msg = f"Error fetching positions: {str(e)}"
+            self.logger.error(error_msg)
+            await update.message.reply_text(error_msg)
+
+    async def send_telegram_message(self, message):
+        if self.use_telegram:
+            try:
+                await self.telegram_app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+            except Exception as e:
+                print(f"Error sending Telegram message: {e}")
+
+    def get_reference_prices(self, symbol):
+        references = {}
+        
+        try:
+            if self.timeframe_config['daily']['enabled']:
+                daily_data = self.get_historical_data(symbol, Client.KLINE_INTERVAL_1DAY, "2 days ago UTC")
+                references['daily'] = {
+                    'open': float(daily_data['open'].iloc[-1]),
+                    'high': float(daily_data['high'].iloc[-1]),
+                    'low': float(daily_data['low'].iloc[-1])
+                }
+            
+            if self.timeframe_config['weekly']['enabled']:
+                weekly_data = self.get_historical_data(symbol, Client.KLINE_INTERVAL_1WEEK, "2 weeks ago UTC")
+                references['weekly'] = {
+                    'open': float(weekly_data['open'].iloc[-1]),
+                    'high': float(weekly_data['high'].iloc[-1]),
+                    'low': float(weekly_data['low'].iloc[-1])
+                }
+            
+            if self.timeframe_config['monthly']['enabled']:
+                monthly_data = self.get_historical_data(symbol, Client.KLINE_INTERVAL_1MONTH, "2 months ago UTC")
+                references['monthly'] = {
+                    'open': float(monthly_data['open'].iloc[-1]),
+                    'high': float(monthly_data['high'].iloc[-1]),
+                    'low': float(monthly_data['low'].iloc[-1])
+                }
+        except Exception as e:
+            self.logger.error(f"Error getting reference prices for {symbol}: {e}")
+            
+        return references
+
+    async def handle_stats(self, update, context):
+        """Handle /stats command - Show system stats and bot runtime information"""
+        try:
+            # Get system information
+            cpu_percent = psutil.cpu_percent(interval=1)
+            memory = psutil.virtual_memory()
+            disk = psutil.disk_usage('/')
+            
+            # Calculate bot runtime
+            runtime = datetime.now() - self.start_time
+            days = runtime.days
+            hours = runtime.seconds // 3600
+            minutes = (runtime.seconds % 3600) // 60
+            seconds = runtime.seconds % 60
+            
+            # Format message
+            stats_message = (
+                "🤖 Bot Statistics\n\n"
+                f"⏱️ Runtime: {days}d {hours}h {minutes}m {seconds}s\n"
+                f"🔄 Total Trades: {self.total_trades}\n\n"
+                "💻 System Information:\n"
+                f"CPU Usage: {cpu_percent}%\n"
+                f"RAM Usage: {memory.percent}%\n"
+                f"Free RAM: {memory.available / 1024 / 1024:.1f}MB\n"
+                f"Disk Usage: {disk.percent}%\n"
+                f"Free Disk: {disk.free / 1024 / 1024 / 1024:.1f}GB\n\n"
+                "⚙️ Bot Configuration:\n"
+                f"Order Type: {self.order_type}\n"
+                f"Using Testnet: {self.client.API_URL == 'https://testnet.binance.vision/api'}\n"
+                f"Symbols: {', '.join(self.valid_symbols)}\n"  # Changed from TRADING_SYMBOLS
+                "Timeframes Enabled:\n"
+            )
+            
+            # Add timeframe information
+            for timeframe in self.timeframe_config:
+                if self.timeframe_config[timeframe]['enabled']:
+                    thresholds = [f"{t*100}%" for t in self.timeframe_config[timeframe]['thresholds']]
+                    stats_message += f"- {timeframe.capitalize()}: {', '.join(thresholds)}\n"
+            
+            # Add trading amounts
+            stats_message += f"\n💰 Trading Configuration:\n"
+            stats_message += f"USDT Reserve: {self.reserve_balance_usdt}\n"
+            if self.use_percentage:
+                stats_message += f"Trade Amount: {self.trade_amount * 100}% of available USDT\n"
+            else:
+                stats_message += f"Trade Amount: {self.trade_amount} USDT\n"
+            
+            await update.message.reply_text(stats_message)
+            
+        except Exception as e:
+            error_msg = f"Error fetching stats: {str(e)}"
+            self.logger.error(error_msg)
+            await update.message.reply_text(error_msg)
+
+    async def main_loop(self):
+        try:
+            fetch_price_interval = 60  # 60 seconds between checks
+            last_price_fetch_time = time.time() - fetch_price_interval
+            next_daily_open_check = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+
+            if self.use_telegram:
+                try:
+                    await self.telegram_app.initialize()
+                    await self.setup_telegram_commands()
+                    await self.telegram_app.start()
+                    await self.telegram_app.updater.start_polling()
+                    print(f"{Fore.GREEN}Telegram bot started successfully!")
+                except Exception as e:
+                    print(f"{Fore.RED}Error starting Telegram bot: {e}")
+                    self.use_telegram = False  # Disable Telegram if it fails to start
+
+            self.print_daily_open_price()
+            self.print_balance_report()
+
+            print(Fore.GREEN + "Bot started successfully!")
+            print(Fore.YELLOW + "Monitoring price movements...")
+            self.logger.info("Bot started successfully!")
+
+            while True:
+                try:
+                    current_time = time.time()
+                    time_until_next_check = max(0, fetch_price_interval - (current_time - last_price_fetch_time))
+
+                    # Fetch current prices at regular intervals
+                    if time_until_next_check <= 0:
+                        for symbol in self.valid_symbols:  # Use valid_symbols instead of TRADING_SYMBOLS
+                            current_price = self.fetch_current_price(symbol)
+                            if current_price is not None:
+                                # Get reference prices and show drops
+                                reference_prices = self.get_reference_prices(symbol)
+                                print(f"{Fore.CYAN}Reference Prices for {symbol}:")
+                                for timeframe, prices in reference_prices.items():
+                                    drop = ((prices['open'] - current_price) / prices['open']) * 100
+                                    trend_arrow = "↑" if drop < 0 else "↓"
+                                    trend_color = Fore.GREEN if drop < 0 else Fore.RED
+                                    print(f"  {timeframe.capitalize()}:")
+                                    print(f"    Open: {prices['open']:.2f} USDT")
+                                    print(f"    High: {prices['high']:.2f} USDT")
+                                    print(f"    Low: {prices['low']:.2f} USDT")
+                                    print(f"    Change: {trend_color}{drop:+.2f}% {trend_arrow}")
+
+                        last_price_fetch_time = current_time
+                    else:
+                        # Show countdown
+                        print(f"\r{Fore.YELLOW}Next price check in: {int(time_until_next_check)} seconds ⏳", end="")
+                        await asyncio.sleep(1)  # Update countdown every second
+                        continue
+
+                    # Check for daily open price at 00:00 UTC
+                    if datetime.now(timezone.utc) >= next_daily_open_check:
+                        self.print_daily_open_price()
+                        next_daily_open_check += timedelta(days=1)
+
+                    # Reset orders placed at the end of each timeframe
+                    for timeframe, reset_time in self.next_reset_times.items():
+                        if datetime.now(timezone.utc) >= reset_time:
+                            if timeframe == 'daily':
+                                self.next_reset_times[timeframe] = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+                            elif timeframe == 'weekly':
+                                self.next_reset_times[timeframe] = self.get_next_weekly_reset()
+                            elif timeframe == 'monthly':
+                                self.next_reset_times[timeframe] = self.get_next_monthly_reset()
+                        
+                            self.strategy.order_history[timeframe] = {}
+
+                    await asyncio.sleep(10)
+                
+                except Exception as e:
+                    print(Fore.RED + f"Error in main loop: {str(e)}")
+                    self.logger.error(f"Error in main loop: {str(e)}")
+                    await asyncio.sleep(60)
+        except Exception as e:
+            self.logger.error(f"Error in main loop: {e}")
+            if self.use_telegram:
+                try:
+                    if self.telegram_app.running:
+                        await self.telegram_app.stop()
+                except Exception as e:
+                    print(f"{Fore.RED}Error stopping Telegram bot: {str(e)}")
+            raise
+        finally:
+            await self._shutdown_telegram()
+
+    def get_profits(self):
+        """Calculate current profits"""
+        try:
+            profits = {}
+            current_prices = {}
+            
+            # Get current prices
+            for symbol in self.valid_symbols:  # Changed from TRADING_SYMBOLS
+                ticker = self.client.get_symbol_ticker(symbol=symbol)
+                current_prices[symbol] = float(ticker['price'])
+            
+            # Calculate profits for each symbol
+            for symbol in self.valid_symbols:  # Changed from TRADING_SYMBOLS
+                if self.total_bought[symbol] > 0:
+                    current_value = self.total_bought[symbol] * current_prices[symbol]
+                    profit = current_value - self.total_spent[symbol]
+                    profits[symbol] = round(profit, 2)
+                else:
+                    profits[symbol] = 0
+                    
+            return profits
+        except Exception as e:
+            self.logger.error(f"Error calculating profits: {e}")
+            return None
+
+    async def handle_distribution(self, update, context):
+        """Handle /distribution command"""
+        try:
+            no_data = True
+            for symbol in self.valid_symbols:
+                try:
+                    if self.total_bought[symbol] > 0:
+                        # Get entry prices from orders_placed
+                        entry_prices = []
+                        for timeframe in self.orders_placed[symbol].values():
+                            for order in timeframe.values():
+                                try:
+                                    entry_prices.append(float(order['price']))
+                                except (KeyError, ValueError):
+                                    continue
+                        
+                        if entry_prices:
+                            no_data = False
+                            graph = self.graph_generator.generate_entry_price_histogram(symbol, entry_prices)
+                            if graph:
+                                await update.message.reply_photo(
+                                    photo=graph,
+                                    caption=f"Entry price distribution for {symbol}"
+                                )
+                            else:
+                                await update.message.reply_text(
+                                    f"⚠️ Could not generate graph for {symbol}. Please try again later."
+                                )
+                except Exception as e:
+                    await update.message.reply_text(
+                        f"⚠️ Error processing {symbol}: {str(e)}"
+                    )
+                    continue
+            
+            if no_data:
+                await update.message.reply_text(
+                    "📊 No trading data available yet. Make some trades first!"
+                )
+                
+        except Exception as e:
+            await update.message.reply_text(
+                "❌ Error generating distribution graphs. Please try again later.\n"
+                f"Error: {str(e)}"
+            )
+            self.logger.error(f"Error in handle_distribution: {str(e)}")
+
+    # Similar error handling for other graph commands...
+    async def handle_stacking(self, update, context):
+        """Handle /stacking command"""
+        try:
+            no_data = True
+            for symbol in self.valid_symbols:
+                try:
+                    if self.total_bought[symbol] > 0:
+                        timestamps = []
+                        quantities = []
+                        prices = []
+                        
+                        for timeframe in self.orders_placed[symbol].values():
+                            for order in timeframe.values():
+                                try:
+                                    timestamps.append(order['timestamp'])
+                                    quantities.append(float(order['qty']))
+                                    prices.append(float(order['price']))
+                                except (KeyError, ValueError):
+                                    continue
+                        
+                        if timestamps:
+                            no_data = False
+                            graph = self.graph_generator.generate_position_stacking(
+                                symbol, timestamps, quantities, prices
+                            )
+                            if graph:
+                                await update.message.reply_photo(
+                                    photo=graph,
+                                    caption=f"Position building for {symbol}"
+                                )
+                            else:
+                                await update.message.reply_text(
+                                    f"⚠️ Could not generate stacking graph for {symbol}"
+                                )
+                except Exception as e:
+                    await update.message.reply_text(
+                        f"⚠️ Error processing {symbol}: {str(e)}"
+                    )
+                    continue
+            
+            if no_data:
+                await update.message.reply_text(
+                    "📊 No position data available yet. Make some trades first!"
+                )
+                
+        except Exception as e:
+            await update.message.reply_text(
+                "❌ Error generating stacking visualization. Please try again later.\n"
+                f"Error: {str(e)}"
+            )
+            self.logger.error(f"Error in handle_stacking: {str(e)}")
+
+    # Add similar error handling for other graph handlers...
+    async def handle_buy_times(self, update, context):
+        """Handle /buytimes command"""
+        try:
+            buy_timestamps = []
+            for symbol in self.valid_symbols:
+                for timeframe in self.orders_placed[symbol].values():
+                    for order in timeframe.values():
+                        buy_timestamps.append(order['timestamp'])
+            
+            if buy_timestamps:
+                graph = self.graph_generator.generate_time_between_buys(sorted(buy_timestamps))
+                if graph:
+                    await update.message.reply_photo(photo=graph)
+                else:
+                    await update.message.reply_text("Need at least 2 trades to generate time analysis")
+            else:
+                await update.message.reply_text("No trades found")
+        except Exception as e:
+            await update.message.reply_text(f"Error generating buy times analysis: {str(e)}")
+
+    async def handle_portfolio(self, update, context):
+        """Handle /portfolio command"""
+        try:
+            # Get historical portfolio values
+            timestamps = []
+            total_values = []
+            
+            # Calculate portfolio value at each trade
+            current_prices = {symbol: float(self.client.get_symbol_ticker(symbol=symbol)['price']) 
+                            for symbol in self.valid_symbols}
+            
+            for timestamp in sorted(set([order['timestamp'] 
+                                      for symbol in self.valid_symbols 
+                                      for timeframe in self.orders_placed[symbol].values() 
+                                      for order in timeframe.values()])):
+                total_value = sum(self.total_bought[symbol] * current_prices[symbol] 
+                                for symbol in self.valid_symbols)
+                timestamps.append(timestamp)
+                total_values.append(total_value)
+            
+            if timestamps:
+                graph = self.graph_generator.generate_portfolio_evolution(timestamps, total_values)
+                await update.message.reply_photo(photo=graph)
+            else:
+                await update.message.reply_text("No portfolio data available")
+        except Exception as e:
+            await update.message.reply_text(f"Error generating portfolio evolution: {str(e)}")
+
+    async def handle_allocation(self, update, context):
+        """Handle /allocation command"""
+        try:
+            assets = []
+            values = []
+            
+            for symbol in self.valid_symbols:
+                if self.total_bought[symbol] > 0:
+                    current_price = float(self.client.get_symbol_ticker(symbol=symbol)['price'])
+                    value = self.total_bought[symbol] * current_price
+                    if value > 0:
+                        assets.append(symbol)
+                        values.append(value)
+            
+            if values:
+                graph = self.graph_generator.generate_asset_allocation(assets, values)
+                await update.message.reply_photo(photo=graph)
+            else:
+                await update.message.reply_text("No assets found in portfolio")
+        except Exception as e:
+            await update.message.reply_text(f"Error generating asset allocation: {str(e)}")
 
     def run(self):
-        fetch_price_interval = 60  # Check every minute to catch flash trades
-        last_price_fetch_time = time.time() - fetch_price_interval  # Ensure the price is fetched immediately on start
-        next_daily_open_check = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
-
-        if self.use_telegram:
-            updater = Updater(TELEGRAM_TOKEN)  # Corrected initialization
-            dispatcher = updater.dispatcher
-            dispatcher.add_handler(CommandHandler("balance", self.handle_balance))
-            dispatcher.add_handler(CommandHandler("trades", self.handle_trades))
-            dispatcher.add_handler(CommandHandler("profits", self.handle_profits))
-            updater.start_polling()
-
-        self.print_daily_open_price()  # Print daily open price at startup
-        self.print_balance_report()  # Print balance report at startup
-
-        while True:
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
             try:
-                current_time = time.time()
-                if current_time - last_price_fetch_time >= fetch_price_interval:
-                    for symbol in TRADING_SYMBOLS:
-                        self.fetch_current_price(symbol)
-                    last_price_fetch_time = current_time
-
-                if datetime.now(timezone.utc) >= next_daily_open_check:
-                    self.print_daily_open_price()
-                    next_daily_open_check += timedelta(days=1)
-                    self.last_order_time = {symbol: None for symbol in TRADING_SYMBOLS}  # Reset last order time at 00:00 UTC
-                    self.orders_placed_today = {symbol: {threshold: False for threshold in self.strategy.drop_thresholds} for symbol in TRADING_SYMBOLS}  # Reset orders placed today count
-                    self.max_trades_executed = False  # Reset max trades executed flag
-
-                if not self.max_trades_executed:
-                    for symbol in TRADING_SYMBOLS:
-                        if any(not placed for placed in self.orders_placed_today[symbol].values()):
-                            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                            print(f"[{timestamp}] Fetching historical data for {symbol}...")
-                            historical_data = self.get_historical_data(symbol, TIME_INTERVAL, "1 day ago UTC")
-                            daily_open_price = self.get_daily_open_price(symbol)
-                            signals = self.strategy.generate_signals(historical_data['close'].astype(float).values, daily_open_price)
-                            
-                            for threshold, price in signals:
-                                if not self.orders_placed_today[symbol][threshold]:
-                                    print(f"Signal generated for {symbol} at threshold {threshold}: BUY at price {price}")
-                                    self.execute_trade(symbol, price)
-                                    self.orders_placed_today[symbol][threshold] = True
-                                    self.logger.info(f"Signal generated for {symbol} at threshold {threshold}: BUY at price {price}")
-                    self.max_trades_executed = all(all(placed for placed in self.orders_placed_today[symbol].values()) for symbol in TRADING_SYMBOLS)
-                else:
-                    next_reset_time = next_daily_open_check - datetime.now(timezone.utc)
-                    print(f"Max trades executed for the day. Next reset in {next_reset_time}.")
-                    self.logger.info(f"Max trades executed for the day. Next reset in {next_reset_time}.")
-                    if self.use_telegram:
-                        self.telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"Max trades executed for the day. Next reset in {next_reset_time}.")
-                    time.sleep(3600)  # Sleep for an hour before checking again
+                loop.run_until_complete(self.main_loop())
+            except KeyboardInterrupt:
+                print(f"\n{Fore.YELLOW}Shutting down bot...")
+            finally:
+                loop.run_until_complete(self._shutdown_telegram())
+                loop.run_until_complete(loop.shutdown_asyncgens())
+                loop.close()
+                print(f"{Fore.GREEN}Bot stopped successfully")
                 
-                time.sleep(60)  # Check every minute
-                
-            except Exception as e:
-                self.logger.error(f"Error in main loop: {str(e)}")
-                print(f"Error in main loop: {str(e)}")
-                time.sleep(60)
+        except Exception as e:
+            print(f"{Fore.RED}Error in event loop: {str(e)}")
+            self.logger.error(f"Error in event loop: {str(e)}")
 
 if __name__ == "__main__":
-    use_testnet = input("Do you want to use the testnet? (yes/no): ").strip().lower() == 'yes'
-    use_telegram = input("Do you want to use Telegram notifications? (yes/no): ").strip().lower() == 'yes'
-    num_thresholds = int(input("Enter the number of drop thresholds: ").strip())
-    drop_thresholds = []
-    for i in range(num_thresholds):
+    try:
+        # Validate testnet input
         while True:
-            threshold = float(input(f"Enter drop threshold {i+1} percentage (e.g., 1 for 1%): ").strip()) / 100
-            if i == 0 or threshold > drop_thresholds[-1]:
-                drop_thresholds.append(threshold)
+            testnet_input = input("Do you want to use the testnet? (yes/no): ").strip().lower()
+            if testnet_input in ['yes', 'no']:
+                use_testnet = testnet_input == 'yes'
                 break
+            print("Invalid input. Please enter 'yes' or 'no'.")
+
+        # Validate telegram input
+        while True:
+            telegram_input = input("Do you want to use Telegram notifications? (yes/no): ").strip().lower()
+            if telegram_input in ['yes', 'no']:
+                use_telegram = telegram_input == 'yes'
+                break
+            print("Invalid input. Please enter 'yes' or 'no'.")
+
+        # Validate USDT reserve
+        while True:
+            try:
+                reserve_balance_usdt = float(input("Enter the USDT reserve balance (minimum USDT to keep): ").strip())
+                if reserve_balance_usdt >= 0:
+                    print(f"USDT Reserve set to: {reserve_balance_usdt} USDT")
+                    break
+                print("Reserve balance must be non-negative.")
+            except ValueError:
+                print("Please enter a valid number.")
+
+        # Configure timeframes with validation
+        timeframe_config = {}
+        timeframes = ['daily', 'weekly', 'monthly']
+        
+        for timeframe in timeframes:
+            print(f"\n{Fore.CYAN}Configure {timeframe.capitalize()} Settings:")
+            print(f"{Fore.YELLOW}Note: Thresholds must be entered in ascending order (e.g., 1%, 2%, 3%)")
+            while True:
+                enabled_input = input(f"Enable {timeframe} trading? (yes/no): ").strip().lower()
+                if enabled_input in ['yes', 'no']:
+                    enabled = enabled_input == 'yes'
+                    break
+                print("Invalid input. Please enter 'yes' or 'no'.")
+            
+            if enabled:
+                while True:
+                    try:
+                        num_thresholds = int(input(f"Enter the number of {timeframe} drop thresholds: ").strip())
+                        if 0 < num_thresholds <= 10:
+                            break
+                        print("Please enter a number between 1 and 10.")
+                    except ValueError:
+                        print("Please enter a valid number.")
+
+                thresholds = []
+                last_threshold = 0  # Keep track of last threshold
+                for i in range(num_thresholds):
+                    while True:
+                        try:
+                            threshold_input = float(input(f"Enter {timeframe} drop threshold {i+1} percentage (must be > {last_threshold:.1f}%): ").strip())
+                            threshold = threshold_input / 100
+                            
+                            # Compare the input values directly, not the converted ones
+                            if threshold_input <= last_threshold:
+                                print(f"Threshold must be higher than {last_threshold:.1f}%")
+                                continue
+                                
+                            if 0 < threshold_input <= 100:
+                                thresholds.append(threshold)
+                                last_threshold = threshold_input  # Store the input percentage, not the converted value
+                                break
+                                
+                            print("Threshold must be between 0 and 100 percent.")
+                        except ValueError:
+                            print("Please enter a valid number.")
+                
+                timeframe_config[timeframe] = {
+                    'enabled': enabled,
+                    'thresholds': thresholds,
+                    'orders_placed': {}
+                }
             else:
-                print(f"Threshold {i+1} must be higher than threshold {i}. Please enter a valid value.")
-    order_type = input("Do you want to use limit orders or market orders? (limit/market): ").strip().lower()
-    use_percentage = input("Do you want to use a percentage of USDT per trade? (yes/no): ").strip().lower() == 'yes'
-    if use_percentage:
-        trade_amount = float(input("Enter the percentage of USDT to use per trade (e.g., 10 for 10%): ").strip()) / 100
-    else:
-        trade_amount = float(input("Enter the amount of USDT to use per trade: ").strip())
-    bot = BinanceBot(use_testnet, use_telegram, drop_thresholds, order_type, use_percentage, trade_amount)
-    bot.test_connection()
-    bot.run()
+                timeframe_config[timeframe] = {
+                    'enabled': False,
+                    'thresholds': [],
+                    'orders_placed': {}
+                }
+
+        # Validate order type
+        while True:
+            order_type = input("Do you want to use limit orders or market orders? (limit/market): ").strip().lower()
+            if order_type in ['limit', 'market']:
+                break
+            print("Invalid input. Please enter 'limit' or 'market'.")
+
+        # Validate trade amount type
+        while True:
+            percentage_input = input("Do you want to use a percentage of USDT per trade? (yes/no): ").strip().lower()
+            if percentage_input in ['yes', 'no']:
+                use_percentage = percentage_input == 'yes'
+                break
+            print("Invalid input. Please enter 'yes' or 'no'.")
+
+        # Validate trade amount
+        while True:
+            try:
+                if use_percentage:
+                    trade_amount = float(input("Enter the percentage of USDT to use per trade (e.g., 10 for 10%): ").strip()) / 100
+                    if 0 < trade_amount <= 1:
+                        break
+                    print("Percentage must be between 0 and 100.")
+                else:
+                    trade_amount = float(input("Enter the amount of USDT to use per trade: ").strip())
+                    if trade_amount > 0:
+                        break
+                    print("Amount must be greater than 0.")
+            except ValueError:
+                print("Please enter a valid number.")
+
+        # Initialize and run bot with error handling
+        try:
+            bot = BinanceBot(use_testnet, use_telegram, timeframe_config, order_type, use_percentage, trade_amount, reserve_balance_usdt)
+            bot.test_connection()
+            bot.run()
+        except Exception as e:
+            print(f"Error initializing bot: {str(e)}")
+            logging.error(f"Error initializing bot: {str(e)}")
+
+    except KeyboardInterrupt:
+        print("\nBot shutdown requested by user.")
+    except Exception as e:
+        print(f"Unexpected error: {str(e)}")
+        logging.error(f"Unexpected error: {str(e)}")
+
+
+

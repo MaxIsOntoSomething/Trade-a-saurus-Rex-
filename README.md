@@ -1,12 +1,38 @@
-## Installation and Usage of the Binance Bot
+# Binance Trading Bot
 
-### Prerequisites
+A sophisticated cryptocurrency trading bot that implements a drop-based buying strategy across multiple timeframes with advanced visualization capabilities.
+
+## Core Features 🚀
+
+- ✨ Multi-timeframe monitoring (daily, weekly, monthly)
+- 📊 Advanced visualization and analytics
+- 💰 Dynamic drop threshold system
+- 🔒 Balance protection with USDT reserve
+- 📈 Real-time price tracking and trend indicators
+- 🤖 Comprehensive Telegram integration
+- 📉 Advanced performance graphs and statistics
+- ⚡ Limit and market order support
+- 🛡️ Smart symbol validation and error handling
+- 💹 Portfolio analysis and tracking
+- 📝 Automatic invalid symbol management
+- 🕒 24h trading pause on low balance
+- 📊 Data visualization suite
+
+## Analytics & Visualization Features
+
+- 📊 Entry price distribution histograms
+- 📈 Position building visualization
+- ⏱️ Trade timing analysis
+- 💼 Portfolio value evolution
+- 🥧 Asset allocation charts
+
+## Prerequisites
 
 - Python 3.7 or higher
-- A Binance account
-- A Telegram account for notifications (optional)
+- Binance account
+- Telegram bot (optional but recommended)
 
-### Installation
+## Installation
 
 1. **Clone the repository**
     ```sh
@@ -14,7 +40,7 @@
     cd binance-bot
     ```
 
-2. **Create and activate a virtual environment**
+2. **Set up virtual environment**
     ```sh
     python -m venv venv
     source venv/bin/activate  # On Windows: venv\Scripts\activate
@@ -25,80 +51,128 @@
     pip install -r requirements.txt
     ```
 
-4. **Copy the configuration template and edit the configuration file**
+4. **Configure the bot**
     ```sh
     cp config/config_template.json config/config.json
     ```
-    Edit the file [config.json](http://_vscodecontentref_/3) and add your Binance and Telegram API keys:
+    Edit config.json with your credentials:
     ```json
     {
-         "BINANCE_API_KEY": "YOUR_BINANCE_API_KEY",
-         "BINANCE_API_SECRET": "YOUR_BINANCE_API_SECRET",
-         "TESTNET_API_KEY": "YOUR_TESTNET_API_KEY",
-         "TESTNET_API_SECRET": "YOUR_TESTNET_API_SECRET",
-         "TRADING_SYMBOLS": ["BTCUSDT", "ETHUSDT", "SOLUSDT"], 
-         "QUANTITY_PERCENTAGE": 0.1, 
-         "TIME_INTERVAL": "1d",
-         "TELEGRAM_TOKEN": "YOUR_TELEGRAM_BOT_TOKEN",
-         "TELEGRAM_CHAT_ID": "YOUR_TELEGRAM_CHAT_ID",
-         "DROP_THRESHOLDS": [0.01, 0.02, 0.03]  
+        "BINANCE_API_KEY": "your_api_key",
+        "BINANCE_API_SECRET": "your_api_secret",
+        "TESTNET_API_KEY": "your_testnet_key",
+        "TESTNET_API_SECRET": "your_testnet_secret",
+        "TRADING_SYMBOLS": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+        "TELEGRAM_TOKEN": "your_telegram_token",
+        "TELEGRAM_CHAT_ID": "your_chat_id"
     }
     ```
 
-### Usage
+## Usage
 
 1. **Start the bot**
     ```sh
     python main.py
     ```
 
-2. **Select Testnet or Live Network**
-    When starting, you will be asked if you want to use the Testnet. Answer with `yes` or `no`.
+2. **Initial Configuration**
+    - Choose between Testnet/Live trading
+    - Set up Telegram notifications
+    - Configure USDT reserve amount
+    - Set up timeframes and thresholds
+    - Choose order type (limit/market)
+    - Configure trade amounts
 
-3. **Select Telegram notifications**
-    When starting, you will be asked if you want to use Telegram notifications. Answer with `yes` or `no`.
+3. **Telegram Commands**
+    - `/start` - Show available commands
+    - `/positions` - Show trading opportunities
+    - `/balance` - Current balance
+    - `/trades` - Trade count
+    - `/profits` - Current profits
+    - `/stats` - System statistics
+    - `/distribution` - Price entry distribution
+    - `/stacking` - Position building analysis
+    - `/buytimes` - Trade timing analysis
+    - `/portfolio` - Portfolio evolution
+    - `/allocation` - Asset allocation
 
-4. **Set the drop thresholds**
-    When starting, you will be asked to enter the number of drop thresholds and their percentages in ascending order (e.g., 1 for 1%, 2 for 2%, etc.).
+## Trading Strategy
 
-5. **Select order type**
-    When starting, you will be asked if you want to use limit orders or market orders. Answer with `limit` or `market`.
+The bot implements a multi-timeframe drop-based buying strategy:
+- Monitors price drops across daily, weekly, and monthly timeframes
+- Executes trades when price drops reach configured thresholds
+- Maintains separate thresholds for each timeframe
+- Implements smart order management and position building
 
-6. **Set trade amount**
-    When starting, you will be asked if you want to use a percentage of USDT per trade or a fixed amount. Enter the percentage or the fixed amount accordingly.
+## Analytics Features
 
-7. **Telegram commands** (if Telegram is enabled)
-    - `/balance`: Shows the current account balance.
-    - `/trades`: Shows the total number of trades done.
-    - `/profits`: Shows the current profits.
+1. **Entry Price Analysis**
+   - Distribution of entry prices
+   - Entry timing patterns
+   - Price level analysis
 
-### Example Screenshots
+2. **Position Building**
+   - Cumulative position growth
+   - Entry point visualization
+   - Position building patterns
 
-#### Bot Starting
-![Bot Starting](img/bot_starting.png)
+3. **Portfolio Analytics**
+   - Value evolution over time
+   - Asset allocation
+   - Performance metrics
 
-#### Bot Buying
-![Bot Buying](img/bot_buying.png)
+4. **Trading Patterns**
+   - Time between trades
+   - Trade frequency analysis
+   - Market timing visualization
 
-### Disclaimer
+## Completed Features ✅
 
-This bot is available to everyone. Losses and usage are at your own risk.
+- [x] Multi-timeframe support
+- [x] Enhanced Telegram integration
+- [x] Advanced graphing capabilities
+- [x] Portfolio analytics
+- [x] Position tracking
+- [x] Trade timing analysis
+- [x] Asset allocation visualization
+- [x] Error handling and recovery
+- [x] Invalid symbol management
+- [x] Balance protection system
 
-### TODO
+## TODO 📋
 
-- Implement multiple strategies
-- Support for other exchanges
-- Backtesting capabilities
-- Local UI for management
-- Docker Implementation so it works on Ubuntu Server and Windows Docker
-- More drops to choose from: Monthly, weekly, yearly and also drops for each of them
-- Stock Updates from stocks chosen in config.json
-- More Telegram features
-- More buying settings like Bollinger Bands, Ichimoku Cloud, EMA, etc.
-- Put invalid symbols in a file and ignore them
+- [ ] Implement sell strategies
+- [ ] Add more technical indicators
+- [ ] Develop backtesting module
+- [ ] Create web dashboard
+- [ ] Add more exchanges
+- [ ] Implement machine learning predictions
+- [ ] Add trade journal export
+- [ ] Create mobile app integration
+- [ ] Add email notifications
+- [ ] Implement stop-loss features
 
-### Contact
+## Safety Features
 
-![Discord](https://img.shields.io/badge/Discord-7289DA?style=for-the-badge&logo=discord&logoColor=white)
+- Real-time balance monitoring
+- USDT reserve protection
+- Invalid symbol detection
+- Error recovery system
+- Automatic trade pausing
+- Order timeout protection
 
-You can reach me on Discord: **maskiplays**
+## Support & Contact
+
+For support or questions:
+
+[![Discord](https://img.shields.io/badge/Discord-7289DA?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/)
+
+Discord: **maskiplays**
+
+## Disclaimer
+
+This bot is provided for educational purposes. Trading cryptocurrencies carries significant risks. Use at your own discretion and risk.
+
+## License
+
+MIT License - Feel free to use and modify as needed.

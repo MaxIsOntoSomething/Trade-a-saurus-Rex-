@@ -3,10 +3,23 @@
     "BINANCE_API_SECRET": "YOUR_BINANCE_API_SECRET",
     "TESTNET_API_KEY": "YOUR_TESTNET_API_KEY",
     "TESTNET_API_SECRET": "YOUR_TESTNET_API_SECRET",
-    "TRADING_SYMBOLS": ["BTCUSDT", "ETHUSDT"], 
-    "QUANTITY_PERCENTAGE": 0.1, 
+    "TRADING_SYMBOLS": ["BTCUSDT", "ETHUSDT"],
     "TIME_INTERVAL": "1d",
     "TELEGRAM_TOKEN": "YOUR_TELEGRAM_BOT_TOKEN",
     "TELEGRAM_CHAT_ID": "YOUR_TELEGRAM_CHAT_ID",
-    "DROP_THRESHOLDS": [0.01, 0.02, 0.03] 
+    "DEFAULT_RESERVE_BALANCE": 1000,
+    "TIMEFRAMES": {
+        "daily": {
+            "enabled": true,
+            "thresholds": [0.01, 0.02, 0.03]
+        },
+        "weekly": {
+            "enabled": true,
+            "thresholds": [0.01, 0.02, 0.03]
+        },
+        "monthly": {
+            "enabled": true,
+            "thresholds": [0.01, 0.02, 0.03]
+        }
+    }
 }
