@@ -528,7 +528,19 @@ class BinanceBot:
         try:
             quantity = float(order_status['executedQty'])
             price = float(order_status['price'])
+            order_id = order_status['orderId']
             base_asset = symbol.replace('USDT', '')
+            
+            # Find matching pending order by orderId
+            matching_bot_order_id = None
+            for bot_order_id, order_info in self.pending_orders.items():
+                if order_info['orderId'] == order_id:
+                    matching_bot_order_id = bot_order_id
+                    break
+            
+            if not matching_bot_order_id:
+                self.logger.warning(f"No matching pending order found for orderId: {order_id}")
+                return
             
             # Force balance update
             new_balance = await self._get_verified_balance(base_asset)
@@ -539,44 +551,22 @@ class BinanceBot:
                 self.total_bought[symbol] = self.total_bought.get(symbol, 0) + quantity
                 self.total_spent[symbol] = self.total_spent.get(symbol, 0) + (quantity * price)
                 self.total_trades += 1
-                
-                # Check if this order already exists in trades (as a BOT trade)
-                existing_trade = None
-                for trade_id, trade in self.trades.items():
-                    if (trade['symbol'] == symbol and 
-                        trade['entry_price'] == price and 
-                        trade['quantity'] == quantity and 
-                        trade['type'] == 'bot'):
-                        existing_trade = trade_id
-                        break
 
-                if existing_trade:
-                    # Update existing trade with verification
-                    self.trades[existing_trade].update({
+                # Update the existing BOT trade entry with verification
+                if matching_bot_order_id in self.trades:
+                    self.trades[matching_bot_order_id].update({
+                        'status': 'VERIFIED',
                         'verification_time': datetime.now(timezone.utc).isoformat(),
-                        'status': 'VERIFIED'
+                        'filled_time': datetime.now(timezone.utc).isoformat()
                     })
-                else:
-                    # Create new verified trade entry
-                    trade_id = f"VERIFIED_{datetime.now().strftime('%Y%m%d%H%M%S')}_{symbol}"
-                    self.trades[trade_id] = {
-                        'symbol': symbol,
-                        'entry_price': price,
-                        'quantity': quantity,
-                        'total_cost': quantity * price,
-                        'current_value': None,
-                        'profit_usdt': None,
-                        'profit_percentage': None,
-                        'status': 'FILLED',
-                        'filled_time': datetime.now(timezone.utc).isoformat(),
-                        'verification_time': datetime.now(timezone.utc).isoformat(),
-                        'type': 'verified'
-                    }
                 
-                self.save_trades()  # Save changes to trades.json
+                # Remove from pending orders
+                del self.pending_orders[matching_bot_order_id]
+                self.save_pending_orders()  # Save pending orders file immediately
+                self.save_trades()  # Save trades file
                 
                 fill_msg = (
-                    f"✅ Verified order fill for {symbol}:\n"
+                    f"✅ Verified order fill for {symbol} [ID: {matching_bot_order_id}]:\n"
                     f"Quantity: {quantity:.8f}\n"
                     f"Price: {price:.8f} USDT\n"
                     f"Total Cost: {quantity * price:.2f} USDT\n\n"
@@ -746,6 +736,7 @@ class BinanceBot:
         return f"BOT_{timestamp}_{symbol}_{self.order_counter}"
 
     async def execute_trade(self, symbol, price):
+        """Execute trade with proper order tracking"""
         try:
             # Check balance status first
             if not await self.check_balance_status():
@@ -855,6 +846,7 @@ class BinanceBot:
             if self.use_telegram:
                 await self.send_telegram_message(order_msg)
             
+            # Save to pending orders first
             self.pending_orders[bot_order_id] = {
                 'symbol': symbol,
                 'orderId': order['orderId'],
@@ -863,11 +855,10 @@ class BinanceBot:
                 'placed_time': datetime.now(timezone.utc).isoformat(),
                 'cancel_time': (datetime.now(timezone.utc) + self.limit_order_timeout).isoformat()
             }
-            self.save_pending_orders()  # Save after placing order
+            self.save_pending_orders()  # Save immediately
             
-            # After placing order successfully, add to trades
-            trade_id = bot_order_id  # Use the same ID as the pending order
-            self.trades[trade_id] = {
+            # Add to trades as pending
+            self.trades[bot_order_id] = {
                 'symbol': symbol,
                 'entry_price': price,
                 'quantity': quantity,
@@ -876,13 +867,15 @@ class BinanceBot:
                 'profit_usdt': None,
                 'profit_percentage': None,
                 'status': 'PENDING',
-                'filled_time': None,
-                'type': 'bot'
+                'type': 'bot',
+                'orderId': order['orderId'],  # Add orderId for cross-reference
+                'placed_time': datetime.now(timezone.utc).isoformat()
             }
-            self.save_trades()
+            self.save_trades()  # Save immediately
             
+            # Start monitoring task
             asyncio.create_task(self.monitor_order(bot_order_id, symbol, order['orderId'], current_price, order_time))
-                
+            
         except BinanceAPIException as e:
             error_msg = f"Binance API error in execute_trade: {str(e)}"
             self.logger.error(error_msg)
@@ -891,6 +884,13 @@ class BinanceBot:
             error_msg = f"Error executing trade for {symbol}: {str(e)}"
             self.logger.error(error_msg)
             print(f"{Fore.RED}{error_msg}")
+            # Clean up if something went wrong
+            if bot_order_id in self.pending_orders:
+                del self.pending_orders[bot_order_id]
+                self.save_pending_orders()
+            if bot_order_id in self.trades:
+                del self.trades[bot_order_id]
+                self.save_trades()
 
     async def cancel_all_orders(self):
         """Cancel all pending orders"""
@@ -1352,6 +1352,7 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         logging.error(f"Unexpected error: {str(e)}")
+
 
 
 
