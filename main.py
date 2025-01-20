@@ -354,16 +354,30 @@ class BinanceBot:
             for asset, total in balance_report.items():
                 self.logger.info(f"{asset}: {total}")
 
+    def ensure_utc(self, dt):
+        """Ensure datetime is UTC aware"""
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt
+
     async def monitor_order(self, symbol, order_id, price, placed_time):
         """Asynchronously monitor an order until it's filled"""
-        while True:
-            try:
-                if datetime.now(timezone.utc) - placed_time > self.limit_order_timeout:
+        try:
+            # Ensure timezone awareness
+            placed_time = placed_time if placed_time.tzinfo else placed_time.replace(tzinfo=timezone.utc)
+            
+            while True:
+                now = datetime.now(timezone.utc)  # Always use UTC
+                if now - placed_time > self.limit_order_timeout:
                     # Cancel order if timeout reached
                     self.client.cancel_order(symbol=symbol, orderId=order_id)
-                    print(f"Order {order_id} canceled due to timeout")
+                    msg = f"Order {order_id} for {symbol} canceled due to timeout"
+                    print(msg)
+                    self.logger.info(msg)
                     break
+
                 order_status = self.client.get_order(symbol=symbol, orderId=order_id, recvWindow=self.recv_window)
+                
                 if order_status['status'] == 'FILLED':
                     quantity = float(order_status['executedQty'])
                     executed_price = float(order_status['price'])
@@ -372,36 +386,36 @@ class BinanceBot:
                     self.total_spent[symbol] += quantity * price
                     self.total_trades += 1
                     
-                    # Detailed log for console
-                    print(Fore.GREEN + f"Order filled for {symbol}: {order_status}")
-                    self.logger.info(f"Order filled for {symbol}: {order_status}")
+                    fill_msg = (
+                        f"✅ Order filled for {symbol}:\n"
+                        f"Quantity: {quantity}\n"
+                        f"Price: {executed_price:.8f} USDT\n"
+                        f"Total: {total_cost:.2f} USDT"
+                    )
                     
-                    # Simplified message for Telegram
+                    print(Fore.GREEN + fill_msg)
+                    self.logger.info(f"Order filled: {order_status}")
+                    
                     if self.use_telegram:
-                        telegram_msg = (
-                            f"✅ Order filled for {symbol}\n"
-                            f"Quantity: {quantity} {symbol.replace('USDT', '')}\n"
-                            f"Price: {executed_price:.2f} USDT\n"
-                            f"Total: {total_cost:.2f} USDT"
-                        )
-                        await self.send_telegram_message(telegram_msg)
+                        await self.send_telegram_message(fill_msg)
                     
                     self.print_balance_report()
                     break
+                
                 elif order_status['status'] == 'CANCELED':
-                    print(f"Order canceled for {symbol}")
+                    msg = f"Order {order_id} for {symbol} was canceled"
+                    print(msg)
+                    self.logger.info(msg)
                     break
-                    
-                await asyncio.sleep(1)  # Non-blocking sleep
                 
-            except Exception as e:
-                print(f"Error monitoring order: {e}")
-                self.logger.error(f"Error monitoring order: {e}")
-                break
+                await asyncio.sleep(10)
                 
-        # Remove from pending orders once complete
-        if symbol in self.pending_orders:
-            del self.pending_orders[symbol]
+        except Exception as e:
+            print(f"Error monitoring order: {e}")
+            self.logger.error(f"Error monitoring order: {e}")
+        finally:
+            if symbol in self.pending_orders:
+                del self.pending_orders[symbol]
 
     async def get_available_usdt(self):
         """Enhanced balance check with reserve protection"""
@@ -547,11 +561,26 @@ class BinanceBot:
                     recvWindow=self.recv_window,
                     timestamp=timestamp
                 )
-                print(f"Limit order set at price {formatted_price}")
-                self.logger.info(f"Limit order set at price {formatted_price}")
+                
+                # Use UTC for all datetime operations
+                order_time = datetime.now(timezone.utc)
+                cancel_time = order_time + self.limit_order_timeout
+                
+                order_msg = (
+                    f"Limit order set for {symbol}:\n"
+                    f"Price: {formatted_price} USDT\n"
+                    f"Quantity: {quantity}\n"
+                    f"Will cancel at: {cancel_time.strftime('%Y-%m-%d %H:%M:%S')} UTC"
+                )
+                
+                print(order_msg)
+                self.logger.info(order_msg)
+                
+                if self.use_telegram:
+                    await self.send_telegram_message(order_msg)
                 
                 self.pending_orders[symbol] = order['orderId']
-                await self.monitor_order(symbol, order['orderId'], current_price, datetime.now(timezone.utc))
+                asyncio.create_task(self.monitor_order(symbol, order['orderId'], current_price, order_time))
                 
             elif self.order_type == "market":
                 order = self.client.create_order(
@@ -665,13 +694,28 @@ class BinanceBot:
 
     async def handle_start(self, update, context):
         welcome_msg = (
-            "🤖 Bot is running!\n\n"
-            "Available commands:\n"
+            "🤖 Binance Trading Bot\n\n"
+            "Available Commands:\n"
+            "📊 Market Analysis:\n"
             "/positions - Show available trade opportunities\n"
+            "/orders - Show open limit orders with cancel times\n\n"
+            "💰 Portfolio & Trading:\n"
             "/balance - Show current balance\n"
-            "/trades - Show total trades\n"
+            "/trades - Show total number of trades\n"
             "/profits - Show current profits\n"
-            "/stats - Show system stats and bot information"
+            "/portfolio - Show portfolio value evolution\n"
+            "/allocation - Show asset allocation\n\n"
+            "📈 Analytics:\n"
+            "/distribution - Show entry price distribution\n"
+            "/stacking - Show position building over time\n"
+            "/buytimes - Show time between buys\n\n"
+            "ℹ️ System:\n"
+            "/stats - Show system stats and bot information\n\n"
+            "🔄 Trading Status:\n"
+            f"Mode: {'Testnet' if self.client.API_URL == 'https://testnet.binance.vision/api' else 'Live'}\n"
+            f"Order Type: {self.order_type.capitalize()}\n"
+            f"USDT Reserve: {self.reserve_balance_usdt}\n"
+            "Bot is actively monitoring markets! 🚀"
         )
         await update.message.reply_text(welcome_msg)
 
