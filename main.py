@@ -91,6 +91,7 @@ class BinanceBot:
             self.telegram_app.add_handler(CommandHandler("buytimes", self.handle_buy_times))
             self.telegram_app.add_handler(CommandHandler("portfolio", self.handle_portfolio))
             self.telegram_app.add_handler(CommandHandler("allocation", self.handle_allocation))
+            self.telegram_app.add_handler(CommandHandler("orders", self.handle_orders))  # Add new handler
             # Remove async setup from __init__
             self.commands_setup = False
         
@@ -134,7 +135,8 @@ class BinanceBot:
                 BotCommand("stacking", "Show position building over time"),
                 BotCommand("buytimes", "Show time between buys"),
                 BotCommand("portfolio", "Show portfolio value evolution"),
-                BotCommand("allocation", "Show asset allocation")
+                BotCommand("allocation", "Show asset allocation"),
+                BotCommand("orders", "Show open limit orders")  # Add new command
             ]
             
             await self.telegram_app.bot.set_my_commands(commands)
@@ -364,15 +366,25 @@ class BinanceBot:
                 order_status = self.client.get_order(symbol=symbol, orderId=order_id, recvWindow=self.recv_window)
                 if order_status['status'] == 'FILLED':
                     quantity = float(order_status['executedQty'])
+                    executed_price = float(order_status['price'])
+                    total_cost = quantity * executed_price
                     self.total_bought[symbol] += quantity
                     self.total_spent[symbol] += quantity * price
                     self.total_trades += 1
                     
+                    # Detailed log for console
                     print(Fore.GREEN + f"Order filled for {symbol}: {order_status}")
                     self.logger.info(f"Order filled for {symbol}: {order_status}")
                     
+                    # Simplified message for Telegram
                     if self.use_telegram:
-                        await self.send_telegram_message(f"Order filled for {symbol}: {order_status}")
+                        telegram_msg = (
+                            f"✅ Order filled for {symbol}\n"
+                            f"Quantity: {quantity} {symbol.replace('USDT', '')}\n"
+                            f"Price: {executed_price:.2f} USDT\n"
+                            f"Total: {total_cost:.2f} USDT"
+                        )
+                        await self.send_telegram_message(telegram_msg)
                     
                     self.print_balance_report()
                     break
@@ -440,6 +452,9 @@ class BinanceBot:
             ticker = self.client.get_symbol_ticker(symbol=symbol)
             current_price = float(ticker['price'])
             
+            # Format price to proper decimal string (no scientific notation)
+            formatted_price = '{:.8f}'.format(current_price).rstrip('0').rstrip('.')
+            
             available_usdt = await self.get_available_usdt()
             if available_usdt < self.trade_amount:
                 print(f"{Fore.RED}Balance issue detected:")
@@ -474,9 +489,51 @@ class BinanceBot:
             else:
                 trade_amount = min(self.trade_amount, available_usdt)
             
+            # Calculate quantity with proper precision
             quantity = trade_amount / current_price
             quantity = self.adjust_quantity(symbol, quantity)
+
+            # Get symbol info for precision
+            symbol_info = None
+            exchange_info = self.client.get_exchange_info()
+            for info in exchange_info['symbols']:
+                if info['symbol'] == symbol:
+                    symbol_info = info
+                    break
             
+            if not symbol_info:
+                raise ValueError(f"Symbol info not found for {symbol}")
+            
+            # Get the quantity precision from lot size filter
+            lot_size_filter = None
+            for filter in symbol_info['filters']:
+                if filter['filterType'] == 'LOT_SIZE':
+                    lot_size_filter = filter
+                    break
+            
+            if not lot_size_filter:
+                raise ValueError(f"Lot size filter not found for {symbol}")
+            
+            # Calculate step size decimal places
+            step_size = float(lot_size_filter['stepSize'])
+            precision = len(str(step_size).rstrip('0').split('.')[-1])
+            
+            # Round quantity to the correct precision
+            quantity = round(quantity, precision)
+            quantity = float(f"%.{precision}f" % quantity)  # Ensure proper string formatting
+            
+            # Validate against min and max quantity
+            min_qty = float(lot_size_filter['minQty'])
+            max_qty = float(lot_size_filter['maxQty'])
+            
+            if quantity < min_qty:
+                print(f"{Fore.YELLOW}Quantity {quantity} below minimum {min_qty} for {symbol}, adjusting...")
+                quantity = min_qty
+            elif quantity > max_qty:
+                print(f"{Fore.YELLOW}Quantity {quantity} above maximum {max_qty} for {symbol}, adjusting...")
+                quantity = max_qty
+            
+            # Create order with validated quantity
             timestamp = int(time.time() * 1000) + self.time_offset
             
             if self.order_type == "limit":
@@ -486,12 +543,12 @@ class BinanceBot:
                     type=ORDER_TYPE_LIMIT,
                     timeInForce=TIME_IN_FORCE_GTC,
                     quantity=quantity,
-                    price=str(current_price),
+                    price=formatted_price,  # Use formatted price instead of str(current_price)
                     recvWindow=self.recv_window,
                     timestamp=timestamp
                 )
-                print(f"Limit order set at price {current_price}")
-                self.logger.info(f"Limit order set at price {current_price}")
+                print(f"Limit order set at price {formatted_price}")
+                self.logger.info(f"Limit order set at price {formatted_price}")
                 
                 self.pending_orders[symbol] = order['orderId']
                 await self.monitor_order(symbol, order['orderId'], current_price, datetime.now(timezone.utc))
@@ -514,9 +571,14 @@ class BinanceBot:
                     asyncio.run(self.send_telegram_message(f"BUY ORDER for {symbol}: {order}"))
                 self.print_balance_report()  # Print balance report after each buy
                 self.last_order_time[symbol] = datetime.now(timezone.utc)  # Update last order time
+        except BinanceAPIException as e:
+            error_msg = f"Binance API error in execute_trade: {str(e)}"
+            self.logger.error(error_msg)
+            print(f"{Fore.RED}{error_msg}")
         except Exception as e:
-            self.logger.error(f"Error executing trade for {symbol}: {str(e)}")
-            print(f"Error executing trade for {symbol}: {str(e)}")
+            error_msg = f"Error executing trade for {symbol}: {str(e)}"
+            self.logger.error(error_msg)
+            print(f"{Fore.RED}{error_msg}")
 
     async def cancel_all_orders(self):
         """Cancel all pending orders"""
@@ -677,8 +739,6 @@ class BinanceBot:
                     'high': float(weekly_data['high'].iloc[-1]),
                     'low': float(weekly_data['low'].iloc[-1])
                 }
-            
-            if self.timeframe_config['monthly']['enabled']:
                 monthly_data = self.get_historical_data(symbol, Client.KLINE_INTERVAL_1MONTH, "2 months ago UTC")
                 references['monthly'] = {
                     'open': float(monthly_data['open'].iloc[-1]),
@@ -775,28 +835,47 @@ class BinanceBot:
 
                     # Fetch current prices at regular intervals
                     if time_until_next_check <= 0:
-                        for symbol in self.valid_symbols:  # Use valid_symbols instead of TRADING_SYMBOLS
+                        for symbol in self.valid_symbols:
                             current_price = self.fetch_current_price(symbol)
                             if current_price is not None:
-                                # Get reference prices and show drops
-                                reference_prices = self.get_reference_prices(symbol)
-                                print(f"{Fore.CYAN}Reference Prices for {symbol}:")
-                                for timeframe, prices in reference_prices.items():
-                                    drop = ((prices['open'] - current_price) / prices['open']) * 100
-                                    trend_arrow = "↑" if drop < 0 else "↓"
-                                    trend_color = Fore.GREEN if drop < 0 else Fore.RED
-                                    print(f"  {timeframe.capitalize()}:")
-                                    print(f"    Open: {prices['open']:.2f} USDT")
-                                    print(f"    High: {prices['high']:.2f} USDT")
-                                    print(f"    Low: {prices['low']:.2f} USDT")
-                                    print(f"    Change: {trend_color}{drop:+.2f}% {trend_arrow}")
+                                # Create data structure for strategy
+                                df = pd.DataFrame({
+                                    'symbol': [symbol],
+                                    'close': [current_price]
+                                })
+                                
+                                # Get reference prices
+                                reference_prices = {
+                                    timeframe: prices['open'] 
+                                    for timeframe, prices in self.get_reference_prices(symbol).items()
+                                }
+                                
+                                # Check for signals
+                                signals = self.strategy.generate_signals(
+                                    df, 
+                                    reference_prices,
+                                    datetime.now(timezone.utc)
+                                )
+                                
+                                # Execute trades for any signals
+                                for timeframe, threshold, price in signals:
+                                    print(f"{Fore.GREEN}🎯 Trade signal detected for {symbol}:")
+                                    print(f"   Timeframe: {timeframe}")
+                                    print(f"   Threshold: {threshold*100}%")
+                                    print(f"   Price: {price}")
+                                    
+                                    await self.execute_trade(symbol, price)
+                                    
+                                    if self.use_telegram:
+                                        signal_msg = (
+                                            f"🎯 Trade executed for {symbol}\n"
+                                            f"Timeframe: {timeframe}\n"
+                                            f"Threshold: {threshold*100}%\n"
+                                            f"Price: {price}"
+                                        )
+                                        await self.send_telegram_message(signal_msg)
 
                         last_price_fetch_time = current_time
-                    else:
-                        # Show countdown
-                        print(f"\r{Fore.YELLOW}Next price check in: {int(time_until_next_check)} seconds ⏳", end="")
-                        await asyncio.sleep(1)  # Update countdown every second
-                        continue
 
                     # Check for daily open price at 00:00 UTC
                     if datetime.now(timezone.utc) >= next_daily_open_check:
@@ -1022,34 +1101,93 @@ class BinanceBot:
             
             if values:
                 graph = self.graph_generator.generate_asset_allocation(assets, values)
-                await update.message.reply_photo(photo=graph)
+                if graph:
+                    await update.message.reply_photo(photo=graph)
+                else:
+                    await update.message.reply_text("Could not generate allocation graph")
             else:
-                await update.message.reply_text("No assets found in portfolio")
+                await update.message.reply_text("No assets in portfolio yet")
         except Exception as e:
             await update.message.reply_text(f"Error generating asset allocation: {str(e)}")
+            self.logger.error(f"Error in handle_allocation: {str(e)}")
+
+    async def handle_orders(self, update, context):
+        """Handle /orders command - Show open limit orders"""
+        try:
+            open_orders = []
+            for symbol in self.valid_symbols:
+                try:
+                    symbol_orders = self.client.get_open_orders(symbol=symbol)
+                    open_orders.extend(symbol_orders)
+                except Exception as e:
+                    await update.message.reply_text(f"Error fetching orders for {symbol}: {str(e)}")
+                    continue
+            
+            if not open_orders:
+                await update.message.reply_text("No open limit orders")
+                return
+            
+            message = "📋 Open Limit Orders:\n\n"
+            for order in open_orders:
+                symbol = order['symbol']
+                side = order['side']
+                quantity = float(order['origQty'])
+                price = float(order['price'])
+                total = quantity * price
+                
+                # Calculate time info
+                order_time = datetime.fromtimestamp(order['time']/1000)
+                cancel_time = order_time + self.limit_order_timeout
+                now = datetime.now()
+                time_until_cancel = cancel_time - now
+                hours_left = time_until_cancel.total_seconds() / 3600
+                
+                # Format the cancel time info
+                if hours_left < 0:
+                    cancel_info = "Order will be cancelled soon"
+                else:
+                    cancel_info = f"Cancels in: {hours_left:.1f} hours"
+                
+                message += (
+                    f"Symbol: {symbol}\n"
+                    f"Side: {side}\n"
+                    f"Quantity: {quantity}\n"
+                    f"Price: {price:.8f} USDT\n"
+                    f"Total: {total:.2f} USDT\n"
+                    f"Placed: {order_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"Order ID: {order['orderId']}\n"
+                    f"❗ {cancel_info}\n"
+                    f"─────────────\n"
+                )
+            
+            await update.message.reply_text(message)
+            
+        except Exception as e:
+            error_msg = f"Error fetching open orders: {str(e)}"
+            self.logger.error(error_msg)
+            await update.message.reply_text(error_msg)
 
     def run(self):
+        """Run the bot's main loop"""
         try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-            try:
-                loop.run_until_complete(self.main_loop())
-            except KeyboardInterrupt:
-                print(f"\n{Fore.YELLOW}Shutting down bot...")
-            finally:
-                loop.run_until_complete(self._shutdown_telegram())
-                loop.run_until_complete(loop.shutdown_asyncgens())
-                loop.close()
-                print(f"{Fore.GREEN}Bot stopped successfully")
-                
+            # Create and run the event loop
+            loop = asyncio.get_event_loop()
+            loop.run_until_complete(self.main_loop())
+        except KeyboardInterrupt:
+            print("\nShutdown requested... closing connections")
+            self.logger.info("Shutdown requested by user")
         except Exception as e:
-            print(f"{Fore.RED}Error in event loop: {str(e)}")
-            self.logger.error(f"Error in event loop: {str(e)}")
+            print(f"\nError in main loop: {str(e)}")
+            self.logger.error(f"Error in main loop: {str(e)}")
+        finally:
+            # Ensure proper cleanup
+            if self.use_telegram:
+                loop.run_until_complete(self._shutdown_telegram())
+            loop.close()
 
 if __name__ == "__main__":
     try:
-        # Validate testnet input
+        # 1. First ask about network
         while True:
             testnet_input = input("Do you want to use the testnet? (yes/no): ").strip().lower()
             if testnet_input in ['yes', 'no']:
@@ -1057,7 +1195,7 @@ if __name__ == "__main__":
                 break
             print("Invalid input. Please enter 'yes' or 'no'.")
 
-        # Validate telegram input
+        # 2. Then about Telegram
         while True:
             telegram_input = input("Do you want to use Telegram notifications? (yes/no): ").strip().lower()
             if telegram_input in ['yes', 'no']:
@@ -1065,7 +1203,38 @@ if __name__ == "__main__":
                 break
             print("Invalid input. Please enter 'yes' or 'no'.")
 
-        # Validate USDT reserve
+        # 3. Then order type
+        while True:
+            order_type = input("Do you want to use limit orders or market orders? (limit/market): ").strip().lower()
+            if order_type in ['limit', 'market']:
+                break
+            print("Invalid input. Please enter 'limit' or 'market'.")
+
+        # 4. Trade amount type
+        while True:
+            percentage_input = input("Do you want to use a percentage of USDT per trade? (yes/no): ").strip().lower()
+            if percentage_input in ['yes', 'no']:
+                use_percentage = percentage_input == 'yes'
+                break
+            print("Invalid input. Please enter 'yes' or 'no'.")
+
+        # 5. Trade amount value
+        while True:
+            try:
+                if use_percentage:
+                    trade_amount = float(input("Enter the percentage of USDT to use per trade (e.g., 10 for 10%): ").strip()) / 100
+                    if 0 < trade_amount <= 1:
+                        break
+                    print("Percentage must be between 0 and 100.")
+                else:
+                    trade_amount = float(input("Enter the amount of USDT to use per trade: ").strip())
+                    if trade_amount > 0:
+                        break
+                    print("Amount must be greater than 0.")
+            except ValueError:
+                print("Please enter a valid number.")
+
+        # 6. USDT reserve
         while True:
             try:
                 reserve_balance_usdt = float(input("Enter the USDT reserve balance (minimum USDT to keep): ").strip())
@@ -1076,7 +1245,7 @@ if __name__ == "__main__":
             except ValueError:
                 print("Please enter a valid number.")
 
-        # Configure timeframes with validation
+        # 7. Finally timeframe configuration
         timeframe_config = {}
         timeframes = ['daily', 'weekly', 'monthly']
         
@@ -1134,42 +1303,11 @@ if __name__ == "__main__":
                     'orders_placed': {}
                 }
 
-        # Validate order type
-        while True:
-            order_type = input("Do you want to use limit orders or market orders? (limit/market): ").strip().lower()
-            if order_type in ['limit', 'market']:
-                break
-            print("Invalid input. Please enter 'limit' or 'market'.")
-
-        # Validate trade amount type
-        while True:
-            percentage_input = input("Do you want to use a percentage of USDT per trade? (yes/no): ").strip().lower()
-            if percentage_input in ['yes', 'no']:
-                use_percentage = percentage_input == 'yes'
-                break
-            print("Invalid input. Please enter 'yes' or 'no'.")
-
-        # Validate trade amount
-        while True:
-            try:
-                if use_percentage:
-                    trade_amount = float(input("Enter the percentage of USDT to use per trade (e.g., 10 for 10%): ").strip()) / 100
-                    if 0 < trade_amount <= 1:
-                        break
-                    print("Percentage must be between 0 and 100.")
-                else:
-                    trade_amount = float(input("Enter the amount of USDT to use per trade: ").strip())
-                    if trade_amount > 0:
-                        break
-                    print("Amount must be greater than 0.")
-            except ValueError:
-                print("Please enter a valid number.")
-
         # Initialize and run bot with error handling
         try:
             bot = BinanceBot(use_testnet, use_telegram, timeframe_config, order_type, use_percentage, trade_amount, reserve_balance_usdt)
             bot.test_connection()
-            bot.run()
+            bot.run()  # Now this will work
         except Exception as e:
             print(f"Error initializing bot: {str(e)}")
             logging.error(f"Error initializing bot: {str(e)}")
@@ -1179,6 +1317,8 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         logging.error(f"Unexpected error: {str(e)}")
+
+
 
 
 

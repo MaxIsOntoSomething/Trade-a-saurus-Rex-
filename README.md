@@ -17,6 +17,8 @@ A sophisticated cryptocurrency trading bot that implements a drop-based buying s
 - 📝 Automatic invalid symbol management
 - 🕒 24h trading pause on low balance
 - 📊 Data visualization suite
+- ⏱️ 8-hour limit order auto-cancellation
+- 🔍 Real-time order status monitoring
 
 ## Analytics & Visualization Features
 
@@ -51,106 +53,31 @@ A sophisticated cryptocurrency trading bot that implements a drop-based buying s
     pip install -r requirements.txt
     ```
 
-4. **Configure the bot**
-    ```sh
-    cp config/config_template.json config/config.json
-    ```
-    Edit config.json with your credentials:
-    ```json
-    {
-        "BINANCE_API_KEY": "your_api_key",
-        "BINANCE_API_SECRET": "your_api_secret",
-        "TESTNET_API_KEY": "your_testnet_key",
-        "TESTNET_API_SECRET": "your_testnet_secret",
-        "TRADING_SYMBOLS": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
-        "TELEGRAM_TOKEN": "your_telegram_token",
-        "TELEGRAM_CHAT_ID": "your_chat_id"
-    }
-    ```
+## Configuration
 
-## Usage
+1. **Initial Setup**
+   - Copy `config_template.json` to `config.json`
+   - Add your API keys and preferences
+   - Configure trading symbols
 
-1. **Start the bot**
-    ```sh
-    python main.py
-    ```
+2. **Trading Parameters**
+   - Choose between testnet/live trading
+   - Set USDT reserve amount
+   - Configure trading amount
+   - Select order type (limit/market)
 
-2. **Initial Configuration**
-    - Choose between Testnet/Live trading
-    - Set up Telegram notifications
-    - Configure USDT reserve amount
-    - Set up timeframes and thresholds
-    - Choose order type (limit/market)
-    - Configure trade amounts
+3. **Timeframe Settings**
+   - Enable/disable timeframes (daily, weekly, monthly)
+   - Set drop thresholds for each timeframe
+   - Configure order limits
 
-3. **Telegram Commands**
-    - `/start` - Show available commands
-    - `/positions` - Show trading opportunities
-    - `/balance` - Current balance
-    - `/trades` - Trade count
-    - `/profits` - Current profits
-    - `/stats` - System statistics
-    - `/distribution` - Price entry distribution
-    - `/stacking` - Position building analysis
-    - `/buytimes` - Trade timing analysis
-    - `/portfolio` - Portfolio evolution
-    - `/allocation` - Asset allocation
+## Order Management
 
-## Trading Strategy
-
-The bot implements a multi-timeframe drop-based buying strategy:
-- Monitors price drops across daily, weekly, and monthly timeframes
-- Executes trades when price drops reach configured thresholds
-- Maintains separate thresholds for each timeframe
-- Implements smart order management and position building
-
-## Analytics Features
-
-1. **Entry Price Analysis**
-   - Distribution of entry prices
-   - Entry timing patterns
-   - Price level analysis
-
-2. **Position Building**
-   - Cumulative position growth
-   - Entry point visualization
-   - Position building patterns
-
-3. **Portfolio Analytics**
-   - Value evolution over time
-   - Asset allocation
-   - Performance metrics
-
-4. **Trading Patterns**
-   - Time between trades
-   - Trade frequency analysis
-   - Market timing visualization
-
-## Completed Features ✅
-
-- [x] Multi-timeframe support
-- [x] Enhanced Telegram integration
-- [x] Advanced graphing capabilities
-- [x] Portfolio analytics
-- [x] Position tracking
-- [x] Trade timing analysis
-- [x] Asset allocation visualization
-- [x] Error handling and recovery
-- [x] Invalid symbol management
-- [x] Balance protection system
-
-## TODO 📋
-
-- [ ] Implement sell strategies
-- [ ] Add more technical indicators
-- [ ] Develop backtesting module
-- [ ] Create web dashboard
-- [ ] Add more exchanges
-- [ ] Implement machine learning predictions
-- [ ] Add trade journal export
-- [ ] Create mobile app integration
-- [ ] Add email notifications
-- [ ] Implement stop-loss features
+- Limit orders auto-cancel after 8 hours
+- Real-time order status monitoring
+- Automatic order validation
+- Dynamic quantity adjustment
+- Price precision handling
 
 ## Safety Features
 
@@ -160,19 +87,49 @@ The bot implements a multi-timeframe drop-based buying strategy:
 - Error recovery system
 - Automatic trade pausing
 - Order timeout protection
+- Scientific notation handling for small-cap tokens
+
+## Logging System
+
+- Clean, structured trade logs
+- Important event tracking
+- Error and warning management
+- Performance monitoring
+- Trade execution details
+- Balance updates
+
+## Trading Strategy
+
+The bot implements a sophisticated multi-timeframe drop-based buying strategy:
+- Monitors daily, weekly, and monthly timeframes
+- Executes trades at configured drop thresholds
+- Implements smart position building
+- Manages order timeouts and cancellations
+
+## Telegram Commands
+
+- `/start` - Show available commands and bot status
+- `/positions` - Show available trading opportunities
+- `/balance` - Show current balance
+- `/trades` - Show total number of trades
+- `/profits` - Show current profits
+- `/stats` - Show system stats and bot information
+- `/distribution` - Show entry price distribution
+- `/stacking` - Show position building over time
+- `/buytimes` - Show time between buys
+- `/portfolio` - Show portfolio value evolution
+- `/allocation` - Show asset allocation
+- `/orders` - Show open limit orders with cancellation times
 
 ## Support & Contact
 
 For support or questions:
-
-[![Discord](https://img.shields.io/badge/Discord-7289DA?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/)
-
-Discord: **maskiplays**
+- Discord: **maskiplays**
 
 ## Disclaimer
 
-This bot is provided for educational purposes. Trading cryptocurrencies carries significant risks. Use at your own discretion and risk.
+This bot is for educational purposes only. Trading cryptocurrencies carries significant risks. Use at your own discretion.
 
 ## License
 
-MIT License - Feel free to use and modify as needed
+MIT License - Feel free to use and modify as needed.
