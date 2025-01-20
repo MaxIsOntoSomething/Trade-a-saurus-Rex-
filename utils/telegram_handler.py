@@ -1,9 +1,9 @@
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram import BotCommand, Update
 import asyncio
 from colorama import Fore
 import logging
-from datetime import datetime  # Add this import
+from datetime import datetime, timezone  # Add timezone import
 
 class TelegramHandler:
     def __init__(self, token, chat_id, bot_instance):
@@ -13,6 +13,7 @@ class TelegramHandler:
         self.app = Application.builder().token(token).build()
         self.commands_setup = False
         self.logger = logging.getLogger(__name__)
+        self.trade_conv_state = {}  # Add this to track conversation states
 
     async def initialize(self):
         """Initialize Telegram bot and set up commands"""
@@ -25,20 +26,21 @@ class TelegramHandler:
             await self.app.bot.get_me()  # This will fail if token is invalid
             
             commands = [
-                BotCommand("start", "Show available commands and bot status"),
-                BotCommand("positions", "Show available trading opportunities"),
-                BotCommand("balance", "Show current balance"),
-                BotCommand("trades", "Show all trades with profit/loss after tax"),
-                BotCommand("profits", "Show current profits"),
-                BotCommand("stats", "Show system stats and bot information"),
-                BotCommand("distribution", "Show entry price distribution"),
-                BotCommand("stacking", "Show position building over time"),
-                BotCommand("buytimes", "Show time between buys"),
-                BotCommand("portfolio", "Show portfolio value evolution"),
-                BotCommand("allocation", "Show asset allocation"),
-                BotCommand("orders", "Show open limit orders"),
-                BotCommand("symbol", "Show detailed stats for a symbol including tax"),
-                BotCommand("summary", "Show complete portfolio summary with tax")
+                BotCommand("start", "🚀 Show available commands and bot status"),
+                BotCommand("positions", "📊 Show current prices and available trading opportunities"),
+                BotCommand("balance", "💰 Show current balance for all assets"),
+                BotCommand("trades", "📈 Show all trades with profit/loss after tax"),
+                BotCommand("profits", "💹 Show current profits for all positions"),
+                BotCommand("stats", "ℹ️ Show system stats and bot information"),
+                BotCommand("distribution", "📊 Show entry price distribution analysis"),
+                BotCommand("stacking", "📚 Show position building over time"),
+                BotCommand("buytimes", "⏰ Show time between buys analysis"),
+                BotCommand("portfolio", "📈 Show portfolio value evolution"),
+                BotCommand("allocation", "🔄 Show current asset allocation"),
+                BotCommand("orders", "📋 Show open limit orders"),
+                BotCommand("symbol", "🔍 Show detailed stats for a symbol including tax"),
+                BotCommand("summary", "📊 Show complete portfolio summary with tax"),
+                BotCommand("addtrade", "➕ Add a manual trade to the portfolio")
             ]
 
             # Register command handlers
@@ -85,10 +87,14 @@ class TelegramHandler:
             "trades": self.handle_trades_list,  # New command to list all trades
             "symbol": self.handle_symbol_stats,  # Add new handler
             "summary": self.handle_portfolio_summary,  # Add new handler
+            "addtrade": self.handle_addtrade,  # Add new handler
         }
 
         for command, handler in handlers.items():
             self.app.add_handler(CommandHandler(command, handler))
+        
+        # Add message handler for conversations
+        self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
 
     async def send_message(self, text, parse_mode=None, reply_markup=None):
         """Safely send messages with retry logic"""
@@ -134,22 +140,23 @@ class TelegramHandler:
         """Handle /start command"""
         welcome_msg = (
             "🤖 Binance Trading Bot\n\n"
-            "Available Commands:\n"
+            "Available Commands:\n\n"
             "📊 Market Analysis:\n"
-            "/positions - Show available trade opportunities\n"
+            "/positions - Show current prices and trading opportunities\n"
             "/orders - Show open limit orders with cancel times\n\n"
             "💰 Portfolio & Trading:\n"
-            "/balance - Show current balance\n"
+            "/balance - Show current balance for all assets\n"
             "/trades - List all trades with P/L after tax\n"
+            "/addtrade - Add a manual trade to track\n"
             "/symbol <SYMBOL> - Show detailed symbol stats with tax\n"
             "/summary - Show complete portfolio summary with tax\n"
-            "/profits - Show current profits\n"
+            "/profits - Show current profits for all positions\n"
             "/portfolio - Show portfolio value evolution\n"
-            "/allocation - Show asset allocation\n\n"
+            "/allocation - Show current asset distribution\n\n"
             "📈 Analytics:\n"
             "/distribution - Show entry price distribution\n"
-            "/stacking - Show position building over time\n"
-            "/buytimes - Show time between buys\n\n"
+            "/stacking - Show position building patterns\n"
+            "/buytimes - Show time between purchases\n\n"
             "ℹ️ System:\n"
             "/stats - Show system stats and bot information\n\n"
             "🔄 Trading Status:\n"
@@ -422,6 +429,118 @@ class TelegramHandler:
         except Exception as e:
             await self.send_message(f"❌ Error getting portfolio summary: {e}")
 
+    async def handle_addtrade(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /addtrade command with step-by-step interaction"""
+        chat_id = update.effective_chat.id
+        
+        # Initialize or reset conversation state
+        self.trade_conv_state[chat_id] = {
+            'step': 'symbol',
+            'symbol': None,
+            'entry_price': None,
+            'quantity': None
+        }
+        
+        # Start conversation
+        await self.send_message(
+            "Let's add a manual trade! 📝\n\n"
+            "Please enter the trading pair symbol (e.g., BTCUSDT):"
+        )
+
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle conversation messages for adding trades"""
+        chat_id = update.effective_chat.id
+        text = update.message.text
+        
+        if chat_id not in self.trade_conv_state:
+            return
+            
+        state = self.trade_conv_state[chat_id]
+        
+        try:
+            if state['step'] == 'symbol':
+                symbol = text.upper()
+                if not symbol.endswith('USDT'):
+                    await self.send_message("❌ Only USDT pairs are supported (e.g., BTCUSDT)\nPlease try again:")
+                    return
+                    
+                state['symbol'] = symbol
+                state['step'] = 'entry_price'
+                await self.send_message(f"✅ Symbol: {symbol}\n\nPlease enter the entry price in USDT:")
+                
+            elif state['step'] == 'entry_price':
+                entry_price = float(text)
+                if entry_price <= 0:
+                    await self.send_message("❌ Entry price must be greater than 0\nPlease try again:")
+                    return
+                    
+                state['entry_price'] = entry_price
+                state['step'] = 'quantity'
+                await self.send_message(
+                    f"✅ Entry Price: {entry_price:.8f} USDT\n\n"
+                    f"Please enter the quantity of {state['symbol'].replace('USDT', '')}:"
+                )
+                
+            elif state['step'] == 'quantity':
+                quantity = float(text)
+                if quantity <= 0:
+                    await self.send_message("❌ Quantity must be greater than 0\nPlease try again:")
+                    return
+                
+                # Calculate total cost
+                total_cost = state['entry_price'] * quantity
+                
+                # Show summary and confirmation
+                confirm_msg = (
+                    "📋 Trade Summary\n\n"
+                    f"Symbol: {state['symbol']}\n"
+                    f"Entry Price: {state['entry_price']:.8f} USDT\n"
+                    f"Quantity: {quantity:.8f}\n"
+                    f"Total Cost: {total_cost:.2f} USDT\n\n"
+                    "Is this correct? Type 'yes' to confirm or 'no' to cancel:"
+                )
+                
+                state['quantity'] = quantity
+                state['step'] = 'confirm'
+                await self.send_message(confirm_msg)
+                
+            elif state['step'] == 'confirm':
+                if text.lower() == 'yes':
+                    # Generate trade ID
+                    trade_id = f"MANUAL_{datetime.now().strftime('%Y%m%d%H%M%S')}_{state['symbol']}"
+                    
+                    # Create trade entry
+                    trade_entry = {
+                        'symbol': state['symbol'],
+                        'entry_price': state['entry_price'],
+                        'quantity': state['quantity'],
+                        'total_cost': state['entry_price'] * state['quantity'],
+                        'type': 'manual',
+                        'status': 'FILLED',
+                        'filled_time': datetime.now(timezone.utc).isoformat()
+                    }
+                    
+                    # Add to trades
+                    self.bot.trades[trade_id] = trade_entry
+                    self.bot.save_trades()
+                    
+                    await self.send_message(f"✅ Trade added successfully!\nTrade ID: {trade_id}")
+                    
+                elif text.lower() == 'no':
+                    await self.send_message("❌ Trade cancelled. Use /addtrade to start over.")
+                else:
+                    await self.send_message("Please type 'yes' to confirm or 'no' to cancel:")
+                    return
+                    
+                # Clear conversation state
+                del self.trade_conv_state[chat_id]
+                
+        except ValueError:
+            await self.send_message("❌ Invalid number format. Please enter a valid number:")
+        except Exception as e:
+            await self.send_message(f"❌ Error: {str(e)}\nUse /addtrade to start over.")
+            del self.trade_conv_state[chat_id]
+
     async def shutdown(self):
         """Safely shutdown Telegram bot"""
         try:
@@ -434,4 +553,3 @@ class TelegramHandler:
         except Exception as e:
             print(f"{Fore.YELLOW}Note: Telegram was already stopped or not running")
             self.logger.info("Telegram was already stopped or not running")
-``` 
