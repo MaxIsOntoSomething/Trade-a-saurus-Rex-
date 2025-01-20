@@ -264,6 +264,54 @@ docker-compose down -v
 # Rebuild and restart
 docker-compose up -d --build
 
+## 🚧 TODO & Future Features
+
+### Take-Profit Implementation
+- [ ] Add overall symbol take-profit functionality
+  - Trigger sell when total symbol position profit reaches target
+  - Example: Sell 100% when BTC position is +25% in profit
+  - Configurable TP levels per symbol
+  - Optional partial sells at different levels
+
+### Performance Improvements
+- [ ] Implement connection pooling for file operations
+  - Faster data handling
+  - Better resource management
+  - Reduced disk I/O
+  - Improved scalability
+
+### WebSocket Enhancements
+- [ ] Implement advanced WebSocket reconnection logic
+  - Exponential backoff with jitter
+  - Multiple fallback endpoints
+  - Connection health monitoring
+  - Automatic recovery
+  - Better error handling
+
+### Risk Management
+- [ ] Add position size limits per symbol
+- [ ] Implement portfolio exposure limits
+- [ ] Add volatility-based position sizing
+- [ ] Create risk score system
+
+### Analytics Expansion
+- [ ] Add real-time performance metrics
+- [ ] Create detailed trade reports
+- [ ] Implement win/loss ratio tracking
+- [ ] Add ROI calculations per timeframe
+
+### User Experience
+- [ ] Add more interactive Telegram commands
+- [ ] Create custom keyboard shortcuts
+- [ ] Add chart generation
+- [ ] Implement customizable alerts
+
+### Monitoring
+- [ ] Add system health monitoring
+- [ ] Implement error tracking analytics
+- [ ] Add performance bottleneck detection
+- [ ] Create detailed logging analytics
+
 ## Support & Contact
 
 For support or questions:
