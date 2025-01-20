@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 import psutil  # Add missing import
 import logging  # Add missing import
 import os  # Add missing import
+from config.config_handler import ConfigHandler
 
 from strategies.price_drop import PriceDropStrategy
 from utils.logger import setup_logger
@@ -22,8 +23,7 @@ from utils.logger import setup_logger
 init(autoreset=True)
 
 # Load configuration from JSON file
-with open('config/config.json') as config_file:
-    config = json.load(config_file)
+config = ConfigHandler.load_config()
 
 BINANCE_API_KEY = config['BINANCE_API_KEY']
 BINANCE_API_SECRET = config['BINANCE_API_SECRET']
@@ -48,7 +48,7 @@ class BinanceBot:
         self.start_time = datetime.now()
         self.valid_symbols = []  # Add this to track valid symbols
         self.invalid_symbols = []  # Add this to track invalid symbols
-        self.invalid_symbols_file = 'data/invalid_symbols.txt'  # Add new class variable
+        self.invalid_symbols_file = str(ConfigHandler.get_data_dir() / 'invalid_symbols.txt')  # Update directory handling
         
         if use_testnet:
             self.client = Client(TESTNET_API_KEY, TESTNET_API_SECRET, testnet=True)
@@ -102,7 +102,8 @@ class BinanceBot:
         self.orders_placed = {}
         self.total_trades = 0  # Track the total number of trades
         self.max_trades_executed = False
-        self.pending_orders = {}  # Add this to track pending orders
+        self.pending_orders = self.load_pending_orders()  # Add this to track pending orders
+        self.orders_file = 'data/pending_orders.json'
         self.executor = ThreadPoolExecutor(max_workers=10)  # For running async tasks
         self.limit_order_timeout = timedelta(hours=8)
         self.next_reset_times = {
@@ -117,6 +118,26 @@ class BinanceBot:
                 timeframe: {} for timeframe in timeframe_config.keys()
             } for symbol in TRADING_SYMBOLS
         }
+
+    def load_pending_orders(self):
+        """Load pending orders from file"""
+        try:
+            if os.path.exists('data/pending_orders.json'):
+                with open('data/pending_orders.json', 'r') as f:
+                    return json.load(f)
+            return {}
+        except Exception as e:
+            self.logger.error(f"Error loading pending orders: {e}")
+            return {}
+
+    def save_pending_orders(self):
+        """Save pending orders to file"""
+        try:
+            os.makedirs('data', exist_ok=True)
+            with open('data/pending_orders.json', 'w') as f:
+                json.dump(self.pending_orders, f, indent=4)
+        except Exception as e:
+            self.logger.error(f"Error saving pending orders: {e}")
 
     async def setup_telegram_commands(self):
         """Setup the Telegram bot commands menu"""
@@ -416,6 +437,7 @@ class BinanceBot:
         finally:
             if symbol in self.pending_orders:
                 del self.pending_orders[symbol]
+                self.save_pending_orders()  # Save after order complete/canceled
 
     async def get_available_usdt(self):
         """Enhanced balance check with reserve protection"""
@@ -579,7 +601,15 @@ class BinanceBot:
                 if self.use_telegram:
                     await self.send_telegram_message(order_msg)
                 
-                self.pending_orders[symbol] = order['orderId']
+                self.pending_orders[symbol] = {
+                    'orderId': order['orderId'],
+                    'price': formatted_price,
+                    'quantity': quantity,
+                    'placed_time': datetime.now(timezone.utc).isoformat(),
+                    'cancel_time': (datetime.now(timezone.utc) + self.limit_order_timeout).isoformat()
+                }
+                self.save_pending_orders()  # Save after placing order
+                
                 asyncio.create_task(self.monitor_order(symbol, order['orderId'], current_price, order_time))
                 
             elif self.order_type == "market":
@@ -1228,6 +1258,10 @@ class BinanceBot:
             if self.use_telegram:
                 loop.run_until_complete(self._shutdown_telegram())
             loop.close()
+
+    def __del__(self):
+        """Save pending orders when bot shuts down"""
+        self.save_pending_orders()
 
 if __name__ == "__main__":
     try:

@@ -3,5 +3,11 @@ config/old_config.json
 config/config.json
 logs/
 __pycache__/
+*.py[cod]
+*$py.class
+logs/
+data/
 .env
+config.json
+*.log
 data/invalid_symbols.txt
