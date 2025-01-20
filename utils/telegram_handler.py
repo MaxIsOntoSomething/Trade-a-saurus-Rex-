@@ -74,7 +74,6 @@ class TelegramHandler:
             "start": self.handle_start,
             "positions": self.handle_positions,
             "balance": self.handle_balance,
-            "trades": self.handle_trades,
             "profits": self.handle_profits,
             "stats": self.handle_stats,
             "distribution": self.handle_distribution,
@@ -84,10 +83,10 @@ class TelegramHandler:
             "allocation": self.handle_allocation,
             "orders": self.handle_orders,
             "trade": self.handle_trade,
-            "trades": self.handle_trades_list,  # New command to list all trades
-            "symbol": self.handle_symbol_stats,  # Add new handler
-            "summary": self.handle_portfolio_summary,  # Add new handler
-            "addtrade": self.handle_addtrade,  # Add new handler
+            "trades": self.handle_trades_list,  # Keep only one trades handler
+            "symbol": self.handle_symbol_stats,
+            "summary": self.handle_portfolio_summary,
+            "addtrade": self.handle_addtrade,
         }
 
         for command, handler in handlers.items():
@@ -169,15 +168,92 @@ class TelegramHandler:
         await self.send_message(welcome_msg)
 
     async def handle_positions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show trading positions"""
+        """Show trading positions with thresholds and reset times"""
         try:
+            # Send initial response
+            processing_message = await self.send_message("📊 Fetching positions...")
+
             positions = []
-            for symbol in self.bot.valid_symbols:
-                price = self.bot.ws_manager.last_prices.get(symbol, {}).get('price', 0)
-                positions.append(f"📊 {symbol}: {price:.8f}")
-            
-            message = "🎯 Available Trading Positions:\n\n" + "\n".join(positions)
-            await self.send_message(message)
+            cached_prices = self.bot.ws_manager.last_prices
+            now = datetime.now(timezone.utc)
+
+            # Process each trading symbol
+            for symbol in sorted(self.bot.valid_symbols):
+                price_data = cached_prices.get(symbol, {})
+                if not price_data:
+                    positions.append(f"⚪ {symbol}: No price data")
+                    continue
+
+                price = price_data.get('price', 0)
+                change = price_data.get('change', 0)
+                arrow = "↑" if change >= 0 else "↓"
+                color = "🟢" if change >= 0 else "🔴"
+
+                # Get reference prices for drop calculations
+                ref_prices = self.bot.get_reference_prices(symbol)
+                
+                symbol_info = [f"{color} {symbol}: {price:.8f} ({change:+.2f}%) {arrow}"]
+                
+                # Add timeframe information
+                for timeframe in ['daily', 'weekly', 'monthly']:
+                    if not self.bot.timeframe_config[timeframe]['enabled']:
+                        continue
+
+                    # Get reference price for timeframe
+                    ref_price = ref_prices.get(timeframe, {}).get('open', 0)
+                    if ref_price:
+                        current_drop = ((ref_price - price) / ref_price) * 100
+                        
+                        # Get thresholds and their status
+                        thresholds = self.bot.timeframe_config[timeframe]['thresholds']
+                        threshold_status = []
+                        
+                        for threshold in thresholds:
+                            threshold_pct = threshold * 100
+                            if symbol in self.bot.strategy.order_history[timeframe] and \
+                               threshold in self.bot.strategy.order_history[timeframe][symbol]:
+                                # Calculate time until reset
+                                last_order = self.bot.strategy.order_history[timeframe][symbol][threshold]
+                                if timeframe == 'daily':
+                                    reset_time = last_order + timedelta(days=1)
+                                elif timeframe == 'weekly':
+                                    reset_time = last_order + timedelta(days=7)
+                                else:  # monthly
+                                    reset_time = last_order + timedelta(days=30)
+                                
+                                if now < reset_time:
+                                    time_left = reset_time - now
+                                    hours = int(time_left.total_seconds() / 3600)
+                                    mins = int((time_left.total_seconds() % 3600) / 60)
+                                    threshold_status.append(f"🔒 {threshold_pct:.1f}% ({hours}h {mins}m)")
+                                else:
+                                    threshold_status.append(f"✅ {threshold_pct:.1f}%")
+                            else:
+                                if current_drop >= threshold_pct:
+                                    threshold_status.append(f"🟡 {threshold_pct:.1f}%")
+                                else:
+                                    threshold_status.append(f"⚪ {threshold_pct:.1f}%")
+                        
+                        symbol_info.append(f"  {timeframe.capitalize()}: {current_drop:+.2f}%")
+                        symbol_info.append(f"    Thresholds: {' | '.join(threshold_status)}")
+
+                positions.extend(symbol_info)
+                positions.append("")  # Add blank line between symbols
+
+            # Format message
+            message = "🎯 Trading Positions & Thresholds:\n\n"
+            message += "Legend:\n"
+            message += "⚪ Not Triggered | 🟡 Triggered | ✅ Available | 🔒 Locked (time till reset)\n\n"
+            message += "\n".join(positions)
+            message += f"\n\nLast Update: {now.strftime('%H:%M:%S UTC')}"
+
+            # Edit the processing message
+            await self.app.bot.edit_message_text(
+                chat_id=self.chat_id,
+                message_id=processing_message.message_id,
+                text=message
+            )
+
         except Exception as e:
             await self.send_message(f"❌ Error fetching positions: {e}")
 

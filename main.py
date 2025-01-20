@@ -1003,6 +1003,10 @@ class BinanceBot:
     async def main_loop(self):
         """Main bot loop with improved error handling"""
         try:
+            # Perform startup checks first
+            if not await self.startup_checks():
+                raise Exception("Startup checks failed")
+
             # Initialize WebSocket manager
             self.ws_manager = WebSocketManager(self.client, self.valid_symbols, self.logger)
             self.ws_manager.add_callback(self.handle_price_update)
@@ -1010,6 +1014,17 @@ class BinanceBot:
             # Initialize Telegram if enabled
             if self.telegram_handler:
                 await self.telegram_handler.initialize()
+                
+                # Send startup notification
+                startup_msg = (
+                    "🚀 Bot Started Successfully!\n\n"
+                    f"Mode: {'Testnet' if self.client.API_URL == 'https://testnet.binance.vision/api' else 'Live'}\n"
+                    f"Trading Pairs: {len(self.valid_symbols)}\n"
+                    f"Order Type: {self.order_type.capitalize()}\n"
+                    f"USDT Reserve: {self.reserve_balance_usdt}\n"
+                    "Use /start to see available commands"
+                )
+                await self.telegram_handler.send_message(startup_msg)
 
             print(f"{Fore.GREEN}Starting WebSocket connection...")
             await self.ws_manager.start()
@@ -1129,6 +1144,33 @@ class BinanceBot:
         except Exception as e:
             self.logger.error(f"Error calculating symbol stats: {e}")
             return None
+
+    async def startup_checks(self):
+        """Perform startup checks and verifications"""
+        try:
+            print(f"{Fore.CYAN}Performing startup checks...")
+            
+            # Verify pending orders
+            orders_count = len(self.pending_orders)
+            if orders_count > 0:
+                print(f"{Fore.YELLOW}Found {orders_count} pending orders. Verifying status...")
+                await self.verify_pending_orders()
+                print(f"{Fore.GREEN}Order verification complete!")
+            
+            # Update next reset times
+            self.next_reset_times = {
+                'daily': datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1),
+                'weekly': self.get_next_weekly_reset(),
+                'monthly': self.get_next_monthly_reset()
+            }
+            
+            print(f"{Fore.GREEN}Startup checks completed successfully!")
+            return True
+            
+        except Exception as e:
+            print(f"{Fore.RED}Error during startup checks: {e}")
+            self.logger.error(f"Startup checks failed: {e}")
+            return False
 
 if __name__ == "__main__":
     try:

@@ -1,6 +1,6 @@
 # Binance Trading Bot
 
-A sophisticated cryptocurrency trading bot that implements a drop-based buying strategy across multiple timeframes with advanced visualization capabilities.
+A sophisticated cryptocurrency trading bot that implements a drop-based buying strategy across multiple timeframes with advanced visualization capabilities and portfolio management.
 
 ## Core Features 🚀
 
@@ -9,16 +9,29 @@ A sophisticated cryptocurrency trading bot that implements a drop-based buying s
 - 💰 Dynamic drop threshold system
 - 🔒 Balance protection with USDT reserve
 - 📈 Real-time price tracking and trend indicators
-- 🤖 Comprehensive Telegram integration
+- 🤖 Interactive Telegram commands
 - 📉 Advanced performance graphs and statistics
 - ⚡ Limit and market order support
 - 🛡️ Smart symbol validation and error handling
 - 💹 Portfolio analysis and tracking
-- 📝 Automatic invalid symbol management
+- 📝 Manual trade entry system
 - 🕒 24h trading pause on low balance
 - 📊 Data visualization suite
 - ⏱️ 8-hour limit order auto-cancellation
 - 🔍 Real-time order status monitoring
+- 💼 Complete portfolio management
+- 🧮 Automatic tax calculations (28%)
+
+## Portfolio Management Features
+
+- 📈 Real-time portfolio tracking
+- 💰 Automated profit/loss calculations
+- 📊 Tax-adjusted performance metrics
+- 🔄 Manual trade entry system
+- 📑 Trade history management
+- 💹 Symbol-specific analytics
+- 📌 Position tracking
+- 💸 Cost basis tracking
 
 ## Analytics & Visualization Features
 
@@ -27,6 +40,9 @@ A sophisticated cryptocurrency trading bot that implements a drop-based buying s
 - ⏱️ Trade timing analysis
 - 💼 Portfolio value evolution
 - 🥧 Asset allocation charts
+- 📉 Price drop monitoring
+- 💰 Profit/loss tracking
+- 📊 Tax impact analysis
 
 ## Prerequisites
 
@@ -71,6 +87,15 @@ A sophisticated cryptocurrency trading bot that implements a drop-based buying s
    - Set drop thresholds for each timeframe
    - Configure order limits
 
+## Portfolio Management
+
+- Real-time value tracking
+- Automated P/L calculations
+- Tax considerations (28% rate)
+- Position size monitoring
+- Cost basis tracking
+- Trade history management
+
 ## Order Management
 
 - Limit orders auto-cancel after 8 hours
@@ -108,31 +133,45 @@ The bot implements a sophisticated multi-timeframe drop-based buying strategy:
 
 ## Telegram Commands
 
-- `/start` - Show available commands and bot status
-- `/positions` - Show available trading opportunities
-- `/balance` - Show current balance
-- `/trades` - Show total number of trades
-- `/profits` - Show current profits
-- `/stats` - Show system stats and bot information
-- `/distribution` - Show entry price distribution
-- `/stacking` - Show position building over time
-- `/buytimes` - Show time between buys
+### Market Analysis
+- `/positions` - Show current prices and trading opportunities
+- `/orders` - Show open limit orders with cancel times
+
+### Portfolio & Trading
+- `/balance` - Show current balance for all assets
+- `/trades` - List all trades with P/L after tax
+- `/addtrade` - Interactive manual trade entry
+- `/symbol <SYMBOL>` - Show detailed symbol stats with tax
+- `/summary` - Show complete portfolio summary with tax
+- `/profits` - Show current profits for all positions
 - `/portfolio` - Show portfolio value evolution
-- `/allocation` - Show asset allocation
-- `/orders` - Show open limit orders with cancellation times
+- `/allocation` - Show current asset distribution
 
-## Support & Contact
+### Analytics
+- `/distribution` - Show entry price distribution
+- `/stacking` - Show position building patterns
+- `/buytimes` - Show time between purchases
 
-For support or questions:
-- Discord: **maskiplays**
+### System
+- `/stats` - Show system stats and bot information
 
-## Disclaimer
+## Manual Trade Entry System
 
-This bot is for educational purposes only. Trading cryptocurrencies carries significant risks. Use at your own discretion.
+The bot supports manual trade entry through an interactive Telegram conversation:
 
-## License
+1. Start with `/addtrade`
+2. Enter trading pair (e.g., BTCUSDT)
+3. Enter entry price
+4. Enter quantity
+5. Review and confirm trade details
+6. Trade is added to portfolio tracking
 
-MIT License - Feel free to use and modify as needed.
+Features:
+- Input validation at each step
+- Clear error messages
+- Preview before confirmation
+- Automatic tax calculations
+- Integration with portfolio summary
 
 ## Docker Setup
 
