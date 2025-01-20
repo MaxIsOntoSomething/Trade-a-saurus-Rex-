@@ -3,7 +3,7 @@ from telegram import BotCommand, Update
 import asyncio
 from colorama import Fore
 import logging
-from datetime import datetime, timezone  # Add timezone import
+from datetime import datetime, timezone, timedelta  # Add timedelta to imports
 
 class TelegramHandler:
     def __init__(self, token, chat_id, bot_instance):
@@ -214,6 +214,8 @@ class TelegramHandler:
                                threshold in self.bot.strategy.order_history[timeframe][symbol]:
                                 # Calculate time until reset
                                 last_order = self.bot.strategy.order_history[timeframe][symbol][threshold]
+                                
+                                # Calculate reset time based on timeframe
                                 if timeframe == 'daily':
                                     reset_time = last_order + timedelta(days=1)
                                 elif timeframe == 'weekly':
@@ -221,6 +223,7 @@ class TelegramHandler:
                                 else:  # monthly
                                     reset_time = last_order + timedelta(days=30)
                                 
+                                # Rest of the code
                                 if now < reset_time:
                                     time_left = reset_time - now
                                     hours = int(time_left.total_seconds() / 3600)
@@ -263,6 +266,7 @@ class TelegramHandler:
             balance = self.bot.get_balance()
             if balance:
                 # Filter and format significant balances
+                
                 significant_balances = []
                 
                 # Always show USDT first
