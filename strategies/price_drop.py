@@ -33,15 +33,16 @@ class PriceDropStrategy:
         if not symbol:
             return signals
 
+        current_price = float(data['close'].iloc[-1])
+
         # Process each timeframe
         for timeframe in self.timeframe_priority:
             config = self.timeframe_config[timeframe]
-            if not config['enabled']:
+            if not config['enabled'] or timeframe not in reference_prices:
                 continue
 
-            ref_price = reference_prices[timeframe]
-            last_price = float(data['close'].iloc[-1])
-            drop_percentage = (ref_price - last_price) / ref_price
+            ref_price = float(reference_prices[timeframe]['open'])  # Ensure we get the 'open' price
+            drop_percentage = (ref_price - current_price) / ref_price if ref_price > 0 else 0
             
             # Sort thresholds from lowest to highest
             sorted_thresholds = sorted(config['thresholds'])
@@ -52,16 +53,13 @@ class PriceDropStrategy:
 
             # Check each threshold from lowest to highest
             for threshold in sorted_thresholds:
-                # Skip if this threshold was already executed for this symbol and timeframe
                 if threshold in self.order_history[timeframe][symbol]:
-                    print(f"Skipping {timeframe} {threshold*100}% threshold for {symbol} - already executed")
                     continue
                 
                 # Check if threshold is triggered
                 if drop_percentage >= threshold:
                     if self.can_place_order(timeframe, symbol, threshold, current_time):
-                        print(f"Signal: {timeframe} {threshold*100}% threshold triggered for {symbol}")
-                        signals.append((timeframe, threshold, last_price))
+                        signals.append((timeframe, threshold, current_price))
                         self.order_history[timeframe][symbol][threshold] = current_time
                         break  # Stop checking higher thresholds for this timeframe
                     

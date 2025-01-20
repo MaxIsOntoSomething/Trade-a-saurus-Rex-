@@ -20,6 +20,8 @@ from telegram.ext import Application  # Update import
 from strategies.price_drop import PriceDropStrategy
 from utils.logger import setup_logger
 from utils.websocket_manager import WebSocketManager
+from utils.rate_limiter import RateLimiter
+from utils.telegram_handler import TelegramHandler
 
 # Initialize colorama
 init(autoreset=True)
@@ -87,11 +89,10 @@ class BinanceBot:
         from utils.graph_generator import GraphGenerator
         self.graph_generator = GraphGenerator()
 
-        if self.use_telegram:
-            # Update Telegram initialization
-            self.telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
-            self.commands_setup = False
-            # Remove the asyncio.create_task call here
+        # Replace Telegram initialization with new handler
+        self.telegram_handler = None
+        if use_telegram:
+            self.telegram_handler = TelegramHandler(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, self)
         
         self.last_order_time = {}
         self.orders_placed_today = {}
@@ -120,6 +121,35 @@ class BinanceBot:
         # Add WebSocket manager
         self.ws_manager = None
         self.last_price_updates = {}
+
+        # Add rate limiting
+        self.rate_limiter = RateLimiter(max_requests=1200)  # Set to 1200 to be safe (well under 3000 limit)
+        self.price_cache = {}
+        self.cache_duration = 1  # Cache duration in seconds
+
+    async def _make_api_call(self, func, *args, **kwargs):
+        """Wrapper for API calls with rate limiting"""
+        await self.rate_limiter.acquire()
+        return func(*args, **kwargs)
+
+    async def get_cached_price(self, symbol):
+        """Get cached price or fetch new one"""
+        current_time = time.time()
+        
+        if (symbol in self.price_cache and
+            current_time - self.price_cache[symbol]['timestamp'] < self.cache_duration):
+            return self.price_cache[symbol]['price']
+        
+        # If no cache or expired, fetch new price
+        ticker = await self._make_api_call(self.client.get_symbol_ticker, symbol=symbol)
+        price = float(ticker['price'])
+        
+        self.price_cache[symbol] = {
+            'price': price,
+            'timestamp': current_time
+        }
+        
+        return price
 
     def load_pending_orders(self):
         """Load pending orders from file"""
@@ -492,12 +522,28 @@ class BinanceBot:
             if not await self.check_balance_status():
                 return
 
-            ticker = self.client.get_symbol_ticker(symbol=symbol)
-            current_price = float(ticker['price'])
+            # Use cached price instead of fetching new one
+            current_price = await self.get_cached_price(symbol)
             
-            # Format price to proper decimal string (no scientific notation)
-            formatted_price = '{:.8f}'.format(current_price).rstrip('0').rstrip('.')
-            
+            # Format price with exact decimal places based on symbol info
+            if not hasattr(self, 'symbol_info_cache'):
+                self.symbol_info_cache = {}
+                exchange_info = await self._make_api_call(self.client.get_exchange_info)
+                for info in exchange_info['symbols']:
+                    self.symbol_info_cache[info['symbol']] = info
+
+            symbol_info = self.symbol_info_cache.get(symbol)
+            if not symbol_info:
+                raise ValueError(f"Symbol info not found for {symbol}")
+
+            # Get price filter for precision
+            price_filter = next((f for f in symbol_info['filters'] if f['filterType'] == 'PRICE_FILTER'), None)
+            if price_filter:
+                tick_size = float(price_filter['tickSize'])
+                price_precision = len(str(tick_size).rstrip('0').split('.')[-1])
+                formatted_price = f"{current_price:.{price_precision}f}"
+
+            # Calculate and format quantity with proper precision
             available_usdt = await self.get_available_usdt()
             if available_usdt < self.trade_amount:
                 print(f"{Fore.RED}Balance issue detected:")
@@ -526,117 +572,68 @@ class BinanceBot:
                 if self.use_telegram:
                     await self.send_telegram_message(pause_message)
                 return
-            
-            if self.use_percentage:
-                trade_amount = available_usdt * self.trade_amount
-            else:
-                trade_amount = min(self.trade_amount, available_usdt)
-            
-            # Calculate quantity with proper precision
-            quantity = trade_amount / current_price
-            quantity = self.adjust_quantity(symbol, quantity)
 
-            # Get symbol info for precision
-            symbol_info = None
-            exchange_info = self.client.get_exchange_info()
-            for info in exchange_info['symbols']:
-                if info['symbol'] == symbol:
-                    symbol_info = info
-                    break
+            trade_amount = available_usdt * self.trade_amount if self.use_percentage else min(self.trade_amount, available_usdt)
             
-            if not symbol_info:
-                raise ValueError(f"Symbol info not found for {symbol}")
-            
-            # Get the quantity precision from lot size filter
-            lot_size_filter = None
-            for filter in symbol_info['filters']:
-                if filter['filterType'] == 'LOT_SIZE':
-                    lot_size_filter = filter
-                    break
-            
-            if not lot_size_filter:
-                raise ValueError(f"Lot size filter not found for {symbol}")
-            
-            # Calculate step size decimal places
-            step_size = float(lot_size_filter['stepSize'])
-            precision = len(str(step_size).rstrip('0').split('.')[-1])
-            
-            # Round quantity to the correct precision
-            quantity = round(quantity, precision)
-            quantity = float(f"%.{precision}f" % quantity)  # Ensure proper string formatting
-            
-            # Validate against min and max quantity
-            min_qty = float(lot_size_filter['minQty'])
-            max_qty = float(lot_size_filter['maxQty'])
-            
-            if quantity < min_qty:
-                print(f"{Fore.YELLOW}Quantity {quantity} below minimum {min_qty} for {symbol}, adjusting...")
-                quantity = min_qty
-            elif quantity > max_qty:
-                print(f"{Fore.YELLOW}Quantity {quantity} above maximum {max_qty} for {symbol}, adjusting...")
-                quantity = max_qty
-            
-            # Create order with validated quantity
+            # Get lot size filter for quantity precision
+            lot_size_filter = next((f for f in symbol_info['filters'] if f['filterType'] == 'LOT_SIZE'), None)
+            if lot_size_filter:
+                step_size = float(lot_size_filter['stepSize'])
+                quantity_precision = len(str(step_size).rstrip('0').split('.')[-1])
+                quantity = (trade_amount / current_price)
+                quantity = round(quantity - (quantity % float(step_size)), quantity_precision)
+                formatted_quantity = f"{quantity:.{quantity_precision}f}"
+
+            # Create order with proper formatting
             timestamp = int(time.time() * 1000) + self.time_offset
-            
+            order_params = {
+                'symbol': symbol,
+                'side': SIDE_BUY,
+                'quantity': f"%.{quantity_precision}f" % quantity,
+                'recvWindow': self.recv_window,
+                'timestamp': timestamp
+            }
+
             if self.order_type == "limit":
-                order = self.client.create_order(
-                    symbol=symbol,
-                    side=SIDE_BUY,
-                    type=ORDER_TYPE_LIMIT,
-                    timeInForce=TIME_IN_FORCE_GTC,
-                    quantity=quantity,
-                    price=formatted_price,  # Use formatted price instead of str(current_price)
-                    recvWindow=self.recv_window,
-                    timestamp=timestamp
-                )
+                order_params.update({
+                    'type': ORDER_TYPE_LIMIT,
+                    'timeInForce': TIME_IN_FORCE_GTC,
+                    'price': f"%.8f" % price
+                })
+            else:
+                order_params['type'] = ORDER_TYPE_MARKET
+
+            # Place order with rate limiting
+            order = await self._make_api_call(self.client.create_order, **order_params)
+            
+            # Use UTC for all datetime operations
+            order_time = datetime.now(timezone.utc)
+            cancel_time = order_time + self.limit_order_timeout
+            
+            order_msg = (
+                f"Limit order set for {symbol}:\n"
+                f"Price: {formatted_price} USDT\n"
+                f"Quantity: {quantity}\n"
+                f"Will cancel at: {cancel_time.strftime('%Y-%m-%d %H:%M:%S')} UTC"
+            )
+            
+            print(order_msg)
+            self.logger.info(order_msg)
+            
+            if self.use_telegram:
+                await self.send_telegram_message(order_msg)
+            
+            self.pending_orders[symbol] = {
+                'orderId': order['orderId'],
+                'price': formatted_price,
+                'quantity': quantity,
+                'placed_time': datetime.now(timezone.utc).isoformat(),
+                'cancel_time': (datetime.now(timezone.utc) + self.limit_order_timeout).isoformat()
+            }
+            self.save_pending_orders()  # Save after placing order
+            
+            asyncio.create_task(self.monitor_order(symbol, order['orderId'], current_price, order_time))
                 
-                # Use UTC for all datetime operations
-                order_time = datetime.now(timezone.utc)
-                cancel_time = order_time + self.limit_order_timeout
-                
-                order_msg = (
-                    f"Limit order set for {symbol}:\n"
-                    f"Price: {formatted_price} USDT\n"
-                    f"Quantity: {quantity}\n"
-                    f"Will cancel at: {cancel_time.strftime('%Y-%m-%d %H:%M:%S')} UTC"
-                )
-                
-                print(order_msg)
-                self.logger.info(order_msg)
-                
-                if self.use_telegram:
-                    await self.send_telegram_message(order_msg)
-                
-                self.pending_orders[symbol] = {
-                    'orderId': order['orderId'],
-                    'price': formatted_price,
-                    'quantity': quantity,
-                    'placed_time': datetime.now(timezone.utc).isoformat(),
-                    'cancel_time': (datetime.now(timezone.utc) + self.limit_order_timeout).isoformat()
-                }
-                self.save_pending_orders()  # Save after placing order
-                
-                asyncio.create_task(self.monitor_order(symbol, order['orderId'], current_price, order_time))
-                
-            elif self.order_type == "market":
-                order = self.client.create_order(
-                    symbol=symbol,
-                    side=SIDE_BUY,
-                    type=ORDER_TYPE_MARKET,
-                    quantity=quantity,
-                    recvWindow=self.recv_window
-                )
-                self.total_bought[symbol] += quantity
-                self.total_spent[symbol] += quantity * current_price
-                self.total_trades += 1  # Increment total trades
-                self.logger.info(f"BUY ORDER for {symbol}: {order}")
-                print(Fore.GREEN + f"BUY ORDER for {symbol}: {order}")
-                print(Fore.YELLOW + f"Bought {quantity} {symbol.replace('USDT', '')}")
-                if self.use_telegram:
-                    asyncio.run(self.send_telegram_message(f"BUY ORDER for {symbol}: {order}"))
-                self.print_balance_report()  # Print balance report after each buy
-                self.last_order_time[symbol] = datetime.now(timezone.utc)  # Update last order time
         except BinanceAPIException as e:
             error_msg = f"Binance API error in execute_trade: {str(e)}"
             self.logger.error(error_msg)
@@ -710,108 +707,52 @@ class BinanceBot:
             self.logger.error(f"Error fetching current price of {symbol}: {str(e)}")
             return None
 
-    async def handle_balance(self, update: telegram.Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /balance command with detailed balance info"""
-        balance_report = self.get_balance()
-        if balance_report:
-            message = "Current Balance:\n\n"
-            for asset, details in balance_report.items():
-                message += (f"{asset}:\n"
-                          f"  Free: {details['free']}\n"
-                          f"  Locked: {details['locked']}\n"
-                          f"  Total: {details['total']}\n"
-                          f"------------------------\n")
-            await update.effective_message.reply_text(message)
-        else:
-            await update.effective_message.reply_text("Error fetching balance.")
-
-    async def handle_trades(self, update: telegram.Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.effective_message.reply_text(f"Total number of trades done: {self.total_trades}")
-
-    async def handle_profits(self, update: telegram.Update, context: ContextTypes.DEFAULT_TYPE):
-        profits = self.get_profits()
-        if profits is not None:
-            profit_message = "\n".join([f"{symbol}: {profit} USDT" for symbol, profit in profits.items()])
-            await update.effective_message.reply_text(f"Current profits:\n{profit_message}")
-        else:
-            await update.effective_message.reply_text("Error calculating profits.")
-
-    async def handle_start(self, update: telegram.Update, context: ContextTypes.DEFAULT_TYPE):
-        welcome_msg = (
-            "🤖 Binance Trading Bot\n\n"
-            "Available Commands:\n"
-            "📊 Market Analysis:\n"
-            "/positions - Show available trade opportunities\n"
-            "/orders - Show open limit orders with cancel times\n\n"
-            "💰 Portfolio & Trading:\n"
-            "/balance - Show current balance\n"
-            "/trades - Show total number of trades\n"
-            "/profits - Show current profits\n"
-            "/portfolio - Show portfolio value evolution\n"
-            "/allocation - Show asset allocation\n\n"
-            "📈 Analytics:\n"
-            "/distribution - Show entry price distribution\n"
-            "/stacking - Show position building over time\n"
-            "/buytimes - Show time between buys\n\n"
-            "ℹ️ System:\n"
-            "/stats - Show system stats and bot information\n\n"
-            "🔄 Trading Status:\n"
-            f"Mode: {'Testnet' if self.client.API_URL == 'https://testnet.binance.vision/api' else 'Live'}\n"
-            f"Order Type: {self.order_type.capitalize()}\n"
-            f"USDT Reserve: {self.reserve_balance_usdt}\n"
-            "Bot is actively monitoring markets! 🚀"
-        )
-        await update.effective_message.reply_text(welcome_msg)
-
-    async def handle_positions(self, update: telegram.Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /positions command with proper context"""
-        if not update or not update.effective_chat:
-            return
-        try:
-            message = "🎯 Available Trading Positions:\n\n"
-            
-            for symbol in self.valid_symbols:  # Changed from TRADING_SYMBOLS
-                message += f"📊 {symbol}:\n"
-                
-                for timeframe in ['daily', 'weekly', 'monthly']:
-                    if self.timeframe_config[timeframe]['enabled']:
-                        message += f"\n{timeframe.capitalize()}:\n"
-                        
-                        # Get available thresholds
-                        available_thresholds = []
-                        for threshold in self.timeframe_config[timeframe]['thresholds']:
-                            if not self.strategy.order_history[timeframe].get(symbol, {}).get(threshold):
-                                available_thresholds.append(f"{threshold*100}%")
-                        
-                        if available_thresholds:
-                            message += f"  Available drops: {', '.join(available_thresholds)}\n"
-                        else:
-                            message += "  ❌ All positions filled\n"
-                
-                message += "\n" + "-"*20 + "\n"
-            
-            # Add current prices
-            message += "\n📈 Current Prices:\n"
-            for symbol in self.valid_symbols:  # Changed from TRADING_SYMBOLS
-                price = self.client.get_symbol_ticker(symbol=symbol)['price']
-                message += f"{symbol}: {price}\n"
-            
-            await update.effective_message.reply_text(message)
-            
-        except Exception as e:
-            error_msg = f"Error fetching positions: {str(e)}"
-            self.logger.error(error_msg)
-            await update.effective_message.reply_text(error_msg)
+    async def safe_telegram_send(self, chat_id, text, parse_mode=None, reply_markup=None):
+        """Safely send Telegram messages with retry logic"""
+        max_retries = 3
+        retry_delay = 2
+        
+        for attempt in range(max_retries):
+            try:
+                # Split message if too long
+                if len(text) > 4000:
+                    chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
+                    responses = []
+                    for chunk in chunks:
+                        response = await self.telegram_app.bot.send_message(
+                            chat_id=chat_id,
+                            text=chunk,
+                            parse_mode=parse_mode,
+                            reply_markup=reply_markup,
+                            read_timeout=30,
+                            connect_timeout=30,
+                            write_timeout=30,
+                            pool_timeout=30
+                        )
+                        responses.append(response)
+                    return responses[-1]  # Return last message
+                else:
+                    return await self.telegram_app.bot.send_message(
+                        chat_id=chat_id,
+                        text=text,
+                        parse_mode=parse_mode,
+                        reply_markup=reply_markup,
+                        read_timeout=30,
+                        connect_timeout=30,
+                        write_timeout=30,
+                        pool_timeout=30
+                    )
+            except Exception as e:
+                if attempt == max_retries - 1:  # Last attempt
+                    self.logger.error(f"Failed to send Telegram message after {max_retries} attempts: {e}")
+                    raise
+                await asyncio.sleep(retry_delay * (attempt + 1))  # Exponential backoff
 
     async def send_telegram_message(self, message):
         """Updated send_telegram_message method"""
-        if self.use_telegram:
+        if self.telegram_handler:
             try:
-                await self.telegram_app.bot.send_message(
-                    chat_id=TELEGRAM_CHAT_ID,
-                    text=message,
-                    parse_mode='HTML'
-                )
+                await self.telegram_handler.send_message(message, parse_mode='HTML')
             except Exception as e:
                 print(f"Error sending Telegram message: {e}")
                 self.logger.error(f"Error sending Telegram message: {e}")
@@ -846,583 +787,86 @@ class BinanceBot:
             
         return references
 
-    async def handle_stats(self, update: telegram.Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /stats command - Show system stats and bot runtime information"""
-        try:
-            # Get system information
-            cpu_percent = psutil.cpu_percent(interval=1)
-            memory = psutil.virtual_memory()
-            disk = psutil.disk_usage('/')
-            
-            # Calculate bot runtime
-            runtime = datetime.now() - self.start_time
-            days = runtime.days
-            hours = runtime.seconds // 3600
-            minutes = (runtime.seconds % 3600) // 60
-            seconds = runtime.seconds % 60
-            
-            # Format message
-            stats_message = (
-                "🤖 Bot Statistics\n\n"
-                f"⏱️ Runtime: {days}d {hours}h {minutes}m {seconds}s\n"
-                f"🔄 Total Trades: {self.total_trades}\n\n"
-                "💻 System Information:\n"
-                f"CPU Usage: {cpu_percent}%\n"
-                f"RAM Usage: {memory.percent}%\n"
-                f"Free RAM: {memory.available / 1024 / 1024:.1f}MB\n"
-                f"Disk Usage: {disk.percent}%\n"
-                f"Free Disk: {disk.free / 1024 / 1024 / 1024:.1f}GB\n\n"
-                "⚙️ Bot Configuration:\n"
-                f"Order Type: {self.order_type}\n"
-                f"Using Testnet: {self.client.API_URL == 'https://testnet.binance.vision/api'}\n"
-                f"Symbols: {', '.join(self.valid_symbols)}\n"  # Changed from TRADING_SYMBOLS
-                "Timeframes Enabled:\n"
-            )
-            
-            # Add timeframe information
-            for timeframe in self.timeframe_config:
-                if self.timeframe_config[timeframe]['enabled']:
-                    thresholds = [f"{t*100}%" for t in self.timeframe_config[timeframe]['thresholds']]
-                    stats_message += f"- {timeframe.capitalize()}: {', '.join(thresholds)}\n"
-            
-            # Add trading amounts
-            stats_message += f"\n💰 Trading Configuration:\n"
-            stats_message += f"USDT Reserve: {self.reserve_balance_usdt}\n"
-            if self.use_percentage:
-                stats_message += f"Trade Amount: {self.trade_amount * 100}% of available USDT\n"
-            else:
-                stats_message += f"Trade Amount: {self.trade_amount} USDT\n"
-            
-            await update.effective_message.reply_text(stats_message)
-            
-        except Exception as e:
-            error_msg = f"Error fetching stats: {str(e)}"
-            self.logger.error(error_msg)
-            await update.effective_message.reply_text(error_msg)
-
     async def main_loop(self):
+        """Main bot loop with improved error handling"""
         try:
             # Initialize WebSocket manager
             self.ws_manager = WebSocketManager(self.client, self.valid_symbols, self.logger)
             self.ws_manager.add_callback(self.handle_price_update)
+            
+            # Initialize Telegram if enabled
+            if self.telegram_handler:
+                await self.telegram_handler.initialize()
+
+            print(f"{Fore.GREEN}Starting WebSocket connection...")
             await self.ws_manager.start()
 
-            # Initialize Telegram if enabled
-            if self.use_telegram:
-                try:
-                    await self.telegram_app.initialize()
-                    await self.setup_telegram_commands()
-                    await self.telegram_app.start()
-                    await self.telegram_app.updater.start_polling()
-                    print(f"{Fore.GREEN}Telegram bot started successfully!")
-                except Exception as e:
-                    print(f"{Fore.RED}Error starting Telegram bot: {e}")
-                    self.use_telegram = False  # Disable Telegram if it fails to start
-
-            self.print_daily_open_price()
-            self.print_balance_report()
-
-            print(Fore.GREEN + "Bot started successfully!")
-            print(Fore.YELLOW + "Monitoring price movements via WebSocket...")
-            self.logger.info("Bot started successfully!")
-
-            # Main loop for other periodic tasks
             while True:
                 try:
-                    now = datetime.now(timezone.utc)
-                    
-                    # Check for daily open price at 00:00 UTC
-                    if now >= self.next_reset_times['daily']:
-                        self.print_daily_open_price()
-                        self.next_reset_times['daily'] += timedelta(days=1)
-
-                    # Reset orders placed at the end of each timeframe
-                    for timeframe, reset_time in self.next_reset_times.items():
-                        if now >= reset_time:
-                            # ...existing reset logic...
-                            pass
-
                     await asyncio.sleep(1)
-
                 except Exception as e:
                     self.logger.error(f"Error in main loop: {e}")
-                    await asyncio.sleep(60)
+                    await asyncio.sleep(5)
 
         except Exception as e:
             self.logger.error(f"Fatal error in main loop: {e}")
             raise
         finally:
-            # Cleanup
             if self.ws_manager:
                 await self.ws_manager.stop()
-            await self._shutdown_telegram()
+            if self.telegram_handler:
+                await self.telegram_handler.shutdown()
 
-    async def handle_price_update(self, symbol, price_data):
-        """Handle real-time price updates from WebSocket"""
+    async def handle_price_update(self, symbol, price):
+        """Handle real-time price updates"""
         try:
-            current_price = price_data['price']
-            price_change = price_data['change']
-            
-            # Store the latest data
-            self.last_price_updates[symbol] = {
-                'price': current_price,
-                'change': price_change,
-                'timestamp': datetime.now()
-            }
-            
-            # Clear screen and print header
-            print("\033[2J\033[H")  # Clear screen and move cursor to top
-            print(f"{Fore.CYAN}{'Symbol':<12} {'Price':<16} {'24h Change':<12} {'Time'}")
-            print("-" * 50)
-            
-            # Print all symbols' latest data
-            for sym in sorted(self.last_price_updates.keys()):
-                data = self.last_price_updates[sym]
-                trend_arrow = "↑" if float(data['change']) >= 0 else "↓"
-                trend_color = Fore.GREEN if float(data['change']) >= 0 else Fore.RED
-                
-                print(f"{Fore.CYAN}{sym:<12} "
-                      f"{trend_color}{float(data['price']):,.8f} "
-                      f"{data['change']:+.2f}% {trend_arrow}{Fore.RESET}")
-
-            # Check for trading signals
+            # Price is already a float, no need to convert
             df = pd.DataFrame({
                 'symbol': [symbol],
-                'close': [current_price]
+                'close': [price]  # Use price directly
             })
             
+            # Get reference prices
             reference_prices = self.get_reference_prices(symbol)
+            if not reference_prices:
+                return  # Skip if no reference prices available
+            
+            # Generate trading signals
             signals = self.strategy.generate_signals(
                 df,
                 reference_prices,
                 datetime.now(timezone.utc)
             )
             
-            # Execute trades for any signals
-            for timeframe, threshold, price in signals:
-                await self.execute_trade(symbol, price)
+            # Execute trades for valid signals
+            for timeframe, threshold, signal_price in signals:
+                await self.execute_trade(symbol, price)  # Use current price
 
         except Exception as e:
-            self.logger.error(f"Error handling price update: {e}")
-
-    def get_profits(self):
-        """Calculate current profits"""
-        try:
-            profits = {}
-            current_prices = {}
-            
-            # Get current prices
-            for symbol in self.valid_symbols:  # Changed from TRADING_SYMBOLS
-                ticker = self.client.get_symbol_ticker(symbol=symbol)
-                current_prices[symbol] = float(ticker['price'])
-            
-            # Calculate profits for each symbol
-            for symbol in self.valid_symbols:  # Changed from TRADING_SYMBOLS
-                if self.total_bought[symbol] > 0:
-                    current_value = self.total_bought[symbol] * current_prices[symbol]
-                    profit = current_value - self.total_spent[symbol]
-                    profits[symbol] = round(profit, 2)
-                else:
-                    profits[symbol] = 0
-                    
-            return profits
-        except Exception as e:
-            self.logger.error(f"Error calculating profits: {e}")
-            return None
-
-    async def handle_distribution(self, update: telegram.Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /distribution command"""
-        try:
-            no_data = True
-            for symbol in self.valid_symbols:
-                try:
-                    if self.total_bought[symbol] > 0:
-                        # Get entry prices from orders_placed
-                        entry_prices = []
-                        for timeframe in self.orders_placed[symbol].values():
-                            for order in timeframe.values():
-                                try:
-                                    entry_prices.append(float(order['price']))
-                                except (KeyError, ValueError):
-                                    continue
-                        
-                        if entry_prices:
-                            no_data = False
-                            graph = self.graph_generator.generate_entry_price_histogram(symbol, entry_prices)
-                            if graph:
-                                await update.effective_message.reply_photo(
-                                    photo=graph,
-                                    caption=f"Entry price distribution for {symbol}"
-                                )
-                            else:
-                                await update.effective_message.reply_text(
-                                    f"⚠️ Could not generate graph for {symbol}. Please try again later."
-                                )
-                except Exception as e:
-                    await update.effective_message.reply_text(
-                        f"⚠️ Error processing {symbol}: {str(e)}"
-                    )
-                    continue
-            
-            if no_data:
-                await update.effective_message.reply_text(
-                    "📊 No trading data available yet. Make some trades first!"
-                )
-                
-        except Exception as e:
-            await update.effective_message.reply_text(
-                "❌ Error generating distribution graphs. Please try again later.\n"
-                f"Error: {str(e)}"
-            )
-            self.logger.error(f"Error in handle_distribution: {str(e)}")
-
-    # Similar error handling for other graph commands...
-    async def handle_stacking(self, update: telegram.Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /stacking command"""
-        try:
-            no_data = True
-            for symbol in self.valid_symbols:
-                try:
-                    if (self.total_bought[symbol] > 0):
-                        timestamps = []
-                        quantities = []
-                        prices = []
-                        
-                        for timeframe in self.orders_placed[symbol].values():
-                            for order in timeframe.values():
-                                try:
-                                    timestamps.append(order['timestamp'])
-                                    quantities.append(float(order['qty']))
-                                    prices.append(float(order['price']))
-                                except (KeyError, ValueError):
-                                    continue
-                        
-                        if timestamps:
-                            no_data = False
-                            graph = self.graph_generator.generate_position_stacking(
-                                symbol, timestamps, quantities, prices
-                            )
-                            if graph:
-                                await update.effective_message.reply_photo(
-                                    photo=graph,
-                                    caption=f"Position building for {symbol}"
-                                )
-                            else:
-                                await update.effective_message.reply_text(
-                                    f"⚠️ Could not generate stacking graph for {symbol}"
-                                )
-                except Exception as e:
-                    await update.effective_message.reply_text(
-                        f"⚠️ Error processing {symbol}: {str(e)}"
-                    )
-                    continue
-            
-            if no_data:
-                await update.effective_message.reply_text(
-                    "📊 No position data available yet. Make some trades first!"
-                )
-                
-        except Exception as e:
-            await update.effective_message.reply_text(
-                "❌ Error generating stacking visualization. Please try again later.\n"
-                f"Error: {str(e)}"
-            )
-            self.logger.error(f"Error in handle_stacking: {str(e)}")
-
-    # Add similar error handling for other graph handlers...
-    async def handle_buy_times(self, update: telegram.Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /buytimes command"""
-        try:
-            buy_timestamps = []
-            for symbol in self.valid_symbols:
-                for timeframe in self.orders_placed[symbol].values():
-                    for order in timeframe.values():
-                        buy_timestamps.append(order['timestamp'])
-            
-            if buy_timestamps:
-                graph = self.graph_generator.generate_time_between_buys(sorted(buy_timestamps))
-                if graph:
-                    await update.effective_message.reply_photo(photo=graph)
-                else:
-                    await update.effective_message.reply_text("Need at least 2 trades to generate time analysis")
-            else:
-                await update.effective_message.reply_text("No trades found")
-        except Exception as e:
-            await update.effective_message.reply_text(f"Error generating buy times analysis: {str(e)}")
-
-    async def handle_portfolio(self, update: telegram.Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /portfolio command"""
-        try:
-            # Get historical portfolio values
-            timestamps = []
-            total_values = []
-            
-            # Calculate portfolio value at each trade
-            current_prices = {symbol: float(self.client.get_symbol_ticker(symbol=symbol)['price']) 
-                            for symbol in self.valid_symbols}
-            
-            for timestamp in sorted(set([order['timestamp'] 
-                                      for symbol in self.valid_symbols 
-                                      for timeframe in self.orders_placed[symbol].values() 
-                                      for order in timeframe.values()])):
-                total_value = sum(self.total_bought[symbol] * current_prices[symbol] 
-                                for symbol in self.valid_symbols)
-                timestamps.append(timestamp)
-                total_values.append(total_value)
-            
-            if timestamps:
-                graph = self.graph_generator.generate_portfolio_evolution(timestamps, total_values)
-                await update.effective_message.reply_photo(photo=graph)
-            else:
-                await update.effective_message.reply_text("No portfolio data available")
-        except Exception as e:
-            await update.effective_message.reply_text(f"Error generating portfolio evolution: {str(e)}")
-
-    async def handle_allocation(self, update: telegram.Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /allocation command with complete portfolio and fast response"""
-        try:
-            # Send immediate response
-            processing_message = await update.effective_message.reply_text("📊 Generating portfolio allocation...")
-
-            try:
-                balances = self.get_balance()
-                if not balances:
-                    await processing_message.edit_text("❌ Error fetching balance information")
-                    return
-
-                # Process prices in parallel using asyncio.gather
-                async def get_asset_value(asset, balance):
-                    try:
-                        if asset == 'USDT':
-                            return asset, balance['total']
-                        else:
-                            try:
-                                ticker = await asyncio.to_thread(
-                                    self.client.get_symbol_ticker,
-                                    symbol=f"{asset}USDT"
-                                )
-                                price = float(ticker['price'])
-                                return asset, balance['total'] * price
-                            except:
-                                try:
-                                    ticker = await asyncio.to_thread(
-                                        self.client.get_symbol_ticker,
-                                        symbol=f"USDT{asset}"
-                                    )
-                                    price = 1 / float(ticker['price'])
-                                    return asset, balance['total'] * price
-                                except:
-                                    return None, None
-
-                    except Exception as e:
-                        self.logger.warning(f"Could not get price for {asset}: {e}")
-                        return None, None
-
-                # Process all assets in parallel
-                tasks = [get_asset_value(asset, balance) for asset, balance in balances.items()]
-                results = await asyncio.gather(*tasks)
-
-                # Filter valid results
-                asset_values = [(asset, value) for asset, value in results if asset is not None]
-                
-                if not asset_values:
-                    await processing_message.edit_text("No assets found in portfolio")
-                    return
-
-                # Sort by value
-                asset_values.sort(key=lambda x: x[1], reverse=True)
-                assets, values = zip(*asset_values)
-
-                # Generate report while graph is being created
-                total_value = sum(values)
-                report = "💰 Portfolio Allocation:\n\n"
-                for asset, value in asset_values:
-                    percentage = (value / total_value) * 100
-                    report += f"{asset}: ${value:.2f} ({percentage:.2f}%)\n"
-                report += f"\nTotal Portfolio Value: ${total_value:.2f}"
-
-                # Generate graph in thread pool
-                graph = await asyncio.to_thread(
-                    self.graph_generator.generate_asset_allocation,
-                    list(assets),
-                    list(values)
-                )
-
-                # Delete processing message and send final report
-                await processing_message.delete()
-                
-                if graph:
-                    await update.effective_message.reply_photo(
-                        photo=graph,
-                        caption=report
-                    )
-                else:
-                    await update.effective_message.reply_text(report)
-
-            except Exception as e:
-                await processing_message.edit_text(
-                    f"❌ Error generating allocation: {str(e)}"
-                )
-                self.logger.error(f"Error in allocation: {e}")
-
-        except Exception as e:
-            await update.effective_message.reply_text(
-                "❌ Error processing command. Please try again."
-            )
-            self.logger.error(f"Error in handle_allocation: {e}")
-
-    # Similar updates for other handlers...
-
-    async def handle_orders(self, update: telegram.Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /orders command - Show open limit orders"""
-        try:
-            open_orders = []
-            for symbol in self.valid_symbols:
-                try:
-                    symbol_orders = self.client.get_open_orders(symbol=symbol)
-                    open_orders.extend(symbol_orders)
-                except Exception as e:
-                    await update.effective_message.reply_text(f"Error fetching orders for {symbol}: {str(e)}")
-                    continue
-            
-            if not open_orders:
-                await update.effective_message.reply_text("No open limit orders")
-                return
-            
-            message = "📋 Open Limit Orders:\n\n"
-            for order in open_orders:
-                symbol = order['symbol']
-                side = order['side']
-                quantity = float(order['origQty'])
-                price = float(order['price'])
-                total = quantity * price
-                
-                # Calculate time info
-                order_time = datetime.fromtimestamp(order['time']/1000)
-                cancel_time = order_time + self.limit_order_timeout
-                now = datetime.now()
-                time_until_cancel = cancel_time - now
-                hours_left = time_until_cancel.total_seconds() / 3600
-                
-                # Format the cancel time info
-                if hours_left < 0:
-                    cancel_info = "Order will be cancelled soon"
-                else:
-                    cancel_info = f"Cancels in: {hours_left:.1f} hours"
-                
-                message += (
-                    f"Symbol: {symbol}\n"
-                    f"Side: {side}\n"
-                    f"Quantity: {quantity}\n"
-                    f"Price: {price:.8f} USDT\n"
-                    f"Total: {total:.2f} USDT\n"
-                    f"Placed: {order_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                    f"Order ID: {order['orderId']}\n"
-                    f"❗ {cancel_info}\n"
-                    f"─────────────\n"
-                )
-            
-            await update.effective_message.reply_text(message)
-            
-        except Exception as e:
-            error_msg = f"Error fetching open orders: {str(e)}"
-            self.logger.error(error_msg)
-            await update.effective_message.reply_text(error_msg)
-
-    async def setup_telegram(self):
-        """Setup Telegram handlers with proper context types"""
-        try:
-            # Add command handlers with proper context types
-            self.telegram_app.add_handler(CommandHandler(
-                "positions", 
-                lambda update, context: self.handle_positions(update, context)
-            ))
-            self.telegram_app.add_handler(CommandHandler(
-                "balance", 
-                lambda update, context: self.handle_balance(update, context)
-            ))
-            self.telegram_app.add_handler(CommandHandler(
-                "trades", 
-                lambda update, context: self.handle_trades(update, context)
-            ))
-            self.telegram_app.add_handler(CommandHandler(
-                "profits", 
-                lambda update, context: self.handle_profits(update, context)
-            ))
-            self.telegram_app.add_handler(CommandHandler(
-                "start", 
-                lambda update, context: self.handle_start(update, context)
-            ))
-            self.telegram_app.add_handler(CommandHandler(
-                "stats", 
-                lambda update, context: self.handle_stats(update, context)
-            ))
-            self.telegram_app.add_handler(CommandHandler(
-                "distribution", 
-                lambda update, context: self.handle_distribution(update, context)
-            ))
-            self.telegram_app.add_handler(CommandHandler(
-                "stacking", 
-                lambda update, context: self.handle_stacking(update, context)
-            ))
-            self.telegram_app.add_handler(CommandHandler(
-                "buytimes", 
-                lambda update, context: self.handle_buy_times(update, context)
-            ))
-            self.telegram_app.add_handler(CommandHandler(
-                "portfolio", 
-                lambda update, context: self.handle_portfolio(update, context)
-            ))
-            self.telegram_app.add_handler(CommandHandler(
-                "allocation", 
-                lambda update, context: self.handle_allocation(update, context)
-            ))
-            self.telegram_app.add_handler(CommandHandler(
-                "orders", 
-                lambda update, context: self.handle_orders(update, context)
-            ))
-
-            # Start the bot
-            await self.telegram_app.initialize()
-            await self.setup_telegram_commands()
-            await self.telegram_app.start()
-            await self.telegram_app.updater.start_polling(
-                allowed_updates=["message"],
-                drop_pending_updates=True
-            )
-            
-            print(f"{Fore.GREEN}Telegram bot started successfully!")
-            self.logger.info("Telegram bot started successfully!")
-            
-        except Exception as e:
-            print(f"{Fore.RED}Error setting up Telegram: {e}")
-            self.logger.error(f"Error setting up Telegram: {e}")
-            self.use_telegram = False
+            self.logger.error(f"Error handling price update for {symbol}: {e}")
+            print(f"{Fore.RED}Error handling price update for {symbol}: {e}")
 
     def run(self):
-        """Run the bot's main loop"""
+        """Run the bot with improved error handling"""
         try:
-            # Create and run the event loop
-            loop = asyncio.new_event_loop()  # Create new event loop
-            asyncio.set_event_loop(loop)     # Set it as the current event loop
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
             
-            # Initialize Telegram before starting main loop
-            if self.use_telegram:
-                loop.run_until_complete(self.setup_telegram())
+            if self.telegram_handler:
+                # Initialize Telegram with proper error handling
+                telegram_success = loop.run_until_complete(self.telegram_handler.initialize())
+                if not telegram_success:
+                    print(f"{Fore.YELLOW}Continuing without Telegram support...")
+                    self.telegram_handler = None
             
-            # Run the main loop
             loop.run_until_complete(self.main_loop())
             
-        except KeyboardInterrupt:
-            print("\nShutdown requested... closing connections")
-            self.logger.info("Shutdown requested by user")
         except Exception as e:
             print(f"\nError in main loop: {str(e)}")
             self.logger.error(f"Error in main loop: {str(e)}")
         finally:
-            # Ensure proper cleanup
-            if self.use_telegram:
-                loop.run_until_complete(self._shutdown_telegram())
+            if self.telegram_handler:
+                loop.run_until_complete(self.telegram_handler.shutdown())
             loop.close()
 
     def __del__(self):
@@ -1563,7 +1007,7 @@ if __name__ == "__main__":
         try:
             bot = BinanceBot(use_testnet, use_telegram, timeframe_config, order_type, use_percentage, trade_amount, reserve_balance_usdt)
             bot.test_connection()
-            bot.run()  # Now this will work
+            bot.run()
         except Exception as e:
             print(f"Error initializing bot: {str(e)}")
             logging.error(f"Error initializing bot: {str(e)}")
@@ -1573,8 +1017,6 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         logging.error(f"Unexpected error: {str(e)}")
-
-
 
 
 

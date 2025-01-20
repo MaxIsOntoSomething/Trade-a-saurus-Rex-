@@ -5,6 +5,7 @@ import json
 from datetime import datetime
 from colorama import Fore
 import logging
+import os
 
 class WebSocketManager:
     def __init__(self, client, symbols, logger=None):
@@ -18,6 +19,8 @@ class WebSocketManager:
         self.reconnect_delay = 5
         self.max_reconnect_delay = 300
         self.initial_prices_sent = False  # Add this flag
+        self.last_refresh = datetime.now()
+        self.refresh_interval = 60  # Refresh every 60 seconds
 
     def add_callback(self, callback):
         """Add callback function to be called when price updates are received"""
@@ -28,6 +31,9 @@ class WebSocketManager:
         try:
             # Get initial prices before starting WebSocket
             await self._send_initial_prices()
+            
+            # Start refresh timer
+            asyncio.create_task(self._refresh_timer())
             
             # Determine WebSocket URL based on testnet or mainnet
             ws_url = "wss://testnet.binance.vision/ws" if self.client.API_URL == "https://testnet.binance.vision/api" else "wss://stream.binance.com:9443/ws"
@@ -74,8 +80,6 @@ class WebSocketManager:
                 self.last_prices[symbol] = {
                     'price': float(ticker['price']),
                     'change': float(stats_24h['priceChangePercent']),
-                    'high': float(stats_24h['highPrice']),
-                    'low': float(stats_24h['lowPrice']),
                     'timestamp': datetime.now()
                 }
             
@@ -92,30 +96,47 @@ class WebSocketManager:
     async def _handle_socket_message(self, msg):
         """Handle incoming WebSocket messages"""
         try:
-            if 'e' not in msg or msg['e'] != '24hrTicker':
+            if 'e' not in msg:  # Handle initial connection message
                 return
+            
+            if msg['e'] == '24hrTicker':
+                symbol = msg['s']  # Symbol
+                price = float(msg['c'])  # Current price as float
+                price_change = float(msg['P'])  # 24h price change percent as float
 
-            symbol = msg['s']  # Symbol
-            price = float(msg['c'])  # Current price
-            price_change = float(msg['P'])  # 24h price change percent
-            high = float(msg['h'])  # 24h high
-            low = float(msg['l'])  # 24h low
+                # Store the last price with reduced information
+                self.last_prices[symbol] = {
+                    'price': price,
+                    'change': price_change,
+                    'timestamp': datetime.now()
+                }
 
-            # Store the last price
-            self.last_prices[symbol] = {
-                'price': price,
-                'change': price_change,
-                'high': high,
-                'low': low,
-                'timestamp': datetime.now()
-            }
+                # Clear console for Windows
+                os.system('cls' if os.name == 'nt' else 'clear')
+                
+                # Print header
+                print(f"{Fore.CYAN}{'Symbol':<12} {'Price':<15} {'24h Change':<15}")
+                print("-" * 42)  # Reduced line length
 
-            # Call all registered callbacks with the update
-            for callback in self.callbacks:
-                asyncio.create_task(callback(symbol, self.last_prices[symbol]))
+                # Print all prices
+                for sym, data in sorted(self.last_prices.items()):
+                    color = Fore.GREEN if data['change'] >= 0 else Fore.RED
+                    arrow = "↑" if data['change'] >= 0 else "↓"
+                    print(f"{Fore.CYAN}{sym:<12} "
+                          f"{color}{data['price']:<15.8f} "
+                          f"{data['change']:+.2f}% {arrow}{Fore.RESET}")
+
+                # Add bottom separator and UTC clock
+                print("-" * 42)
+                print(f"{Fore.YELLOW}UTC: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}")
+
+                # Call all registered callbacks with just the price value
+                for callback in self.callbacks:
+                    await callback(symbol, float(price))  # Send only the price as float
 
         except Exception as e:
             self.logger.error(f"Error processing WebSocket message: {e}")
+            print(f"{Fore.RED}Error processing WebSocket message: {e}")
 
     async def _handle_reconnection(self):
         """Handle WebSocket reconnection with exponential backoff"""
@@ -149,3 +170,56 @@ class WebSocketManager:
                 self.logger.info("WebSocket connection closed")
         except Exception as e:
             self.logger.error(f"Error stopping WebSocket: {e}")
+
+    async def _refresh_timer(self):
+        """Force refresh prices every 60 seconds"""
+        while True:
+            try:
+                await asyncio.sleep(self.refresh_interval)
+                await self._force_refresh()
+            except Exception as e:
+                self.logger.error(f"Error in refresh timer: {e}")
+                await asyncio.sleep(5)  # Wait before retrying
+
+    async def _force_refresh(self):
+        """Force refresh all prices"""
+        try:
+            for symbol in self.symbols:
+                ticker = self.client.get_symbol_ticker(symbol=symbol)
+                stats_24h = self.client.get_ticker(symbol=symbol)
+                
+                price = float(ticker['price'])
+                price_change = float(stats_24h['priceChangePercent'])
+
+                self.last_prices[symbol] = {
+                    'price': price,
+                    'change': price_change,
+                    'timestamp': datetime.now()
+                }
+
+            # Clear and redraw the display
+            os.system('cls' if os.name == 'nt' else 'clear')
+            
+            # Print header
+            print(f"{Fore.CYAN}{'Symbol':<12} {'Price':<15} {'24h Change':<15}")
+            print("-" * 42)
+
+            # Print all prices
+            for sym, data in sorted(self.last_prices.items()):
+                color = Fore.GREEN if data['change'] >= 0 else Fore.RED
+                arrow = "↑" if data['change'] >= 0 else "↓"
+                print(f"{Fore.CYAN}{sym:<12} "
+                      f"{color}{data['price']:<15.8f} "
+                      f"{data['change']:+.2f}% {arrow}{Fore.RESET}")
+
+            # Add bottom separator and UTC clock
+            print("-" * 42)
+            print(f"{Fore.YELLOW}UTC: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}")
+
+            # Call callbacks with updates
+            for symbol, data in self.last_prices.items():
+                for callback in self.callbacks:
+                    asyncio.create_task(callback(symbol, data['price']))
+
+        except Exception as e:
+            self.logger.error(f"Error in force refresh: {e}")
