@@ -37,7 +37,8 @@ class TelegramHandler:
                 BotCommand("portfolio", "Show portfolio value evolution"),
                 BotCommand("allocation", "Show asset allocation"),
                 BotCommand("orders", "Show open limit orders"),
-                BotCommand("symbol", "Show detailed stats for a symbol including tax")
+                BotCommand("symbol", "Show detailed stats for a symbol including tax"),
+                BotCommand("summary", "Show complete portfolio summary with tax")
             ]
 
             # Register command handlers
@@ -83,6 +84,7 @@ class TelegramHandler:
             "trade": self.handle_trade,
             "trades": self.handle_trades_list,  # New command to list all trades
             "symbol": self.handle_symbol_stats,  # Add new handler
+            "summary": self.handle_portfolio_summary,  # Add new handler
         }
 
         for command, handler in handlers.items():
@@ -140,6 +142,7 @@ class TelegramHandler:
             "/balance - Show current balance\n"
             "/trades - List all trades with P/L after tax\n"
             "/symbol <SYMBOL> - Show detailed symbol stats with tax\n"
+            "/summary - Show complete portfolio summary with tax\n"
             "/profits - Show current profits\n"
             "/portfolio - Show portfolio value evolution\n"
             "/allocation - Show asset allocation\n\n"
@@ -363,6 +366,62 @@ class TelegramHandler:
         except Exception as e:
             await self.send_message(f"❌ Error getting symbol stats: {e}")
 
+    async def handle_portfolio_summary(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show summary of all trades and total portfolio performance"""
+        try:
+            if not self.bot.trades:
+                await self.send_message("No trades found")
+                return
+
+            # Calculate totals
+            total_investment = 0
+            total_current_value = 0
+            total_gross_profit = 0
+            symbol_summaries = []
+
+            # Process each symbol
+            for symbol in sorted(set(trade['symbol'] for trade in self.bot.trades.values())):
+                stats = await self.bot.get_symbol_stats(symbol)
+                if stats:
+                    total_investment += stats['total_cost']
+                    total_current_value += stats['current_value']
+                    total_gross_profit += stats['gross_profit_usdt']
+                    symbol_summaries.append(stats)
+
+            # Calculate portfolio totals
+            total_tax = total_gross_profit * self.bot.tax_rate if total_gross_profit > 0 else 0
+            total_net_profit = total_gross_profit - total_tax if total_gross_profit > 0 else total_gross_profit
+            total_profit_percentage = (total_net_profit / total_investment * 100) if total_investment > 0 else 0
+
+            # Format message
+            message = "📊 Portfolio Summary\n\n"
+            
+            # Overall summary
+            message += f"💼 Total Portfolio:\n"
+            message += f"Investment: {total_investment:.2f} USDT\n"
+            message += f"Current Value: {total_current_value:.2f} USDT\n"
+            message += f"Gross P/L: {total_gross_profit:+.2f} USDT\n"
+            message += f"Tax (28%): {total_tax:.2f} USDT\n"
+            message += f"Net P/L: {total_net_profit:+.2f} USDT ({total_profit_percentage:+.2f}%)\n\n"
+            
+            # Individual symbols
+            message += "📈 By Symbol:\n"
+            for stats in symbol_summaries:
+                profit_color = "🟢" if stats['net_profit_usdt'] >= 0 else "🔴"
+                message += (
+                    f"{profit_color} {stats['symbol']}\n"
+                    f"   Cost: {stats['total_cost']:.2f} USDT\n"
+                    f"   Value: {stats['current_value']:.2f} USDT\n"
+                    f"   Net P/L: {stats['net_profit_usdt']:+.2f} USDT ({stats['net_profit_percentage']:+.2f}%)\n"
+                    f"   Trades: {stats['number_of_trades']}\n\n"
+                )
+
+            message += "\nUse /symbol <SYMBOL> for detailed symbol statistics"
+            await self.send_message(message)
+            
+        except Exception as e:
+            await self.send_message(f"❌ Error getting portfolio summary: {e}")
+
     async def shutdown(self):
         """Safely shutdown Telegram bot"""
         try:
@@ -375,3 +434,4 @@ class TelegramHandler:
         except Exception as e:
             print(f"{Fore.YELLOW}Note: Telegram was already stopped or not running")
             self.logger.info("Telegram was already stopped or not running")
+``` 
