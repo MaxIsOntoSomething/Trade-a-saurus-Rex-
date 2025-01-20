@@ -22,17 +22,26 @@ from utils.logger import setup_logger
 # Initialize colorama
 init(autoreset=True)
 
-# Load configuration from JSON file
-config = ConfigHandler.load_config()
+# Check if running in Docker
+IN_DOCKER = os.environ.get('DOCKER', '').lower() == 'true'
 
+# Load configuration based on environment
+config = ConfigHandler.load_config(use_env=IN_DOCKER)
+
+# Initialize mandatory settings
 BINANCE_API_KEY = config['BINANCE_API_KEY']
 BINANCE_API_SECRET = config['BINANCE_API_SECRET']
 TESTNET_API_KEY = config['TESTNET_API_KEY']
 TESTNET_API_SECRET = config['TESTNET_API_SECRET']
 TRADING_SYMBOLS = config['TRADING_SYMBOLS']
-TIME_INTERVAL = config['TIME_INTERVAL']
-TELEGRAM_TOKEN = config['TELEGRAM_TOKEN']
-TELEGRAM_CHAT_ID = config['TELEGRAM_CHAT_ID']
+
+# Initialize optional settings with defaults
+TELEGRAM_TOKEN = config.get('TELEGRAM_TOKEN', '')
+TELEGRAM_CHAT_ID = config.get('TELEGRAM_CHAT_ID', '')
+USE_TELEGRAM = config.get('USE_TELEGRAM', False)
+
+# Remove or comment out this line since TIME_INTERVAL is not used
+# TIME_INTERVAL = config['TIME_INTERVAL']
 
 class BinanceBot:
     # Class-level variables
@@ -1273,11 +1282,23 @@ if __name__ == "__main__":
                 break
             print("Invalid input. Please enter 'yes' or 'no'.")
 
-        # 2. Then about Telegram
+        # 2. Then about Telegram - Add validation
         while True:
             telegram_input = input("Do you want to use Telegram notifications? (yes/no): ").strip().lower()
             if telegram_input in ['yes', 'no']:
                 use_telegram = telegram_input == 'yes'
+                if use_telegram:
+                    if not USE_TELEGRAM:
+                        print(f"{Fore.YELLOW}Telegram will be disabled due to invalid configuration.")
+                        print(f"{Fore.YELLOW}Please check your config.json contains:")
+                        print('  "TELEGRAM_TOKEN": "YOUR_BOT_TOKEN",')
+                        print('  "TELEGRAM_CHAT_ID": "YOUR_CHAT_ID"')
+                        print("\nTo get these values:")
+                        print("1. Token: Talk to @BotFather on Telegram")
+                        print("2. Chat ID: Talk to @userinfobot on Telegram")
+                        use_telegram = False
+                    else:
+                        print(f"{Fore.GREEN}Telegram is properly configured and will be enabled.")
                 break
             print("Invalid input. Please enter 'yes' or 'no'.")
 

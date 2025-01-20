@@ -20,6 +20,7 @@ RUN mkdir -p logs data
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
+ENV DOCKER=true
 
 # Run the bot
 CMD ["python", "main.py"]

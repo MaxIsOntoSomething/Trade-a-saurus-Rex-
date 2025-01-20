@@ -2,14 +2,64 @@ import os
 import json
 from pathlib import Path
 from typing import Dict, Any
+import re
 
 class ConfigHandler:
     @staticmethod
-    def load_config() -> Dict[str, Any]:
-        """Load configuration from .env or config.json based on environment"""
-        if os.path.exists('.env'):
-            return ConfigHandler._load_from_env()
-        return ConfigHandler._load_from_json()
+    def is_valid_token(token: str) -> bool:
+        """Validate Telegram bot token format"""
+        if not isinstance(token, str) or not token:
+            return False
+        # Token format: <bot_id>:<hex_string>
+        pattern = r'^\d+:[A-Za-z0-9_-]{35}$'
+        return bool(re.match(pattern, token.strip()))
+
+    @staticmethod
+    def validate_config(config: Dict[str, Any]) -> None:
+        """Validate critical configuration settings"""
+        # First check if Telegram settings exist
+        telegram_token = config.get('TELEGRAM_TOKEN', '')
+        telegram_chat_id = config.get('TELEGRAM_CHAT_ID', '')
+
+        # Default to False if settings are invalid
+        telegram_enabled = False
+        
+        # Only validate if both token and chat_id are present and not placeholder values
+        if (telegram_token and telegram_chat_id and 
+            telegram_token not in ['YOUR_TELEGRAM_BOT_TOKEN', 'your_telegram_token'] and
+            telegram_chat_id not in ['YOUR_TELEGRAM_CHAT_ID', 'your_chat_id']):
+            
+            if ConfigHandler.is_valid_token(telegram_token) and str(telegram_chat_id).lstrip('-').isdigit():
+                telegram_enabled = True
+                print(f"Telegram configuration validated successfully")
+            else:
+                print(f"Warning: Invalid Telegram configuration")
+
+        # Set the final Telegram state
+        config['USE_TELEGRAM'] = telegram_enabled
+
+    @staticmethod
+    def load_config(use_env: bool = False) -> Dict[str, Any]:
+        """Load configuration based on environment"""
+        config = {}
+        
+        if use_env and os.path.exists('.env'):
+            # Docker environment - use .env
+            config = ConfigHandler._load_from_env()
+            print("Using Docker configuration from .env")
+        else:
+            # Manual run - use config.json
+            if os.path.exists('config/config.json'):
+                with open('config/config.json') as f:
+                    config = json.load(f)
+                print("Using manual configuration from config.json")
+            else:
+                raise FileNotFoundError("config.json not found")
+        
+        # Validate the configuration
+        ConfigHandler.validate_config(config)
+        
+        return config
 
     @staticmethod
     def _load_from_env() -> Dict[str, Any]:
@@ -28,6 +78,7 @@ class ConfigHandler:
             'USE_PERCENTAGE': os.getenv('USE_PERCENTAGE', 'false').lower() == 'true',
             'TRADE_AMOUNT': float(os.getenv('TRADE_AMOUNT', '10')),
             'RESERVE_BALANCE': float(os.getenv('RESERVE_BALANCE', '2000')),
+            'TIME_INTERVAL': os.getenv('TIME_INTERVAL', '1d'),  # Added default time interval
         }
 
         # Parse timeframe configurations
