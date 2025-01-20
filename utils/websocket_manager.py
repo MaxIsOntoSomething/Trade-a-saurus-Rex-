@@ -6,6 +6,8 @@ from datetime import datetime
 from colorama import Fore
 import logging
 import os
+import random
+import time
 
 class WebSocketManager:
     def __init__(self, client, symbols, logger=None):
@@ -21,54 +23,62 @@ class WebSocketManager:
         self.initial_prices_sent = False  # Add this flag
         self.last_refresh = datetime.now()
         self.refresh_interval = 60  # Refresh every 60 seconds
+        self.connection_attempts = 0
+        self.backup_endpoints = [
+            "wss://stream.binance.com:9443/ws",
+            "wss://stream.binance.com:443/ws",
+            "wss://stream1.binance.com:9443/ws"
+        ]
+        self.ping_interval = 30
+        self.last_pong = None
+        self.ping_task = None
 
     def add_callback(self, callback):
         """Add callback function to be called when price updates are received"""
         self.callbacks.append(callback)
 
     async def start(self):
-        """Start WebSocket connection"""
-        try:
-            # Get initial prices before starting WebSocket
-            await self._send_initial_prices()
-            
-            # Start refresh timer
-            asyncio.create_task(self._refresh_timer())
-            
-            # Determine WebSocket URL based on testnet or mainnet
-            ws_url = "wss://testnet.binance.vision/ws" if self.client.API_URL == "https://testnet.binance.vision/api" else "wss://stream.binance.com:9443/ws"
-            
-            # Create subscription message for all symbols
-            streams = [f"{symbol.lower()}@ticker" for symbol in self.symbols]
-            subscribe_msg = {
-                "method": "SUBSCRIBE",
-                "params": streams,
-                "id": 1
-            }
+        """Start WebSocket connection with improved reconnection logic"""
+        while True:
+            try:
+                # Rotate through backup endpoints
+                endpoint = self.backup_endpoints[self.connection_attempts % len(self.backup_endpoints)]
+                
+                # Calculate backoff with jitter
+                delay = min(300, (2 ** self.connection_attempts)) * (0.8 + 0.4 * random.random())
+                
+                if self.connection_attempts > 0:
+                    print(f"Reconnecting in {delay:.1f} seconds using {endpoint}")
+                    await asyncio.sleep(delay)
 
-            async with websockets.connect(ws_url) as websocket:
-                self.ws = websocket
-                self.is_connected = True
-                print(f"{Fore.GREEN}WebSocket connection established")
-                self.logger.info("WebSocket connection established")
-
-                # Send subscription message
-                await websocket.send(json.dumps(subscribe_msg))
-
-                # Start listening for messages
-                while True:
-                    try:
-                        message = await websocket.recv()
-                        await self._handle_socket_message(json.loads(message))
-                    except websockets.ConnectionClosed:
-                        print(f"{Fore.YELLOW}WebSocket connection closed")
-                        self.is_connected = False
-                        await self._handle_reconnection()
-                        break
-
-        except Exception as e:
-            self.logger.error(f"Error starting WebSocket: {e}")
-            await self._handle_reconnection()
+                async with websockets.connect(endpoint) as websocket:
+                    self.ws = websocket
+                    self.is_connected = True
+                    self.connection_attempts = 0  # Reset on successful connection
+                    self.last_pong = time.time()
+                    
+                    # Start ping/pong task
+                    self.ping_task = asyncio.create_task(self._ping_loop())
+                    
+                    # Subscribe to streams
+                    await self._subscribe_to_streams()
+                    
+                    while True:
+                        try:
+                            message = await websocket.recv()
+                            # Reset pong timer on any message
+                            self.last_pong = time.time()
+                            await self._handle_socket_message(json.loads(message))
+                        except websockets.ConnectionClosed:
+                            raise
+                        
+            except Exception as e:
+                self.is_connected = False
+                self.logger.error(f"WebSocket error: {e}")
+                if self.ping_task:
+                    self.ping_task.cancel()
+                self.connection_attempts += 1
+                continue
 
     async def _send_initial_prices(self):
         """Send initial prices for all symbols"""
@@ -223,4 +233,29 @@ class WebSocketManager:
 
         except Exception as e:
             self.logger.error(f"Error in force refresh: {e}")
+
+    async def _ping_loop(self):
+        """Send periodic pings to keep connection alive"""
+        while self.is_connected:
+            try:
+                if time.time() - self.last_pong > self.ping_interval * 2:
+                    # Connection seems dead, force reconnect
+                    self.ws.close()
+                    break
+                    
+                await self.ws.ping()
+                await asyncio.sleep(self.ping_interval)
+            except Exception as e:
+                self.logger.error(f"Ping error: {e}")
+                break
+
+    async def _subscribe_to_streams(self):
+        """Subscribe to price streams"""
+        streams = [f"{symbol.lower()}@ticker" for symbol in self.symbols]
+        subscribe_msg = {
+            "method": "SUBSCRIBE",
+            "params": streams,
+            "id": 1
+        }
+        await self.ws.send(json.dumps(subscribe_msg))
 
