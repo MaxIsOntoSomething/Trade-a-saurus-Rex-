@@ -524,7 +524,7 @@ class BinanceBot:
             self.logger.error(f"Error in verify_pending_orders: {e}")
 
     async def _handle_filled_order(self, symbol, order_status):
-        """Handle filled order updates"""
+        """Handle filled order updates and save to trades.json"""
         try:
             quantity = float(order_status['executedQty'])
             price = float(order_status['price'])
@@ -540,6 +540,28 @@ class BinanceBot:
                 self.total_spent[symbol] = self.total_spent.get(symbol, 0) + (quantity * price)
                 self.total_trades += 1
                 
+                # Generate new trade ID for verified order
+                trade_id = f"VERIFIED_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}_{symbol}"
+                
+                # Create trade entry
+                trade_entry = {
+                    'symbol': symbol,
+                    'entry_price': price,
+                    'quantity': quantity,
+                    'total_cost': quantity * price,
+                    'current_value': None,
+                    'profit_usdt': None,
+                    'profit_percentage': None,
+                    'status': 'FILLED',
+                    'filled_time': datetime.now(timezone.utc).isoformat(),
+                    'verification_time': datetime.now(timezone.utc).isoformat(),
+                    'type': 'verified'
+                }
+                
+                # Add to trades
+                self.trades[trade_id] = trade_entry
+                self.save_trades()  # Save immediately after adding
+                
                 fill_msg = (
                     f"✅ Verified order fill for {symbol}:\n"
                     f"Quantity: {quantity:.8f}\n"
@@ -553,24 +575,10 @@ class BinanceBot:
                 # Send as separate task
                 if self.telegram_handler:
                     asyncio.create_task(self.telegram_handler.send_message(fill_msg))
-                    
-            # Add trade to history
-            trade_id = list(self.pending_orders.keys())[0]  # Get the bot_order_id
-            self.trades[trade_id] = {
-                'symbol': symbol,
-                'entry_price': price,
-                'quantity': quantity,
-                'total_cost': quantity * price,
-                'current_value': None,
-                'profit_usdt': None,
-                'profit_percentage': None,
-                'status': 'FILLED',
-                'filled_time': datetime.now(timezone.utc).isoformat()
-            }
-            self.save_trades()
             
         except Exception as e:
             self.logger.error(f"Error handling filled order: {e}")
+            print(f"{Fore.RED}Error handling filled order: {e}")
 
     async def _cancel_order(self, symbol, order_id):
         """Cancel order and handle cleanup"""
