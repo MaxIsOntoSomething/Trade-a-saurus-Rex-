@@ -15,6 +15,7 @@ import psutil  # Add missing import
 import logging  # Add missing import
 import os  # Add missing import
 from config.config_handler import ConfigHandler
+from telegram.ext import Application  # Update import
 
 from strategies.price_drop import PriceDropStrategy
 from utils.logger import setup_logger
@@ -87,23 +88,10 @@ class BinanceBot:
         self.graph_generator = GraphGenerator()
 
         if self.use_telegram:
-            self.telegram_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-            # Add handlers for commands
-            self.telegram_app.add_handler(CommandHandler("positions", self.handle_positions))
-            self.telegram_app.add_handler(CommandHandler("balance", self.handle_balance))
-            self.telegram_app.add_handler(CommandHandler("trades", self.handle_trades))
-            self.telegram_app.add_handler(CommandHandler("profits", self.handle_profits))
-            self.telegram_app.add_handler(CommandHandler("start", self.handle_start))
-            self.telegram_app.add_handler(CommandHandler("stats", self.handle_stats))
-            # Add new handlers
-            self.telegram_app.add_handler(CommandHandler("distribution", self.handle_distribution))
-            self.telegram_app.add_handler(CommandHandler("stacking", self.handle_stacking))
-            self.telegram_app.add_handler(CommandHandler("buytimes", self.handle_buy_times))
-            self.telegram_app.add_handler(CommandHandler("portfolio", self.handle_portfolio))
-            self.telegram_app.add_handler(CommandHandler("allocation", self.handle_allocation))
-            self.telegram_app.add_handler(CommandHandler("orders", self.handle_orders))  # Add new handler
-            # Remove async setup from __init__
+            # Update Telegram initialization
+            self.telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
             self.commands_setup = False
+            # Remove the asyncio.create_task call here
         
         self.last_order_time = {}
         self.orders_placed_today = {}
@@ -802,11 +790,17 @@ class BinanceBot:
             await update.message.reply_text(error_msg)
 
     async def send_telegram_message(self, message):
+        """Updated send_telegram_message method"""
         if self.use_telegram:
             try:
-                await self.telegram_app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+                await self.telegram_app.bot.send_message(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    text=message,
+                    parse_mode='HTML'
+                )
             except Exception as e:
                 print(f"Error sending Telegram message: {e}")
+                self.logger.error(f"Error sending Telegram message: {e}")
 
     def get_reference_prices(self, symbol):
         references = {}
@@ -1075,7 +1069,7 @@ class BinanceBot:
             no_data = True
             for symbol in self.valid_symbols:
                 try:
-                    if self.total_bought[symbol] > 0:
+                    if (self.total_bought[symbol] > 0):
                         timestamps = []
                         quantities = []
                         prices = []
@@ -1252,12 +1246,51 @@ class BinanceBot:
             self.logger.error(error_msg)
             await update.message.reply_text(error_msg)
 
+    async def setup_telegram(self):
+        """Setup Telegram handlers"""
+        try:
+            # Add command handlers
+            self.telegram_app.add_handler(CommandHandler("positions", self.handle_positions))
+            self.telegram_app.add_handler(CommandHandler("balance", self.handle_balance))
+            self.telegram_app.add_handler(CommandHandler("trades", self.handle_trades))
+            self.telegram_app.add_handler(CommandHandler("profits", self.handle_profits))
+            self.telegram_app.add_handler(CommandHandler("start", self.handle_start))
+            self.telegram_app.add_handler(CommandHandler("stats", self.handle_stats))
+            self.telegram_app.add_handler(CommandHandler("distribution", self.handle_distribution))
+            self.telegram_app.add_handler(CommandHandler("stacking", self.handle_stacking))
+            self.telegram_app.add_handler(CommandHandler("buytimes", self.handle_buy_times))
+            self.telegram_app.add_handler(CommandHandler("portfolio", self.handle_portfolio))
+            self.telegram_app.add_handler(CommandHandler("allocation", self.handle_allocation))
+            self.telegram_app.add_handler(CommandHandler("orders", self.handle_orders))
+
+            # Start the bot
+            await self.telegram_app.initialize()
+            await self.setup_telegram_commands()
+            await self.telegram_app.start()
+            await self.telegram_app.updater.start_polling(allowed_updates=["message"])
+            
+            print(f"{Fore.GREEN}Telegram bot started successfully!")
+            self.logger.info("Telegram bot started successfully!")
+            
+        except Exception as e:
+            print(f"{Fore.RED}Error setting up Telegram: {e}")
+            self.logger.error(f"Error setting up Telegram: {e}")
+            self.use_telegram = False
+
     def run(self):
         """Run the bot's main loop"""
         try:
             # Create and run the event loop
-            loop = asyncio.get_event_loop()
+            loop = asyncio.new_event_loop()  # Create new event loop
+            asyncio.set_event_loop(loop)     # Set it as the current event loop
+            
+            # Initialize Telegram before starting main loop
+            if self.use_telegram:
+                loop.run_until_complete(self.setup_telegram())
+            
+            # Run the main loop
             loop.run_until_complete(self.main_loop())
+            
         except KeyboardInterrupt:
             print("\nShutdown requested... closing connections")
             self.logger.info("Shutdown requested by user")
