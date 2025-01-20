@@ -346,21 +346,26 @@ class BinanceBot:
             self.logger.info(f"Daily open price for {symbol} at 00:00 UTC: {daily_open_price}")
 
     def get_balance(self):
+        """Get complete balance report for all assets"""
         try:
             timestamp = int(time.time() * 1000) + self.time_offset
             balances = self.client.get_account(
                 recvWindow=self.recv_window,
                 timestamp=timestamp
             )['balances']
+            
+            # Include all non-zero balances
             balance_report = {}
             for balance in balances:
-                asset = balance['asset']
-                if asset == 'USDT' or asset in [symbol.replace('USDT', '') for symbol in self.valid_symbols]:
-                    free = float(balance['free'])
-                    locked = float(balance['locked'])
-                    total = free + locked
-                    if total > 0:
-                        balance_report[asset] = total
+                free = float(balance['free'])
+                locked = float(balance['locked'])
+                total = free + locked
+                if total > 0:  # Only include non-zero balances
+                    balance_report[balance['asset']] = {
+                        'free': free,
+                        'locked': locked,
+                        'total': total
+                    }
             return balance_report
         except Exception as e:
             print(f"Error fetching balance: {str(e)}")
@@ -705,26 +710,33 @@ class BinanceBot:
             self.logger.error(f"Error fetching current price of {symbol}: {str(e)}")
             return None
 
-    async def handle_balance(self, update, context):
+    async def handle_balance(self, update: telegram.Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /balance command with detailed balance info"""
         balance_report = self.get_balance()
         if balance_report:
-            balance_message = "\n".join([f"{asset}: {total}" for asset, total in balance_report.items()])
-            await update.message.reply_text(f"Current balance:\n{balance_message}")
+            message = "Current Balance:\n\n"
+            for asset, details in balance_report.items():
+                message += (f"{asset}:\n"
+                          f"  Free: {details['free']}\n"
+                          f"  Locked: {details['locked']}\n"
+                          f"  Total: {details['total']}\n"
+                          f"------------------------\n")
+            await update.effective_message.reply_text(message)
         else:
-            await update.message.reply_text("Error fetching balance.")
+            await update.effective_message.reply_text("Error fetching balance.")
 
-    async def handle_trades(self, update, context):
-        await update.message.reply_text(f"Total number of trades done: {self.total_trades}")
+    async def handle_trades(self, update: telegram.Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.effective_message.reply_text(f"Total number of trades done: {self.total_trades}")
 
-    async def handle_profits(self, update, context):
+    async def handle_profits(self, update: telegram.Update, context: ContextTypes.DEFAULT_TYPE):
         profits = self.get_profits()
         if profits is not None:
             profit_message = "\n".join([f"{symbol}: {profit} USDT" for symbol, profit in profits.items()])
-            await update.message.reply_text(f"Current profits:\n{profit_message}")
+            await update.effective_message.reply_text(f"Current profits:\n{profit_message}")
         else:
-            await update.message.reply_text("Error calculating profits.")
+            await update.effective_message.reply_text("Error calculating profits.")
 
-    async def handle_start(self, update, context):
+    async def handle_start(self, update: telegram.Update, context: ContextTypes.DEFAULT_TYPE):
         welcome_msg = (
             "🤖 Binance Trading Bot\n\n"
             "Available Commands:\n"
@@ -749,10 +761,12 @@ class BinanceBot:
             f"USDT Reserve: {self.reserve_balance_usdt}\n"
             "Bot is actively monitoring markets! 🚀"
         )
-        await update.message.reply_text(welcome_msg)
+        await update.effective_message.reply_text(welcome_msg)
 
-    async def handle_positions(self, update, context):
-        """Handle /positions command - Show available trade opportunities"""
+    async def handle_positions(self, update: telegram.Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /positions command with proper context"""
+        if not update or not update.effective_chat:
+            return
         try:
             message = "🎯 Available Trading Positions:\n\n"
             
@@ -782,12 +796,12 @@ class BinanceBot:
                 price = self.client.get_symbol_ticker(symbol=symbol)['price']
                 message += f"{symbol}: {price}\n"
             
-            await update.message.reply_text(message)
+            await update.effective_message.reply_text(message)
             
         except Exception as e:
             error_msg = f"Error fetching positions: {str(e)}"
             self.logger.error(error_msg)
-            await update.message.reply_text(error_msg)
+            await update.effective_message.reply_text(error_msg)
 
     async def send_telegram_message(self, message):
         """Updated send_telegram_message method"""
@@ -832,7 +846,7 @@ class BinanceBot:
             
         return references
 
-    async def handle_stats(self, update, context):
+    async def handle_stats(self, update: telegram.Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /stats command - Show system stats and bot runtime information"""
         try:
             # Get system information
@@ -879,12 +893,12 @@ class BinanceBot:
             else:
                 stats_message += f"Trade Amount: {self.trade_amount} USDT\n"
             
-            await update.message.reply_text(stats_message)
+            await update.effective_message.reply_text(stats_message)
             
         except Exception as e:
             error_msg = f"Error fetching stats: {str(e)}"
             self.logger.error(error_msg)
-            await update.message.reply_text(error_msg)
+            await update.effective_message.reply_text(error_msg)
 
     async def main_loop(self):
         try:
@@ -1016,7 +1030,7 @@ class BinanceBot:
             self.logger.error(f"Error calculating profits: {e}")
             return None
 
-    async def handle_distribution(self, update, context):
+    async def handle_distribution(self, update: telegram.Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /distribution command"""
         try:
             no_data = True
@@ -1036,34 +1050,34 @@ class BinanceBot:
                             no_data = False
                             graph = self.graph_generator.generate_entry_price_histogram(symbol, entry_prices)
                             if graph:
-                                await update.message.reply_photo(
+                                await update.effective_message.reply_photo(
                                     photo=graph,
                                     caption=f"Entry price distribution for {symbol}"
                                 )
                             else:
-                                await update.message.reply_text(
+                                await update.effective_message.reply_text(
                                     f"⚠️ Could not generate graph for {symbol}. Please try again later."
                                 )
                 except Exception as e:
-                    await update.message.reply_text(
+                    await update.effective_message.reply_text(
                         f"⚠️ Error processing {symbol}: {str(e)}"
                     )
                     continue
             
             if no_data:
-                await update.message.reply_text(
+                await update.effective_message.reply_text(
                     "📊 No trading data available yet. Make some trades first!"
                 )
                 
         except Exception as e:
-            await update.message.reply_text(
+            await update.effective_message.reply_text(
                 "❌ Error generating distribution graphs. Please try again later.\n"
                 f"Error: {str(e)}"
             )
             self.logger.error(f"Error in handle_distribution: {str(e)}")
 
     # Similar error handling for other graph commands...
-    async def handle_stacking(self, update, context):
+    async def handle_stacking(self, update: telegram.Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /stacking command"""
         try:
             no_data = True
@@ -1089,34 +1103,34 @@ class BinanceBot:
                                 symbol, timestamps, quantities, prices
                             )
                             if graph:
-                                await update.message.reply_photo(
+                                await update.effective_message.reply_photo(
                                     photo=graph,
                                     caption=f"Position building for {symbol}"
                                 )
                             else:
-                                await update.message.reply_text(
+                                await update.effective_message.reply_text(
                                     f"⚠️ Could not generate stacking graph for {symbol}"
                                 )
                 except Exception as e:
-                    await update.message.reply_text(
+                    await update.effective_message.reply_text(
                         f"⚠️ Error processing {symbol}: {str(e)}"
                     )
                     continue
             
             if no_data:
-                await update.message.reply_text(
+                await update.effective_message.reply_text(
                     "📊 No position data available yet. Make some trades first!"
                 )
                 
         except Exception as e:
-            await update.message.reply_text(
+            await update.effective_message.reply_text(
                 "❌ Error generating stacking visualization. Please try again later.\n"
                 f"Error: {str(e)}"
             )
             self.logger.error(f"Error in handle_stacking: {str(e)}")
 
     # Add similar error handling for other graph handlers...
-    async def handle_buy_times(self, update, context):
+    async def handle_buy_times(self, update: telegram.Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /buytimes command"""
         try:
             buy_timestamps = []
@@ -1128,15 +1142,15 @@ class BinanceBot:
             if buy_timestamps:
                 graph = self.graph_generator.generate_time_between_buys(sorted(buy_timestamps))
                 if graph:
-                    await update.message.reply_photo(photo=graph)
+                    await update.effective_message.reply_photo(photo=graph)
                 else:
-                    await update.message.reply_text("Need at least 2 trades to generate time analysis")
+                    await update.effective_message.reply_text("Need at least 2 trades to generate time analysis")
             else:
-                await update.message.reply_text("No trades found")
+                await update.effective_message.reply_text("No trades found")
         except Exception as e:
-            await update.message.reply_text(f"Error generating buy times analysis: {str(e)}")
+            await update.effective_message.reply_text(f"Error generating buy times analysis: {str(e)}")
 
-    async def handle_portfolio(self, update, context):
+    async def handle_portfolio(self, update: telegram.Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /portfolio command"""
         try:
             # Get historical portfolio values
@@ -1158,39 +1172,108 @@ class BinanceBot:
             
             if timestamps:
                 graph = self.graph_generator.generate_portfolio_evolution(timestamps, total_values)
-                await update.message.reply_photo(photo=graph)
+                await update.effective_message.reply_photo(photo=graph)
             else:
-                await update.message.reply_text("No portfolio data available")
+                await update.effective_message.reply_text("No portfolio data available")
         except Exception as e:
-            await update.message.reply_text(f"Error generating portfolio evolution: {str(e)}")
+            await update.effective_message.reply_text(f"Error generating portfolio evolution: {str(e)}")
 
-    async def handle_allocation(self, update, context):
-        """Handle /allocation command"""
+    async def handle_allocation(self, update: telegram.Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /allocation command with complete portfolio and fast response"""
         try:
-            assets = []
-            values = []
-            
-            for symbol in self.valid_symbols:
-                if self.total_bought[symbol] > 0:
-                    current_price = float(self.client.get_symbol_ticker(symbol=symbol)['price'])
-                    value = self.total_bought[symbol] * current_price
-                    if value > 0:
-                        assets.append(symbol)
-                        values.append(value)
-            
-            if values:
-                graph = self.graph_generator.generate_asset_allocation(assets, values)
-                if graph:
-                    await update.message.reply_photo(photo=graph)
-                else:
-                    await update.message.reply_text("Could not generate allocation graph")
-            else:
-                await update.message.reply_text("No assets in portfolio yet")
-        except Exception as e:
-            await update.message.reply_text(f"Error generating asset allocation: {str(e)}")
-            self.logger.error(f"Error in handle_allocation: {str(e)}")
+            # Send immediate response
+            processing_message = await update.effective_message.reply_text("📊 Generating portfolio allocation...")
 
-    async def handle_orders(self, update, context):
+            try:
+                balances = self.get_balance()
+                if not balances:
+                    await processing_message.edit_text("❌ Error fetching balance information")
+                    return
+
+                # Process prices in parallel using asyncio.gather
+                async def get_asset_value(asset, balance):
+                    try:
+                        if asset == 'USDT':
+                            return asset, balance['total']
+                        else:
+                            try:
+                                ticker = await asyncio.to_thread(
+                                    self.client.get_symbol_ticker,
+                                    symbol=f"{asset}USDT"
+                                )
+                                price = float(ticker['price'])
+                                return asset, balance['total'] * price
+                            except:
+                                try:
+                                    ticker = await asyncio.to_thread(
+                                        self.client.get_symbol_ticker,
+                                        symbol=f"USDT{asset}"
+                                    )
+                                    price = 1 / float(ticker['price'])
+                                    return asset, balance['total'] * price
+                                except:
+                                    return None, None
+
+                    except Exception as e:
+                        self.logger.warning(f"Could not get price for {asset}: {e}")
+                        return None, None
+
+                # Process all assets in parallel
+                tasks = [get_asset_value(asset, balance) for asset, balance in balances.items()]
+                results = await asyncio.gather(*tasks)
+
+                # Filter valid results
+                asset_values = [(asset, value) for asset, value in results if asset is not None]
+                
+                if not asset_values:
+                    await processing_message.edit_text("No assets found in portfolio")
+                    return
+
+                # Sort by value
+                asset_values.sort(key=lambda x: x[1], reverse=True)
+                assets, values = zip(*asset_values)
+
+                # Generate report while graph is being created
+                total_value = sum(values)
+                report = "💰 Portfolio Allocation:\n\n"
+                for asset, value in asset_values:
+                    percentage = (value / total_value) * 100
+                    report += f"{asset}: ${value:.2f} ({percentage:.2f}%)\n"
+                report += f"\nTotal Portfolio Value: ${total_value:.2f}"
+
+                # Generate graph in thread pool
+                graph = await asyncio.to_thread(
+                    self.graph_generator.generate_asset_allocation,
+                    list(assets),
+                    list(values)
+                )
+
+                # Delete processing message and send final report
+                await processing_message.delete()
+                
+                if graph:
+                    await update.effective_message.reply_photo(
+                        photo=graph,
+                        caption=report
+                    )
+                else:
+                    await update.effective_message.reply_text(report)
+
+            except Exception as e:
+                await processing_message.edit_text(
+                    f"❌ Error generating allocation: {str(e)}"
+                )
+                self.logger.error(f"Error in allocation: {e}")
+
+        except Exception as e:
+            await update.effective_message.reply_text(
+                "❌ Error processing command. Please try again."
+            )
+            self.logger.error(f"Error in handle_allocation: {e}")
+
+    # Similar updates for other handlers...
+
+    async def handle_orders(self, update: telegram.Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /orders command - Show open limit orders"""
         try:
             open_orders = []
@@ -1199,11 +1282,11 @@ class BinanceBot:
                     symbol_orders = self.client.get_open_orders(symbol=symbol)
                     open_orders.extend(symbol_orders)
                 except Exception as e:
-                    await update.message.reply_text(f"Error fetching orders for {symbol}: {str(e)}")
+                    await update.effective_message.reply_text(f"Error fetching orders for {symbol}: {str(e)}")
                     continue
             
             if not open_orders:
-                await update.message.reply_text("No open limit orders")
+                await update.effective_message.reply_text("No open limit orders")
                 return
             
             message = "📋 Open Limit Orders:\n\n"
@@ -1239,35 +1322,74 @@ class BinanceBot:
                     f"─────────────\n"
                 )
             
-            await update.message.reply_text(message)
+            await update.effective_message.reply_text(message)
             
         except Exception as e:
             error_msg = f"Error fetching open orders: {str(e)}"
             self.logger.error(error_msg)
-            await update.message.reply_text(error_msg)
+            await update.effective_message.reply_text(error_msg)
 
     async def setup_telegram(self):
-        """Setup Telegram handlers"""
+        """Setup Telegram handlers with proper context types"""
         try:
-            # Add command handlers
-            self.telegram_app.add_handler(CommandHandler("positions", self.handle_positions))
-            self.telegram_app.add_handler(CommandHandler("balance", self.handle_balance))
-            self.telegram_app.add_handler(CommandHandler("trades", self.handle_trades))
-            self.telegram_app.add_handler(CommandHandler("profits", self.handle_profits))
-            self.telegram_app.add_handler(CommandHandler("start", self.handle_start))
-            self.telegram_app.add_handler(CommandHandler("stats", self.handle_stats))
-            self.telegram_app.add_handler(CommandHandler("distribution", self.handle_distribution))
-            self.telegram_app.add_handler(CommandHandler("stacking", self.handle_stacking))
-            self.telegram_app.add_handler(CommandHandler("buytimes", self.handle_buy_times))
-            self.telegram_app.add_handler(CommandHandler("portfolio", self.handle_portfolio))
-            self.telegram_app.add_handler(CommandHandler("allocation", self.handle_allocation))
-            self.telegram_app.add_handler(CommandHandler("orders", self.handle_orders))
+            # Add command handlers with proper context types
+            self.telegram_app.add_handler(CommandHandler(
+                "positions", 
+                lambda update, context: self.handle_positions(update, context)
+            ))
+            self.telegram_app.add_handler(CommandHandler(
+                "balance", 
+                lambda update, context: self.handle_balance(update, context)
+            ))
+            self.telegram_app.add_handler(CommandHandler(
+                "trades", 
+                lambda update, context: self.handle_trades(update, context)
+            ))
+            self.telegram_app.add_handler(CommandHandler(
+                "profits", 
+                lambda update, context: self.handle_profits(update, context)
+            ))
+            self.telegram_app.add_handler(CommandHandler(
+                "start", 
+                lambda update, context: self.handle_start(update, context)
+            ))
+            self.telegram_app.add_handler(CommandHandler(
+                "stats", 
+                lambda update, context: self.handle_stats(update, context)
+            ))
+            self.telegram_app.add_handler(CommandHandler(
+                "distribution", 
+                lambda update, context: self.handle_distribution(update, context)
+            ))
+            self.telegram_app.add_handler(CommandHandler(
+                "stacking", 
+                lambda update, context: self.handle_stacking(update, context)
+            ))
+            self.telegram_app.add_handler(CommandHandler(
+                "buytimes", 
+                lambda update, context: self.handle_buy_times(update, context)
+            ))
+            self.telegram_app.add_handler(CommandHandler(
+                "portfolio", 
+                lambda update, context: self.handle_portfolio(update, context)
+            ))
+            self.telegram_app.add_handler(CommandHandler(
+                "allocation", 
+                lambda update, context: self.handle_allocation(update, context)
+            ))
+            self.telegram_app.add_handler(CommandHandler(
+                "orders", 
+                lambda update, context: self.handle_orders(update, context)
+            ))
 
             # Start the bot
             await self.telegram_app.initialize()
             await self.setup_telegram_commands()
             await self.telegram_app.start()
-            await self.telegram_app.updater.start_polling(allowed_updates=["message"])
+            await self.telegram_app.updater.start_polling(
+                allowed_updates=["message"],
+                drop_pending_updates=True
+            )
             
             print(f"{Fore.GREEN}Telegram bot started successfully!")
             self.logger.info("Telegram bot started successfully!")

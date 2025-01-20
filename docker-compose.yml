@@ -2,13 +2,22 @@ version: '3.8'
 
 services:
   bot:
-    build: .
+    build: 
+      context: .
+      dockerfile: Dockerfile
     volumes:
-      - ./logs:/app/logs
-      - ./data:/app/data
-      - ./config:/app/config
+      - ./logs:/app/logs:rw
+      - ./data:/app/data:rw
+      - ./config:/app/config:ro
     env_file:
       - .env
-    restart: unless-stopped
     environment:
       - TZ=UTC
+      - PYTHONUNBUFFERED=1
+      - DOCKER=true
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "200m"
+        max-file: "10"

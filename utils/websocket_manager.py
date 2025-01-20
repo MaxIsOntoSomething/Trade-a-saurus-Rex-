@@ -17,6 +17,7 @@ class WebSocketManager:
         self.is_connected = False
         self.reconnect_delay = 5
         self.max_reconnect_delay = 300
+        self.initial_prices_sent = False  # Add this flag
 
     def add_callback(self, callback):
         """Add callback function to be called when price updates are received"""
@@ -25,6 +26,9 @@ class WebSocketManager:
     async def start(self):
         """Start WebSocket connection"""
         try:
+            # Get initial prices before starting WebSocket
+            await self._send_initial_prices()
+            
             # Determine WebSocket URL based on testnet or mainnet
             ws_url = "wss://testnet.binance.vision/ws" if self.client.API_URL == "https://testnet.binance.vision/api" else "wss://stream.binance.com:9443/ws"
             
@@ -59,6 +63,31 @@ class WebSocketManager:
         except Exception as e:
             self.logger.error(f"Error starting WebSocket: {e}")
             await self._handle_reconnection()
+
+    async def _send_initial_prices(self):
+        """Send initial prices for all symbols"""
+        try:
+            for symbol in self.symbols:
+                ticker = self.client.get_symbol_ticker(symbol=symbol)
+                stats_24h = self.client.get_ticker(symbol=symbol)
+                
+                self.last_prices[symbol] = {
+                    'price': float(ticker['price']),
+                    'change': float(stats_24h['priceChangePercent']),
+                    'high': float(stats_24h['highPrice']),
+                    'low': float(stats_24h['lowPrice']),
+                    'timestamp': datetime.now()
+                }
+            
+            # Call callbacks with initial prices
+            for callback in self.callbacks:
+                for symbol in self.symbols:
+                    await callback(symbol, self.last_prices[symbol])
+            
+            self.initial_prices_sent = True
+            
+        except Exception as e:
+            self.logger.error(f"Error getting initial prices: {e}")
 
     async def _handle_socket_message(self, msg):
         """Handle incoming WebSocket messages"""
