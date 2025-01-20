@@ -540,27 +540,40 @@ class BinanceBot:
                 self.total_spent[symbol] = self.total_spent.get(symbol, 0) + (quantity * price)
                 self.total_trades += 1
                 
-                # Generate new trade ID for verified order
-                trade_id = f"VERIFIED_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}_{symbol}"
+                # Check if this order already exists in trades (as a BOT trade)
+                existing_trade = None
+                for trade_id, trade in self.trades.items():
+                    if (trade['symbol'] == symbol and 
+                        trade['entry_price'] == price and 
+                        trade['quantity'] == quantity and 
+                        trade['type'] == 'bot'):
+                        existing_trade = trade_id
+                        break
+
+                if existing_trade:
+                    # Update existing trade with verification
+                    self.trades[existing_trade].update({
+                        'verification_time': datetime.now(timezone.utc).isoformat(),
+                        'status': 'VERIFIED'
+                    })
+                else:
+                    # Create new verified trade entry
+                    trade_id = f"VERIFIED_{datetime.now().strftime('%Y%m%d%H%M%S')}_{symbol}"
+                    self.trades[trade_id] = {
+                        'symbol': symbol,
+                        'entry_price': price,
+                        'quantity': quantity,
+                        'total_cost': quantity * price,
+                        'current_value': None,
+                        'profit_usdt': None,
+                        'profit_percentage': None,
+                        'status': 'FILLED',
+                        'filled_time': datetime.now(timezone.utc).isoformat(),
+                        'verification_time': datetime.now(timezone.utc).isoformat(),
+                        'type': 'verified'
+                    }
                 
-                # Create trade entry
-                trade_entry = {
-                    'symbol': symbol,
-                    'entry_price': price,
-                    'quantity': quantity,
-                    'total_cost': quantity * price,
-                    'current_value': None,
-                    'profit_usdt': None,
-                    'profit_percentage': None,
-                    'status': 'FILLED',
-                    'filled_time': datetime.now(timezone.utc).isoformat(),
-                    'verification_time': datetime.now(timezone.utc).isoformat(),
-                    'type': 'verified'
-                }
-                
-                # Add to trades
-                self.trades[trade_id] = trade_entry
-                self.save_trades()  # Save immediately after adding
+                self.save_trades()  # Save changes to trades.json
                 
                 fill_msg = (
                     f"✅ Verified order fill for {symbol}:\n"
@@ -572,7 +585,6 @@ class BinanceBot:
                     f"• USDT: {usdt_balance['free']:.2f}"
                 )
                 
-                # Send as separate task
                 if self.telegram_handler:
                     asyncio.create_task(self.telegram_handler.send_message(fill_msg))
             
@@ -852,6 +864,22 @@ class BinanceBot:
                 'cancel_time': (datetime.now(timezone.utc) + self.limit_order_timeout).isoformat()
             }
             self.save_pending_orders()  # Save after placing order
+            
+            # After placing order successfully, add to trades
+            trade_id = bot_order_id  # Use the same ID as the pending order
+            self.trades[trade_id] = {
+                'symbol': symbol,
+                'entry_price': price,
+                'quantity': quantity,
+                'total_cost': quantity * price,
+                'current_value': None,
+                'profit_usdt': None,
+                'profit_percentage': None,
+                'status': 'PENDING',
+                'filled_time': None,
+                'type': 'bot'
+            }
+            self.save_trades()
             
             asyncio.create_task(self.monitor_order(bot_order_id, symbol, order['orderId'], current_price, order_time))
                 
