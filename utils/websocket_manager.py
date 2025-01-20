@@ -77,19 +77,12 @@ class WebSocketManager:
                 ticker = self.client.get_symbol_ticker(symbol=symbol)
                 stats_24h = self.client.get_ticker(symbol=symbol)
                 
-                self.last_prices[symbol] = {
-                    'price': float(ticker['price']),
-                    'change': float(stats_24h['priceChangePercent']),
-                    'timestamp': datetime.now()
-                }
-            
-            # Call callbacks with initial prices
-            for callback in self.callbacks:
-                for symbol in self.symbols:
-                    await callback(symbol, self.last_prices[symbol])
-            
-            self.initial_prices_sent = True
-            
+                price = float(ticker['price'])
+                
+                # Call callbacks with just the price value
+                for callback in self.callbacks:
+                    await callback(symbol, price)  # Send only the price float
+
         except Exception as e:
             self.logger.error(f"Error getting initial prices: {e}")
 
@@ -132,7 +125,7 @@ class WebSocketManager:
 
                 # Call all registered callbacks with just the price value
                 for callback in self.callbacks:
-                    await callback(symbol, float(price))  # Send only the price as float
+                    await callback(symbol, float(price))  # Make sure we send just the price float
 
         except Exception as e:
             self.logger.error(f"Error processing WebSocket message: {e}")
@@ -144,10 +137,17 @@ class WebSocketManager:
             try:
                 print(f"{Fore.YELLOW}Attempting to reconnect in {self.reconnect_delay} seconds...")
                 await asyncio.sleep(self.reconnect_delay)
+                
+                # Verify all pending orders before reconnecting
+                if hasattr(self, 'bot') and self.bot:
+                    await self.bot.verify_pending_orders()
+                
                 await self.start()
                 
                 if self.is_connected:
                     print(f"{Fore.GREEN}Successfully reconnected to WebSocket")
+                    # Force refresh all prices after reconnection
+                    await self._force_refresh()
                     break
                     
                 # Exponential backoff with maximum delay
@@ -223,3 +223,4 @@ class WebSocketManager:
 
         except Exception as e:
             self.logger.error(f"Error in force refresh: {e}")
+

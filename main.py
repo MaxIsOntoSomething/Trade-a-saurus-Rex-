@@ -62,6 +62,9 @@ class BinanceBot:
         self.valid_symbols = []  # Add this to track valid symbols
         self.invalid_symbols = []  # Add this to track invalid symbols
         self.invalid_symbols_file = str(ConfigHandler.get_data_dir() / 'invalid_symbols.txt')  # Update directory handling
+        self.order_counter = 0  # Add counter for unique IDs
+        self.tax_rate = 0.28  # Add 28% tax rate
+        self.symbol_stats = {}  # Track per-symbol statistics
         
         if use_testnet:
             self.client = Client(TESTNET_API_KEY, TESTNET_API_SECRET, testnet=True)
@@ -127,6 +130,11 @@ class BinanceBot:
         self.price_cache = {}
         self.cache_duration = 1  # Cache duration in seconds
 
+        self.order_check_interval = 60  # Check orders every 60 seconds
+
+        self.trades_file = 'data/trades.json'
+        self.trades = self.load_trades()
+
     async def _make_api_call(self, func, *args, **kwargs):
         """Wrapper for API calls with rate limiting"""
         await self.rate_limiter.acquire()
@@ -170,6 +178,56 @@ class BinanceBot:
                 json.dump(self.pending_orders, f, indent=4)
         except Exception as e:
             self.logger.error(f"Error saving pending orders: {e}")
+
+    def load_trades(self):
+        """Load trades history from file"""
+        try:
+            if os.path.exists(self.trades_file):
+                with open(self.trades_file, 'r') as f:
+                    return json.load(f)
+            return {}
+        except Exception as e:
+            self.logger.error(f"Error loading trades: {e}")
+            return {}
+
+    def save_trades(self):
+        """Save trades to file"""
+        try:
+            os.makedirs('data', exist_ok=True)
+            with open(self.trades_file, 'w') as f:
+                json.dump(self.trades, f, indent=4)
+        except Exception as e:
+            self.logger.error(f"Error saving trades: {e}")
+
+    async def get_trade_profit(self, trade_id):
+        """Calculate current profit for a specific trade"""
+        try:
+            if trade_id not in self.trades:
+                return None
+            
+            trade = self.trades[trade_id]
+            current_price = await self.get_cached_price(trade['symbol'])
+            
+            # Calculate current values
+            current_value = trade['quantity'] * current_price
+            profit_usdt = current_value - trade['total_cost']
+            profit_percentage = (profit_usdt / trade['total_cost']) * 100
+            
+            # Update trade record
+            trade.update({
+                'current_value': current_value,
+                'profit_usdt': profit_usdt,
+                'profit_percentage': profit_percentage,
+                'last_price': current_price,
+                'last_update': datetime.now(timezone.utc).isoformat()
+            })
+            
+            self.save_trades()
+            return trade
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating trade profit: {e}")
+            return None
 
     async def setup_telegram_commands(self):
         """Setup the Telegram bot commands menu"""
@@ -375,8 +433,8 @@ class BinanceBot:
             print(f"Daily open price for {symbol} at 00:00 UTC: {daily_open_price}")
             self.logger.info(f"Daily open price for {symbol} at 00:00 UTC: {daily_open_price}")
 
-    def get_balance(self):
-        """Get complete balance report for all assets"""
+    def get_balance(self, asset=None):
+        """Get balance for specific asset or all assets"""
         try:
             timestamp = int(time.time() * 1000) + self.time_offset
             balances = self.client.get_account(
@@ -384,7 +442,7 @@ class BinanceBot:
                 timestamp=timestamp
             )['balances']
             
-            # Include all non-zero balances
+            # Convert to dictionary for easier access
             balance_report = {}
             for balance in balances:
                 free = float(balance['free'])
@@ -396,9 +454,13 @@ class BinanceBot:
                         'locked': locked,
                         'total': total
                     }
+            
+            # Return specific asset balance if requested
+            if asset:
+                return balance_report.get(asset, None)
             return balance_report
+            
         except Exception as e:
-            print(f"Error fetching balance: {str(e)}")
             self.logger.error(f"Error fetching balance: {str(e)}")
             return None
 
@@ -418,63 +480,204 @@ class BinanceBot:
             return dt.replace(tzinfo=timezone.utc)
         return dt
 
-    async def monitor_order(self, symbol, order_id, price, placed_time):
-        """Asynchronously monitor an order until it's filled"""
+    async def verify_pending_orders(self):
+        """Verify all pending orders after connection issues"""
         try:
-            # Ensure timezone awareness
-            placed_time = placed_time if placed_time.tzinfo else placed_time.replace(tzinfo=timezone.utc)
-            
-            while True:
-                now = datetime.now(timezone.utc)  # Always use UTC
-                if now - placed_time > self.limit_order_timeout:
-                    # Cancel order if timeout reached
-                    self.client.cancel_order(symbol=symbol, orderId=order_id)
-                    msg = f"Order {order_id} for {symbol} canceled due to timeout"
-                    print(msg)
-                    self.logger.info(msg)
-                    break
-
-                order_status = self.client.get_order(symbol=symbol, orderId=order_id, recvWindow=self.recv_window)
-                
-                if order_status['status'] == 'FILLED':
-                    quantity = float(order_status['executedQty'])
-                    executed_price = float(order_status['price'])
-                    total_cost = quantity * executed_price
-                    self.total_bought[symbol] += quantity
-                    self.total_spent[symbol] += quantity * price
-                    self.total_trades += 1
-                    
-                    fill_msg = (
-                        f"✅ Order filled for {symbol}:\n"
-                        f"Quantity: {quantity}\n"
-                        f"Price: {executed_price:.8f} USDT\n"
-                        f"Total: {total_cost:.2f} USDT"
+            orders_to_remove = []
+            for bot_order_id, order_info in self.pending_orders.items():
+                try:
+                    symbol = order_info['symbol']
+                    order_id = order_info['orderId']
+                    order_status = self.client.get_order(
+                        symbol=symbol,
+                        orderId=order_id,
+                        recvWindow=self.recv_window
                     )
                     
-                    print(Fore.GREEN + fill_msg)
-                    self.logger.info(f"Order filled: {order_status}")
+                    # Check order status
+                    if order_status['status'] == 'FILLED':
+                        await self._handle_filled_order(symbol, order_status)
+                        orders_to_remove.append(bot_order_id)
+                    elif order_status['status'] == 'CANCELED':
+                        orders_to_remove.append(bot_order_id)
+                    elif order_status['status'] == 'NEW':
+                        # Check if order should be cancelled due to timeout
+                        placed_time = datetime.fromisoformat(order_info['placed_time'])
+                        if datetime.now(timezone.utc) - placed_time > self.limit_order_timeout:
+                            await self._cancel_order(symbol, order_id)
+                            orders_to_remove.append(bot_order_id)
+                except BinanceAPIException as e:
+                    if e.code == -2013:  # Order does not exist
+                        orders_to_remove.append(bot_order_id)
+                        continue
+                    self.logger.error(f"Error verifying order for {symbol}: {e}")
+                except Exception as e:
+                    self.logger.error(f"Error verifying order for {symbol}: {e}")
                     
-                    if self.use_telegram:
-                        await self.send_telegram_message(fill_msg)
-                    
-                    self.print_balance_report()
-                    break
+            # Remove processed orders
+            for bot_order_id in orders_to_remove:
+                del self.pending_orders[bot_order_id]
+            
+            self.save_pending_orders()
+            
+        except Exception as e:
+            self.logger.error(f"Error in verify_pending_orders: {e}")
+
+    async def _handle_filled_order(self, symbol, order_status):
+        """Handle filled order updates"""
+        try:
+            quantity = float(order_status['executedQty'])
+            price = float(order_status['price'])
+            base_asset = symbol.replace('USDT', '')
+            
+            # Force balance update
+            new_balance = await self._get_verified_balance(base_asset)
+            usdt_balance = await self._get_verified_balance('USDT')
+            
+            if new_balance and usdt_balance:
+                # Update tracking
+                self.total_bought[symbol] = self.total_bought.get(symbol, 0) + quantity
+                self.total_spent[symbol] = self.total_spent.get(symbol, 0) + (quantity * price)
+                self.total_trades += 1
                 
+                fill_msg = (
+                    f"✅ Verified order fill for {symbol}:\n"
+                    f"Quantity: {quantity:.8f}\n"
+                    f"Price: {price:.8f} USDT\n"
+                    f"Total Cost: {quantity * price:.2f} USDT\n\n"
+                    f"Verified Balances:\n"
+                    f"• {base_asset}: {new_balance['total']:.8f}\n"
+                    f"• USDT: {usdt_balance['free']:.2f}"
+                )
+                
+                # Send as separate task
+                if self.telegram_handler:
+                    asyncio.create_task(self.telegram_handler.send_message(fill_msg))
+                    
+            # Add trade to history
+            trade_id = list(self.pending_orders.keys())[0]  # Get the bot_order_id
+            self.trades[trade_id] = {
+                'symbol': symbol,
+                'entry_price': price,
+                'quantity': quantity,
+                'total_cost': quantity * price,
+                'current_value': None,
+                'profit_usdt': None,
+                'profit_percentage': None,
+                'status': 'FILLED',
+                'filled_time': datetime.now(timezone.utc).isoformat()
+            }
+            self.save_trades()
+            
+        except Exception as e:
+            self.logger.error(f"Error handling filled order: {e}")
+
+    async def _cancel_order(self, symbol, order_id):
+        """Cancel order and handle cleanup"""
+        try:
+            self.client.cancel_order(symbol=symbol, orderId=order_id)
+            self.logger.info(f"Cancelled order {order_id} for {symbol}")
+            
+            if symbol in self.pending_orders:
+                del self.pending_orders[symbol]
+                self.save_pending_orders()
+                
+        except BinanceAPIException as e:
+            if e.code == -2011:  # Order filled or does not exist
+                if symbol in self.pending_orders:
+                    del self.pending_orders[symbol]
+                    self.save_pending_orders()
+            else:
+                raise e
+
+    async def _get_verified_balance(self, asset):
+        """Get balance with verification retries"""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                balance = self.get_balance(asset)
+                if balance:
+                    return balance
+                await asyncio.sleep(1)
+            except Exception as e:
+                self.logger.error(f"Balance verification attempt {attempt + 1} failed: {e}")
+                await asyncio.sleep(1)
+        return None
+
+    async def monitor_order(self, bot_order_id, symbol, order_id, price, placed_time):
+        """Asynchronously monitor an order until it's filled"""
+        try:
+            placed_time = self.ensure_utc(placed_time)
+            last_balance_check = None
+            
+            while True:
+                now = datetime.now(timezone.utc)
+                
+                # Check for timeout
+                if now - placed_time > self.limit_order_timeout:
+                    await self._cancel_order(symbol, order_id)
+                    break
+
+                # Get order status
+                order_status = self.client.get_order(
+                    symbol=symbol,
+                    orderId=order_id,
+                    recvWindow=self.recv_window
+                )
+                
+                if order_status['status'] == 'FILLED':
+                    # Get balances before processing
+                    base_asset = symbol.replace('USDT', '')
+                    
+                    # Verify balance changes
+                    new_balance = await self._get_verified_balance(base_asset)
+                    usdt_balance = await self._get_verified_balance('USDT')
+                    
+                    if new_balance and usdt_balance:
+                        quantity = float(order_status['executedQty'])
+                        executed_price = float(order_status['price'])
+                        total_cost = quantity * executed_price
+                        
+                        # Update tracking
+                        self.total_bought[symbol] = self.total_bought.get(symbol, 0) + quantity
+                        self.total_spent[symbol] = self.total_spent.get(symbol, 0) + total_cost
+                        self.total_trades += 1
+                        
+                        # Create fill message
+                        fill_msg = (
+                            f"✅ Order filled for {symbol} [ID: {bot_order_id}]:\n"
+                            f"Quantity: {quantity:.8f}\n"
+                            f"Price: {executed_price:.8f} USDT\n"
+                            f"Total Cost: {total_cost:.2f} USDT\n\n"
+                            f"Updated Balances:\n"
+                            f"• {base_asset}: {new_balance['total']:.8f}\n"
+                            f"• USDT: {usdt_balance['free']:.2f}"
+                        )
+                        
+                        # Log and notify
+                        print(f"{Fore.GREEN}Order filled for {symbol}")
+                        self.logger.info(f"Order filled: {order_status}")
+                        
+                        # Send Telegram message as separate task
+                        if self.telegram_handler:
+                            asyncio.create_task(self.telegram_handler.send_message(fill_msg))
+                    
+                    break
+                    
                 elif order_status['status'] == 'CANCELED':
-                    msg = f"Order {order_id} for {symbol} was canceled"
-                    print(msg)
-                    self.logger.info(msg)
+                    self.logger.info(f"Order {order_id} for {symbol} was canceled")
                     break
                 
                 await asyncio.sleep(10)
                 
         except Exception as e:
-            print(f"Error monitoring order: {e}")
             self.logger.error(f"Error monitoring order: {e}")
+            print(f"{Fore.RED}Error monitoring order: {e}")
         finally:
-            if symbol in self.pending_orders:
-                del self.pending_orders[symbol]
-                self.save_pending_orders()  # Save after order complete/canceled
+            # Clean up pending order
+            if bot_order_id in self.pending_orders:
+                del self.pending_orders[bot_order_id]
+                self.save_pending_orders()
 
     async def get_available_usdt(self):
         """Enhanced balance check with reserve protection"""
@@ -515,6 +718,12 @@ class BinanceBot:
                 self.insufficient_balance_timestamp = None
                 self.balance_pause_reason = None
         return True
+
+    def generate_order_id(self, symbol):
+        """Generate a unique order ID"""
+        self.order_counter += 1
+        timestamp = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
+        return f"BOT_{timestamp}_{symbol}_{self.order_counter}"
 
     async def execute_trade(self, symbol, price):
         try:
@@ -603,6 +812,9 @@ class BinanceBot:
             else:
                 order_params['type'] = ORDER_TYPE_MARKET
 
+            # Generate unique bot order ID
+            bot_order_id = self.generate_order_id(symbol)
+            
             # Place order with rate limiting
             order = await self._make_api_call(self.client.create_order, **order_params)
             
@@ -611,7 +823,7 @@ class BinanceBot:
             cancel_time = order_time + self.limit_order_timeout
             
             order_msg = (
-                f"Limit order set for {symbol}:\n"
+                f"Limit order set for {symbol} [ID: {bot_order_id}]:\n"
                 f"Price: {formatted_price} USDT\n"
                 f"Quantity: {quantity}\n"
                 f"Will cancel at: {cancel_time.strftime('%Y-%m-%d %H:%M:%S')} UTC"
@@ -623,7 +835,8 @@ class BinanceBot:
             if self.use_telegram:
                 await self.send_telegram_message(order_msg)
             
-            self.pending_orders[symbol] = {
+            self.pending_orders[bot_order_id] = {
+                'symbol': symbol,
                 'orderId': order['orderId'],
                 'price': formatted_price,
                 'quantity': quantity,
@@ -632,7 +845,7 @@ class BinanceBot:
             }
             self.save_pending_orders()  # Save after placing order
             
-            asyncio.create_task(self.monitor_order(symbol, order['orderId'], current_price, order_time))
+            asyncio.create_task(self.monitor_order(bot_order_id, symbol, order['orderId'], current_price, order_time))
                 
         except BinanceAPIException as e:
             error_msg = f"Binance API error in execute_trade: {str(e)}"
@@ -873,6 +1086,50 @@ class BinanceBot:
         """Save pending orders when bot shuts down"""
         self.save_pending_orders()
 
+    async def get_symbol_stats(self, symbol):
+        """Get trading statistics for a specific symbol"""
+        try:
+            if symbol not in self.trades:
+                return None
+
+            total_quantity = 0
+            total_cost = 0
+            current_price = await self.get_cached_price(symbol)
+
+            # Calculate totals from all trades for this symbol
+            symbol_trades = {k: v for k, v in self.trades.items() if v['symbol'] == symbol}
+            
+            for trade in symbol_trades.values():
+                total_quantity += trade['quantity']
+                total_cost += trade['total_cost']
+
+            # Calculate averages and profits
+            avg_price = total_cost / total_quantity if total_quantity > 0 else 0
+            current_value = total_quantity * current_price
+            gross_profit = current_value - total_cost
+            tax_amount = abs(gross_profit) * self.tax_rate if gross_profit > 0 else 0
+            net_profit = gross_profit - tax_amount if gross_profit > 0 else gross_profit
+
+            return {
+                'symbol': symbol,
+                'total_quantity': total_quantity,
+                'total_cost': total_cost,
+                'average_price': avg_price,
+                'current_price': current_price,
+                'current_value': current_value,
+                'gross_profit_usdt': gross_profit,
+                'gross_profit_percentage': (gross_profit / total_cost * 100) if total_cost > 0 else 0,
+                'tax_amount': tax_amount,
+                'net_profit_usdt': net_profit,
+                'net_profit_percentage': (net_profit / total_cost * 100) if total_cost > 0 else 0,
+                'number_of_trades': len(symbol_trades),
+                'last_update': datetime.now(timezone.utc).isoformat()
+            }
+
+        except Exception as e:
+            self.logger.error(f"Error calculating symbol stats: {e}")
+            return None
+
 if __name__ == "__main__":
     try:
         # 1. First ask about network
@@ -1017,6 +1274,7 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         logging.error(f"Unexpected error: {str(e)}")
+```
 
 
 
