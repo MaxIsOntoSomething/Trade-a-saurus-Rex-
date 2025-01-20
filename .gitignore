@@ -9,5 +9,5 @@ logs/
 data/
 .env
 config.json
-*.log
+/logs/*
 data/invalid_symbols.txt
