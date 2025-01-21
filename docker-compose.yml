@@ -5,6 +5,8 @@ services:
     build: 
       context: .
       dockerfile: Dockerfile
+    container_name: binance_bot
+    user: "${UID:-1000}:${GID:-1000}"  # Use host user's UID/GID
     volumes:
       - ./logs:/app/logs:rw
       - ./data:/app/data:rw
@@ -21,3 +23,13 @@ services:
       options:
         max-size: "200m"
         max-file: "10"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
