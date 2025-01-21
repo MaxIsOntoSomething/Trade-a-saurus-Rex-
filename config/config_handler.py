@@ -49,16 +49,24 @@ class ConfigHandler:
             print("Using Docker configuration from .env")
         else:
             # Manual run - use config.json
-            if os.path.exists('config/config.json'):
-                with open('config/config.json') as f:
+            config_path = Path('config/config.json')
+            if config_path.exists():
+                with open(config_path) as f:
                     config = json.load(f)
-                print("Using manual configuration from config.json")
+                print("Using configuration from config.json")
+                
+                # Convert TRADING_SYMBOLS from list to required format if needed
+                if isinstance(config.get('TRADING_SYMBOLS'), list):
+                    config['TRADING_SYMBOLS'] = [str(symbol) for symbol in config['TRADING_SYMBOLS']]
+                
+                # Ensure timeframe configuration exists
+                if 'TIMEFRAMES' in config:
+                    config['timeframe_config'] = config['TIMEFRAMES']
             else:
                 raise FileNotFoundError("config.json not found")
         
         # Validate the configuration
         ConfigHandler.validate_config(config)
-        
         return config
 
     @staticmethod

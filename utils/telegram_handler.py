@@ -14,62 +14,128 @@ class TelegramHandler:
         self.commands_setup = False
         self.logger = logging.getLogger(__name__)
         self.trade_conv_state = {}  # Add this to track conversation states
+        self.command_lock = asyncio.Lock()  # Add lock for commands
+        self.command_timeout = 30  # Timeout for commands in seconds
+        self.processing_commands = set()  # Track processing commands
+
+    async def send_startup_notification(self):
+        """Send comprehensive startup notification"""
+        try:
+            startup_msg = (
+                "🤖 Binance Trading Bot Started!\n\n"
+                "📈 Trading Configuration:\n"
+                f"• Mode: {'Testnet' if self.bot.client.API_URL == 'https://testnet.binance.vision/api' else 'Live'}\n"
+                f"• Order Type: {self.bot.order_type.capitalize()}\n"
+                f"• Trading Pairs: {', '.join(self.bot.valid_symbols)}\n"
+                f"• USDT Reserve: {self.bot.reserve_balance_usdt}\n"
+                f"• Tax Rate: 28%\n\n"
+                "📊 Available Commands:\n\n"
+                "Market Analysis:\n"
+                "/positions - Show current prices and opportunities\n"
+                "/orders - Show open limit orders\n\n"
+                "Portfolio Management:\n"
+                "/balance - Show current balance\n"
+                "/trades - List all trades with P/L\n"
+                "/addtrade - Add manual trade\n"
+                "/symbol <SYMBOL> - Show detailed stats\n"
+                "/summary - Show portfolio summary\n\n"
+                "Analytics:\n"
+                "/profits - Show current profits\n"
+                "/distribution - Show entry distribution\n"
+                "/stacking - Show position building\n"
+                "/buytimes - Show trade timing\n"
+                "/portfolio - Show value evolution\n"
+                "/allocation - Show asset allocation\n\n"
+                "System:\n"
+                "/stats - Show system information\n\n"
+                "🟢 Bot is actively monitoring markets!"
+            )
+            
+            await self.send_message(startup_msg)
+            
+        except Exception as e:
+            self.logger.error(f"Error sending startup notification: {e}")
 
     async def initialize(self):
-        """Initialize Telegram bot and set up commands"""
-        if self.commands_setup:
+        """Initialize Telegram bot with improved error handling"""
+        try:
+            if self.commands_setup:
+                return True
+
+            await self.app.initialize()
+            test_response = await self.app.bot.get_me()
+            if not test_response:
+                raise Exception("Failed to connect to Telegram")
+
+            # Set up command handlers with timeouts
+            self.register_handlers()
+            
+            # Start bot with proper error handling
+            await self.app.start()
+            await self.app.updater.start_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True,
+                read_timeout=30,
+                write_timeout=30,
+                connect_timeout=30,
+                pool_timeout=30
+            )
+
+            # Send startup notification with retry
+            retry_count = 3
+            for attempt in range(retry_count):
+                try:
+                    await self.send_startup_notification()
+                    break
+                except Exception as e:
+                    if attempt == retry_count - 1:
+                        raise
+                    await asyncio.sleep(1)
+
+            self.commands_setup = True
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Telegram initialization failed: {e}")
+            return False
+
+    async def handle_command_wrapper(self, handler, update, context):
+        """Wrapper to handle commands with timeout and cleanup"""
+        command = update.message.text.split()[0][1:]  # Extract command name
+        if command in self.processing_commands:
+            await self.send_message("Command already processing, please wait...")
             return
 
         try:
-            # Test connection before proceeding
-            await self.app.initialize()
-            await self.app.bot.get_me()  # This will fail if token is invalid
-            
-            commands = [
-                BotCommand("start", "🚀 Show available commands and bot status"),
-                BotCommand("positions", "📊 Show current prices and available trading opportunities"),
-                BotCommand("balance", "💰 Show current balance for all assets"),
-                BotCommand("trades", "📈 Show all trades with profit/loss after tax"),
-                BotCommand("profits", "💹 Show current profits for all positions"),
-                BotCommand("stats", "ℹ️ Show system stats and bot information"),
-                BotCommand("distribution", "📊 Show entry price distribution analysis"),
-                BotCommand("stacking", "📚 Show position building over time"),
-                BotCommand("buytimes", "⏰ Show time between buys analysis"),
-                BotCommand("portfolio", "📈 Show portfolio value evolution"),
-                BotCommand("allocation", "🔄 Show current asset allocation"),
-                BotCommand("orders", "📋 Show open limit orders"),
-                BotCommand("symbol", "🔍 Show detailed stats for a symbol including tax"),
-                BotCommand("summary", "📊 Show complete portfolio summary with tax"),
-                BotCommand("addtrade", "➕ Add a manual trade to the portfolio")
-            ]
-
-            # Register command handlers
-            self.register_handlers()
-            
-            # Set up commands
-            await self.app.bot.set_my_commands(commands)
-            
-            # Start the bot
-            await self.app.start()
-            await self.app.updater.start_polling(
-                allowed_updates=["message"],
-                drop_pending_updates=True
-            )
-            
-            print(f"{Fore.GREEN}Telegram bot started successfully!")
-            self.logger.info("Telegram bot started successfully!")
-            self.commands_setup = True
-            
+            self.processing_commands.add(command)
+            async with self.command_lock:
+                # Send typing action
+                await self.app.bot.send_chat_action(
+                    chat_id=update.effective_chat.id,
+                    action="typing"
+                )
+                
+                # Execute command with timeout
+                try:
+                    await asyncio.wait_for(
+                        handler(update, context),
+                        timeout=self.command_timeout
+                    )
+                except asyncio.TimeoutError:
+                    await self.send_message(
+                        f"Command {command} timed out. Please try again."
+                    )
+                
         except Exception as e:
-            self.logger.error(f"Failed to initialize Telegram: {e}")
-            print(f"{Fore.RED}Failed to initialize Telegram: {e}")
-            # Return False to indicate initialization failed
-            return False
-            
-        return True
+            self.logger.error(f"Error in command {command}: {e}")
+            await self.send_message(
+                f"Error processing command {command}. Please try again."
+            )
+        finally:
+            self.processing_commands.discard(command)
 
     def register_handlers(self):
-        """Register all command handlers"""
+        """Register command handlers with wrapper"""
         handlers = {
             "start": self.handle_start,
             "positions": self.handle_positions,
@@ -90,50 +156,43 @@ class TelegramHandler:
         }
 
         for command, handler in handlers.items():
-            self.app.add_handler(CommandHandler(command, handler))
+            wrapped_handler = lambda u, c, h=handler: self.handle_command_wrapper(h, u, c)
+            self.app.add_handler(CommandHandler(command, wrapped_handler))
         
         # Add message handler for conversations
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
 
     async def send_message(self, text, parse_mode=None, reply_markup=None):
-        """Safely send messages with retry logic"""
-        max_retries = 3
-        retry_delay = 2
-        
-        for attempt in range(max_retries):
-            try:
+        """Send message with improved reliability"""
+        try:
+            async with self.command_lock:
                 if len(text) > 4000:
                     chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
-                    responses = []
                     for chunk in chunks:
-                        response = await self.app.bot.send_message(
-                            chat_id=self.chat_id,
-                            text=chunk,
-                            parse_mode=parse_mode,
-                            reply_markup=reply_markup,
-                            read_timeout=30,
-                            connect_timeout=30,
-                            write_timeout=30,
-                            pool_timeout=30
-                        )
-                        responses.append(response)
-                    return responses[-1]
+                        await self._send_with_retry(chunk, parse_mode, reply_markup)
                 else:
-                    return await self.app.bot.send_message(
-                        chat_id=self.chat_id,
-                        text=text,
-                        parse_mode=parse_mode,
-                        reply_markup=reply_markup,
-                        read_timeout=30,
-                        connect_timeout=30,
-                        write_timeout=30,
-                        pool_timeout=30
-                    )
+                    await self._send_with_retry(text, parse_mode, reply_markup)
+        except Exception as e:
+            self.logger.error(f"Failed to send message: {e}")
+
+    async def _send_with_retry(self, text, parse_mode=None, reply_markup=None, max_retries=3):
+        """Send message with retries"""
+        for attempt in range(max_retries):
+            try:
+                return await self.app.bot.send_message(
+                    chat_id=self.chat_id,
+                    text=text,
+                    parse_mode=parse_mode,
+                    reply_markup=reply_markup,
+                    read_timeout=10,
+                    write_timeout=10,
+                    connect_timeout=10,
+                    pool_timeout=10
+                )
             except Exception as e:
                 if attempt == max_retries - 1:
-                    self.logger.error(f"Failed to send message after {max_retries} attempts: {e}")
                     raise
-                await asyncio.sleep(retry_delay * (attempt + 1))
+                await asyncio.sleep(1)
 
     async def handle_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command"""

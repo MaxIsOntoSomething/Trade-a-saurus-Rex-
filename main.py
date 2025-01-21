@@ -55,6 +55,19 @@ class BinanceBot:
     balance_pause_reason = None  # New variable to track why trading is paused
 
     def __init__(self, use_testnet, use_telegram, timeframe_config, order_type, use_percentage, trade_amount, reserve_balance_usdt):
+        # First load proper configuration
+        self.config = ConfigHandler.load_config(use_env=IN_DOCKER)
+        
+        # Use config values if not running from CLI
+        if IN_DOCKER or not any([timeframe_config, order_type, use_percentage, trade_amount, reserve_balance_usdt]):
+            use_testnet = self.config.get('USE_TESTNET', True)
+            use_telegram = self.config.get('USE_TELEGRAM', False)
+            timeframe_config = self.config.get('timeframe_config', {})
+            order_type = self.config.get('ORDER_TYPE', 'limit')
+            use_percentage = self.config.get('USE_PERCENTAGE', False)
+            trade_amount = self.config.get('TRADE_AMOUNT', 10)
+            reserve_balance_usdt = self.config.get('RESERVE_BALANCE', 2000)
+
         # Add timestamp sync
         self.recv_window = 60000
         self.time_offset = 0
