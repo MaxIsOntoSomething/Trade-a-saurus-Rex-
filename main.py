@@ -1065,6 +1065,9 @@ class BinanceBot:
 
             while True:
                 try:
+                    # Check for resets
+                    await self.check_and_handle_resets()
+                    
                     await asyncio.sleep(1)
                 except asyncio.CancelledError:
                     self.logger.info("Main loop cancelled, shutting down...")
@@ -1217,6 +1220,94 @@ class BinanceBot:
             self.logger.error(f"Startup checks failed: {e}")
             return False
 
+    async def check_and_handle_resets(self):
+        """Check for timeframe resets and notify"""
+        now = datetime.now(timezone.utc)
+        reset_messages = []
+
+        for timeframe, reset_time in self.next_reset_times.items():
+            if now >= reset_time:
+                # Generate reset message
+                message = await self._generate_reset_overview(timeframe)
+                reset_messages.append(message)
+                
+                # Update next reset time
+                if timeframe == 'daily':
+                    self.next_reset_times[timeframe] = reset_time + timedelta(days=1)
+                elif timeframe == 'weekly':
+                    self.next_reset_times[timeframe] = reset_time + timedelta(days=7)
+                else:  # monthly
+                    # Calculate first day of next month
+                    if reset_time.month == 12:
+                        next_month = datetime(reset_time.year + 1, 1, 1, tzinfo=timezone.utc)
+                    else:
+                        next_month = datetime(reset_time.year, reset_time.month + 1, 1, tzinfo=timezone.utc)
+                    self.next_reset_times[timeframe] = next_month
+
+        # Send all reset messages
+        if reset_messages:
+            combined_message = "\n\n".join(reset_messages)
+            print(f"\n{Fore.CYAN}{combined_message}")
+            if self.telegram_handler:
+                await self.telegram_handler.send_message(combined_message)
+
+    async def _generate_reset_overview(self, timeframe):
+        """Generate reset overview with opens for all symbols"""
+        try:
+            header = f"🔄 {timeframe.capitalize()} Reset Overview\n"
+            header += f"UTC: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            
+            # Get opens for all symbols
+            opens = []
+            for symbol in self.valid_symbols:
+                ticker = await self._make_api_call(self.client.get_symbol_ticker, symbol=symbol)
+                current_price = float(ticker['price'])
+                
+                # Get previous timeframe data
+                if timeframe == 'daily':
+                    interval = Client.KLINE_INTERVAL_1DAY
+                    lookback = "2 days ago UTC"
+                elif timeframe == 'weekly':
+                    interval = Client.KLINE_INTERVAL_1WEEK
+                    lookback = "2 weeks ago UTC"
+                else:
+                    interval = Client.KLINE_INTERVAL_1MONTH
+                    lookback = "2 months ago UTC"
+                
+                historical = self.get_historical_data(symbol, interval, lookback)
+                previous_open = float(historical['open'].iloc[-1])
+                
+                # Calculate change
+                change = ((current_price - previous_open) / previous_open) * 100
+                arrow = "↑" if change >= 0 else "↓"
+                
+                opens.append({
+                    'symbol': symbol,
+                    'price': current_price,
+                    'previous_open': previous_open,
+                    'change': change,
+                    'arrow': arrow
+                })
+            
+            # Sort by change percentage
+            opens.sort(key=lambda x: x['change'], reverse=True)
+            
+            # Format message
+            details = []
+            for data in opens:
+                details.append(
+                    f"{data['symbol']}:\n"
+                    f"  Current: {data['price']:.8f}\n"
+                    f"  Previous Open: {data['previous_open']:.8f}\n"
+                    f"  Change: {data['change']:+.2f}% {data['arrow']}"
+                )
+            
+            return header + "\n".join(details)
+            
+        except Exception as e:
+            self.logger.error(f"Error generating reset overview: {e}")
+            return f"Error generating {timeframe} reset overview: {str(e)}"
+
 if __name__ == "__main__":
     try:
         # 1. First ask about network
@@ -1361,6 +1452,7 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         logging.error(f"Unexpected error: {str(e)}")
+
 
 
 
