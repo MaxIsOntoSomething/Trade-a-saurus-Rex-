@@ -481,145 +481,136 @@ class BinanceBot:
         return dt
 
     async def verify_pending_orders(self):
-        """Verify all pending orders after connection issues with safe iteration"""
+        """Verify all pending orders with improved safety"""
         try:
-            # Create a list of orders to process
+            # Create a snapshot of orders to process
             orders_to_process = list(self.pending_orders.items())
+            processed_orders = set()
             
             for bot_order_id, order_info in orders_to_process:
                 try:
                     symbol = order_info['symbol']
                     order_id = order_info['orderId']
                     
-                    # Get order status
-                    order_status = await self._make_api_call(
-                        self.client.get_order,
-                        symbol=symbol,
-                        orderId=order_id,
-                        recvWindow=self.recv_window
-                    )
+                    # Get order status with retries
+                    order_status = await self._get_order_status_with_retry(symbol, order_id)
                     
+                    if not order_status:
+                        continue
+                        
                     # Process order based on status
                     if order_status['status'] == 'FILLED':
                         await self._handle_filled_order(symbol, order_status)
-                        if bot_order_id in self.pending_orders:
-                            del self.pending_orders[bot_order_id]
+                        processed_orders.add(bot_order_id)
                     elif order_status['status'] == 'CANCELED':
-                        if bot_order_id in self.pending_orders:
-                            del self.pending_orders[bot_order_id]
+                        processed_orders.add(bot_order_id)
                     elif order_status['status'] == 'NEW':
                         # Check for timeout
                         placed_time = datetime.fromisoformat(order_info['placed_time'])
                         if datetime.now(timezone.utc) - placed_time > self.limit_order_timeout:
-                            await self._cancel_order(symbol, order_id)
-                            if bot_order_id in self.pending_orders:
-                                del self.pending_orders[bot_order_id]
+                            if await self._cancel_order(symbol, order_id):
+                                processed_orders.add(bot_order_id)
                                 
-                except BinanceAPIException as e:
-                    if e.code == -2013:  # Order does not exist
-                        if bot_order_id in self.pending_orders:
-                            del self.pending_orders[bot_order_id]
-                    else:
-                        self.logger.error(f"API error verifying order {bot_order_id}: {e}")
                 except Exception as e:
                     self.logger.error(f"Error processing order {bot_order_id}: {e}")
             
-            # Save changes
-            await self.save_pending_orders()
+            # Remove processed orders atomically
+            if processed_orders:
+                await self._remove_processed_orders(processed_orders)
             
         except Exception as e:
             self.logger.error(f"Error in verify_pending_orders: {e}")
 
+    async def _get_order_status_with_retry(self, symbol, order_id, max_retries=3):
+        """Get order status with retries"""
+        for attempt in range(max_retries):
+            try:
+                return await self._make_api_call(
+                    self.client.get_order,
+                    symbol=symbol,
+                    orderId=order_id,
+                    recvWindow=self.recv_window
+                )
+            except BinanceAPIException as e:
+                if e.code == -2013:  # Order does not exist
+                    return None
+                if attempt == max_retries - 1:
+                    raise
+                await asyncio.sleep(1)
+
+    async def _remove_processed_orders(self, order_ids):
+        """Remove processed orders atomically"""
+        try:
+            # Create new dict without processed orders
+            updated_orders = {
+                k: v for k, v in self.pending_orders.items()
+                if k not in order_ids
+            }
+            
+            # Save atomically using file handler
+            file_handler = AsyncFileHandler()
+            await file_handler.save_json_atomic(self.orders_file, updated_orders)
+            
+            # Update memory state only after successful save
+            self.pending_orders = updated_orders
+            
+        except Exception as e:
+            self.logger.error(f"Error removing processed orders: {e}")
+            raise
+
     async def _handle_filled_order(self, symbol, order_status):
-        """Handle filled order updates and save to trades.json"""
+        """Handle filled order with improved verification"""
         try:
             quantity = float(order_status['executedQty'])
             price = float(order_status['price'])
             order_id = order_status['orderId']
-            base_asset = symbol.replace('USDT', '')
             
-            # Find matching pending order by orderId
-            matching_bot_order_id = None
-            for bot_order_id, order_info in self.pending_orders.items():
-                if order_info['orderId'] == order_id:
-                    matching_bot_order_id = bot_order_id
+            # Verify the order exists in our tracking
+            bot_order_id = None
+            for id, info in self.pending_orders.items():
+                if info['orderId'] == order_id:
+                    bot_order_id = id
                     break
-            
-            if not matching_bot_order_id:
-                self.logger.warning(f"No matching pending order found for orderId: {order_id}")
+                    
+            if not bot_order_id:
+                self.logger.warning(f"Order {order_id} filled but not found in pending orders")
                 return
-            
-            # Force balance update
-            new_balance = await self._get_verified_balance(base_asset)
-            usdt_balance = await self._get_verified_balance('USDT')
-            
-            if new_balance and usdt_balance:
-                # Update tracking
-                self.total_bought[symbol] = self.total_bought.get(symbol, 0) + quantity
-                self.total_spent[symbol] = self.total_spent.get(symbol, 0) + (quantity * price)
-                self.total_trades += 1
-
-                # Update the existing BOT trade entry with verification
-                if matching_bot_order_id in self.trades:
-                    self.trades[matching_bot_order_id].update({
-                        'status': 'VERIFIED',
-                        'verification_time': datetime.now(timezone.utc).isoformat(),
-                        'filled_time': datetime.now(timezone.utc).isoformat()
-                    })
                 
-                # Remove from pending orders
-                del self.pending_orders[matching_bot_order_id]
-                self.save_pending_orders()  # Save pending orders file immediately
-                self.save_trades()  # Save trades file
-                
-                fill_msg = (
-                    f"✅ Verified order fill for {symbol} [ID: {matching_bot_order_id}]:\n"
-                    f"Quantity: {quantity:.8f}\n"
-                    f"Price: {price:.8f} USDT\n"
-                    f"Total Cost: {quantity * price:.2f} USDT\n\n"
-                    f"Verified Balances:\n"
-                    f"• {base_asset}: {new_balance['total']:.8f}\n"
-                    f"• USDT: {usdt_balance['free']:.2f}"
-                )
-                
-                if self.telegram_handler:
-                    asyncio.create_task(self.telegram_handler.send_message(fill_msg))
+            # Update trades first
+            if bot_order_id in self.trades:
+                self.trades[bot_order_id].update({
+                    'status': 'FILLED',
+                    'filled_time': datetime.now(timezone.utc).isoformat(),
+                    'actual_price': price,
+                    'actual_quantity': quantity
+                })
+                await self._save_trades_atomic()
             
+            # Log the successful fill
+            fill_msg = (
+                f"✅ Order filled and verified:\n"
+                f"ID: {bot_order_id}\n"
+                f"Symbol: {symbol}\n"
+                f"Quantity: {quantity}\n"
+                f"Price: {price}"
+            )
+            self.logger.info(fill_msg)
+            
+            if self.telegram_handler:
+                await self.telegram_handler.send_message(fill_msg)
+                
         except Exception as e:
             self.logger.error(f"Error handling filled order: {e}")
-            print(f"{Fore.RED}Error handling filled order: {e}")
+            raise
 
-    async def _cancel_order(self, symbol, order_id):
-        """Cancel order and handle cleanup"""
+    async def _save_trades_atomic(self):
+        """Save trades atomically"""
         try:
-            self.client.cancel_order(symbol=symbol, orderId=order_id)
-            self.logger.info(f"Cancelled order {order_id} for {symbol}")
-            
-            if symbol in self.pending_orders:
-                del self.pending_orders[symbol]
-                self.save_pending_orders()
-                
-        except BinanceAPIException as e:
-            if e.code == -2011:  # Order filled or does not exist
-                if symbol in self.pending_orders:
-                    del self.pending_orders[symbol]
-                    self.save_pending_orders()
-            else:
-                raise e
-
-    async def _get_verified_balance(self, asset):
-        """Get balance with verification retries"""
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                balance = self.get_balance(asset)
-                if balance:
-                    return balance
-                await asyncio.sleep(1)
-            except Exception as e:
-                self.logger.error(f"Balance verification attempt {attempt + 1} failed: {e}")
-                await asyncio.sleep(1)
-        return None
+            file_handler = AsyncFileHandler()
+            await file_handler.save_json_atomic(self.trades_file, self.trades)
+        except Exception as e:
+            self.logger.error(f"Error saving trades: {e}")
+            raise
 
     async def monitor_order(self, bot_order_id, symbol, order_id, price, placed_time):
         """Asynchronously monitor an order until it's filled"""

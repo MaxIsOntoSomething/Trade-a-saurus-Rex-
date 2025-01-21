@@ -4,6 +4,7 @@ import asyncio
 from collections import deque
 import os
 from datetime import datetime
+import fcntl  # For file locking
 
 class FileConnectionPool:
     def __init__(self, max_connections=5):
@@ -74,3 +75,39 @@ class AsyncFileHandler:
         finally:
             if file:
                 await self.pool.release_connection(file)
+
+    async def save_json_atomic(self, filepath, data):
+        """Save JSON data atomically with file locking"""
+        temp_file = f"{filepath}.tmp"
+        backup_file = f"{filepath}.bak"
+        
+        try:
+            # Write to temporary file first
+            async with aiofiles.open(temp_file, 'w') as f:
+                # Acquire exclusive lock
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                await f.write(json.dumps(data, indent=4))
+                await f.flush()
+                os.fsync(f.fileno())
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+            # Create backup of existing file if it exists
+            if os.path.exists(filepath):
+                os.replace(filepath, backup_file)
+
+            # Atomic rename of temp file to actual file
+            os.replace(temp_file, filepath)
+
+            # Remove backup file if everything succeeded
+            if os.path.exists(backup_file):
+                os.remove(backup_file)
+
+        except Exception as e:
+            # Restore from backup if something went wrong
+            if os.path.exists(backup_file):
+                os.replace(backup_file, filepath)
+            raise e
+        finally:
+            # Cleanup temp file if it still exists
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
