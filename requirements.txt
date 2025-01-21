@@ -8,3 +8,4 @@ matplotlib>=3.8.0
 seaborn>=0.13.0
 aiofiles>=23.2.1
 websockets>=11.0.3
+portalocker>=2.3.0

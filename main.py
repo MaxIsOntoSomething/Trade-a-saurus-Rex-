@@ -150,6 +150,13 @@ class BinanceBot:
         self.trades = self.load_trades()
         self.file_handler = AsyncFileHandler()  # Add this line
 
+        # Initialize pending orders from trades
+        self.pending_orders = {
+            trade_id: trade['order_metadata'] 
+            for trade_id, trade in self.trades.items() 
+            if trade['trade_info']['status'] == 'PENDING'
+        }
+
     async def _make_api_call(self, func, *args, **kwargs):
         """Wrapper for API calls with rate limiting"""
         await self.rate_limiter.acquire()
@@ -1265,10 +1272,24 @@ class BinanceBot:
         try:
             print(f"{Fore.CYAN}Performing startup checks...")
             
-            # Verify pending orders
-            orders_count = len(self.pending_orders)
-            if orders_count > 0:
-                print(f"{Fore.YELLOW}Found {orders_count} pending orders. Verifying status...")
+            # Verify trades and pending orders are in sync
+            pending_count = len(self.pending_orders)
+            pending_in_trades = len([
+                t for t in self.trades.values() 
+                if t['trade_info']['status'] == 'PENDING'
+            ])
+            
+            if pending_count != pending_in_trades:
+                print(f"{Fore.YELLOW}Syncing pending orders with trades...")
+                # Re-sync pending orders from trades
+                self.pending_orders = {
+                    trade_id: trade['order_metadata']
+                    for trade_id, trade in self.trades.items()
+                    if trade['trade_info']['status'] == 'PENDING'
+                }
+            
+            if pending_count > 0:
+                print(f"{Fore.YELLOW}Found {pending_count} pending orders. Verifying status...")
                 await self.verify_pending_orders()
                 print(f"{Fore.GREEN}Order verification complete!")
             
@@ -1567,27 +1588,6 @@ if __name__ == "__main__":
                 if reserve_balance_usdt >= 0:
                     print(f"USDT Reserve set to: {reserve_balance_usdt} USDT")
                     break
-                print("Reserve balance must be non-negative.")
-            except ValueError:
-                print("Please enter a valid number.")
-
-        # 7. Finally timeframe configuration
-        timeframe_config = {}
-        timeframes = ['daily', 'weekly', 'monthly']
-        
-        for timeframe in timeframes:
-            print(f"\n{Fore.CYAN}Configure {timeframe.capitalize()} Settings:")
-            print(f"{Fore.YELLOW}Note: Thresholds must be entered in ascending order (e.g., 1%, 2%, 3%)")
-            while True:
-                enabled_input = input(f"Enable {timeframe} trading? (yes/no): ").strip().lower()
-                if enabled_input in ['yes', 'no']:
-                    enabled = enabled_input == 'yes'
-                    break
-                print("Invalid input. Please enter 'yes' or 'no'.")
-            
-            if enabled:
-                while True:
-                    try:
                         num_thresholds = int(input(f"Enter the number of {timeframe} drop thresholds: ").strip())
                         if 0 < num_thresholds <= 10:
                             break
