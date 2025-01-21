@@ -22,6 +22,7 @@ from utils.logger import setup_logger
 from utils.websocket_manager import WebSocketManager
 from utils.rate_limiter import RateLimiter
 from utils.telegram_handler import TelegramHandler
+from utils.file_handler import AsyncFileHandler  # Add import
 
 # Initialize colorama
 init(autoreset=True)
@@ -147,6 +148,7 @@ class BinanceBot:
 
         self.trades_file = 'data/trades.json'
         self.trades = self.load_trades()
+        self.file_handler = AsyncFileHandler()  # Add this line
 
     async def _make_api_call(self, func, *args, **kwargs):
         """Wrapper for API calls with rate limiting"""
@@ -561,8 +563,7 @@ class BinanceBot:
             }
             
             # Save atomically using file handler
-            file_handler = AsyncFileHandler()
-            await file_handler.save_json_atomic(self.orders_file, updated_orders)
+            await self.file_handler.save_json_atomic(self.orders_file, updated_orders)
             
             # Update memory state only after successful save
             self.pending_orders = updated_orders
@@ -619,8 +620,7 @@ class BinanceBot:
     async def _save_trades_atomic(self):
         """Save trades atomically"""
         try:
-            file_handler = AsyncFileHandler()
-            await file_handler.save_json_atomic(self.trades_file, self.trades)
+            await self.file_handler.save_json_atomic(self.trades_file, self.trades)
         except Exception as e:
             self.logger.error(f"Error saving trades: {e}")
             raise
@@ -1320,6 +1320,21 @@ class BinanceBot:
         except Exception as e:
             self.logger.error(f"Error generating reset overview: {e}")
             return f"Error generating {timeframe} reset overview: {str(e)}"
+
+    async def _get_verified_balance(self, asset, max_retries=3, retry_delay=1):
+        """Get balance with verification and retries"""
+        for attempt in range(max_retries):
+            try:
+                balance = self.get_balance(asset)
+                if balance is not None:
+                    return balance
+                await asyncio.sleep(retry_delay)
+            except Exception as e:
+                self.logger.error(f"Balance check attempt {attempt + 1} failed: {e}")
+                if attempt == max_retries - 1:
+                    raise
+                await asyncio.sleep(retry_delay)
+        return None
 
 if __name__ == "__main__":
     try:

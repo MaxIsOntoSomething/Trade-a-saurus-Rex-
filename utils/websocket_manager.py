@@ -324,11 +324,11 @@ class WebSocketManager:
             try:
                 if time.time() - self.last_pong > self.websocket_timeout:
                     print(f"{Fore.YELLOW}Keepalive timeout detected, forcing reconnection...")
-                    if self.ws:
+                    if self.ws and self.ws.open:  # Check if ws exists and is open
                         await self.ws.close(code=1012, reason="Keepalive timeout")
                     break
                 
-                if self.ws and not self.ws.closed:
+                if self.ws and self.ws.open:  # Only send ping if connection is open
                     await self.ws.ping()
                 
                 await asyncio.sleep(self.ping_interval)
