@@ -1209,8 +1209,12 @@ class BinanceBot:
             loop.close()
 
     def __del__(self):
-        """Save pending orders when bot shuts down"""
-        self.save_pending_orders()
+        """Cleanup when bot is destroyed"""
+        try:
+            if hasattr(self, 'trades') and hasattr(self, 'file_handler'):
+                asyncio.run(self.save_trades())
+        except Exception as e:
+            print(f"Error during cleanup: {e}")
 
     async def get_symbol_stats(self, symbol):
         """Get trading statistics for a specific symbol"""
@@ -1385,6 +1389,29 @@ class BinanceBot:
                     raise
                 await asyncio.sleep(retry_delay)
         return None
+
+    def get_next_weekly_reset(self):
+        """Get the next weekly reset time"""
+        now = datetime.now(timezone.utc)
+        # Get next Monday at 00:00 UTC
+        days_ahead = 7 - now.weekday()  # 0 = Monday, so this gets days until next Monday
+        if days_ahead <= 0:  # If today is Monday, jump to next week
+            days_ahead += 7
+        next_monday = now + timedelta(days_ahead)
+        return next_monday.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    def get_next_monthly_reset(self):
+        """Get the next monthly reset time"""
+        now = datetime.now(timezone.utc)
+        if now.month == 12:
+            next_month = datetime(now.year + 1, 1, 1, tzinfo=timezone.utc)
+        else:
+            next_month = datetime(now.year, now.month + 1, 1, tzinfo=timezone.utc)
+        return next_month
+
+    async def save_trades(self):
+        """Save trades atomically"""
+        await self.file_handler.save_json_atomic(self.trades_file, self.trades)
 
 if __name__ == "__main__":
     try:

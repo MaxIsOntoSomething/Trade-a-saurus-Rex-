@@ -17,7 +17,7 @@ class FileConnectionPool:
 
     async def get_connection(self, filepath):
         async with self.lock:
-            while len(self.in_use) >= self.max_connections:
+            while (len(self.in_use) >= self.max_connections):
                 await asyncio.sleep(0.1)
             
             try:
