@@ -171,15 +171,32 @@ class WebSocketManager:
         return self.last_prices.get(symbol)
 
     async def stop(self):
-        """Stop WebSocket connection"""
+        """Stop WebSocket connection with improved cleanup"""
         try:
+            # Cancel ping task first
+            if self.ping_task and not self.ping_task.done():
+                self.ping_task.cancel()
+                try:
+                    await self.ping_task
+                except asyncio.CancelledError:
+                    pass
+
+            # Close WebSocket connection
             if self.ws:
                 await self.ws.close()
-                self.is_connected = False
-                print(f"{Fore.YELLOW}WebSocket connection closed")
-                self.logger.info("WebSocket connection closed")
+                self.ws = None
+            
+            self.is_connected = False
+            print(f"{Fore.YELLOW}WebSocket connection closed")
+            self.logger.info("WebSocket connection closed")
+
         except Exception as e:
             self.logger.error(f"Error stopping WebSocket: {e}")
+        finally:
+            # Ensure we clear all state
+            self.callbacks = []
+            self.last_prices = {}
+            self.initial_prices_sent = False
 
     async def _refresh_timer(self):
         """Force refresh prices every 60 seconds"""

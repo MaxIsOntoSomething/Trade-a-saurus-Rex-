@@ -171,10 +171,10 @@ class BinanceBot:
             return {}
 
     def save_pending_orders(self):
-        """Save pending orders to file"""
+        """Save pending orders with proper file handling"""
         try:
             os.makedirs('data', exist_ok=True)
-            with open('data/pending_orders.json', 'w') as f:
+            with open(self.orders_file, 'w') as f:
                 json.dump(self.pending_orders, f, indent=4)
         except Exception as e:
             self.logger.error(f"Error saving pending orders: {e}")
@@ -481,44 +481,51 @@ class BinanceBot:
         return dt
 
     async def verify_pending_orders(self):
-        """Verify all pending orders after connection issues"""
+        """Verify all pending orders after connection issues with safe iteration"""
         try:
-            orders_to_remove = []
-            for bot_order_id, order_info in self.pending_orders.items():
+            # Create a list of orders to process
+            orders_to_process = list(self.pending_orders.items())
+            
+            for bot_order_id, order_info in orders_to_process:
                 try:
                     symbol = order_info['symbol']
                     order_id = order_info['orderId']
-                    order_status = self.client.get_order(
+                    
+                    # Get order status
+                    order_status = await self._make_api_call(
+                        self.client.get_order,
                         symbol=symbol,
                         orderId=order_id,
                         recvWindow=self.recv_window
                     )
                     
-                    # Check order status
+                    # Process order based on status
                     if order_status['status'] == 'FILLED':
                         await self._handle_filled_order(symbol, order_status)
-                        orders_to_remove.append(bot_order_id)
+                        if bot_order_id in self.pending_orders:
+                            del self.pending_orders[bot_order_id]
                     elif order_status['status'] == 'CANCELED':
-                        orders_to_remove.append(bot_order_id)
+                        if bot_order_id in self.pending_orders:
+                            del self.pending_orders[bot_order_id]
                     elif order_status['status'] == 'NEW':
-                        # Check if order should be cancelled due to timeout
+                        # Check for timeout
                         placed_time = datetime.fromisoformat(order_info['placed_time'])
                         if datetime.now(timezone.utc) - placed_time > self.limit_order_timeout:
                             await self._cancel_order(symbol, order_id)
-                            orders_to_remove.append(bot_order_id)
+                            if bot_order_id in self.pending_orders:
+                                del self.pending_orders[bot_order_id]
+                                
                 except BinanceAPIException as e:
                     if e.code == -2013:  # Order does not exist
-                        orders_to_remove.append(bot_order_id)
-                        continue
-                    self.logger.error(f"Error verifying order for {symbol}: {e}")
+                        if bot_order_id in self.pending_orders:
+                            del self.pending_orders[bot_order_id]
+                    else:
+                        self.logger.error(f"API error verifying order {bot_order_id}: {e}")
                 except Exception as e:
-                    self.logger.error(f"Error verifying order for {symbol}: {e}")
-                    
-            # Remove processed orders
-            for bot_order_id in orders_to_remove:
-                del self.pending_orders[bot_order_id]
+                    self.logger.error(f"Error processing order {bot_order_id}: {e}")
             
-            self.save_pending_orders()
+            # Save changes
+            await self.save_pending_orders()
             
         except Exception as e:
             self.logger.error(f"Error in verify_pending_orders: {e}")
@@ -1037,7 +1044,7 @@ class BinanceBot:
         return references
 
     async def main_loop(self):
-        """Main bot loop with improved error handling"""
+        """Main bot loop with improved shutdown handling"""
         try:
             # Perform startup checks first
             if not await self.startup_checks():
@@ -1068,6 +1075,9 @@ class BinanceBot:
             while True:
                 try:
                     await asyncio.sleep(1)
+                except asyncio.CancelledError:
+                    self.logger.info("Main loop cancelled, shutting down...")
+                    break
                 except Exception as e:
                     self.logger.error(f"Error in main loop: {e}")
                     await asyncio.sleep(5)
@@ -1076,10 +1086,18 @@ class BinanceBot:
             self.logger.error(f"Fatal error in main loop: {e}")
             raise
         finally:
+            # Proper cleanup sequence
             if self.ws_manager:
-                await self.ws_manager.stop()
+                try:
+                    await self.ws_manager.stop()
+                except Exception as e:
+                    self.logger.error(f"Error stopping WebSocket manager: {e}")
+
             if self.telegram_handler:
-                await self.telegram_handler.shutdown()
+                try:
+                    await self.telegram_handler.shutdown()
+                except Exception as e:
+                    self.logger.error(f"Error shutting down Telegram: {e}")
 
     async def handle_price_update(self, symbol, price):
         """Handle real-time price updates"""
