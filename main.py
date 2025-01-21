@@ -1588,6 +1588,27 @@ if __name__ == "__main__":
                 if reserve_balance_usdt >= 0:
                     print(f"USDT Reserve set to: {reserve_balance_usdt} USDT")
                     break
+                print("Reserve balance must be non-negative.")
+            except ValueError:
+                print("Please enter a valid number.")
+
+        # 7. Finally timeframe configuration
+        timeframe_config = {}
+        timeframes = ['daily', 'weekly', 'monthly']
+        
+        for timeframe in timeframes:
+            print(f"\n{Fore.CYAN}Configure {timeframe.capitalize()} Settings:")
+            print(f"{Fore.YELLOW}Note: Thresholds must be entered in ascending order (e.g., 1%, 2%, 3%)")
+            while True:
+                enabled_input = input(f"Enable {timeframe} trading? (yes/no): ").strip().lower()
+                if enabled_input in ['yes', 'no']:
+                    enabled = enabled_input == 'yes'
+                    break
+                print("Invalid input. Please enter 'yes' or 'no'.")
+            
+            if enabled:
+                while True:
+                    try:
                         num_thresholds = int(input(f"Enter the number of {timeframe} drop thresholds: ").strip())
                         if 0 < num_thresholds <= 10:
                             break
