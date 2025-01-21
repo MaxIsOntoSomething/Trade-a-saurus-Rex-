@@ -1,35 +1,41 @@
 version: '3.8'
 
 services:
-  bot:
+  binance-bot:
     build: 
       context: .
       dockerfile: Dockerfile
-    container_name: binance_bot
-    user: "${UID:-1000}:${GID:-1000}"  # Use host user's UID/GID
+      args:
+        APP_USER: ${APP_USER:-botuser}
+        UID: ${UID:-1000}
+        GID: ${GID:-1000}
+    container_name: binance-bot
+    user: "${UID:-1000}:${GID:-1000}"
     volumes:
-      - ./logs:/app/logs:rw
       - ./data:/app/data:rw
+      - ./logs:/app/logs:rw
       - ./config:/app/config:ro
+    environment:
+      - TZ=${TZ:-UTC}
+      - UMASK=${UMASK:-0027}
+      - DOCKER=true
+      - PYTHONUNBUFFERED=1
     env_file:
       - .env
-    environment:
-      - TZ=UTC
-      - PYTHONUNBUFFERED=1
-      - DOCKER=true
+    deploy:
+      resources:
+        limits:
+          memory: ${MEMORY_LIMIT:-512M}
+          cpus: ${CPU_LIMIT:-0.5}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys, os; sys.exit(0 if os.path.exists('/app/data/trades.json') else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
     restart: unless-stopped
     logging:
       driver: "json-file"
       options:
         max-size: "200m"
         max-file: "10"
-    healthcheck:
-      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8080/health')"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 5s
-    ulimits:
-      nofile:
-        soft: 65536
-        hard: 65536
+        compress: "true"
