@@ -1413,6 +1413,92 @@ class BinanceBot:
         """Save trades atomically"""
         await self.file_handler.save_json_atomic(self.trades_file, self.trades)
 
+    def test_connection(self):
+        """Test connection to Binance API and verify trading symbols"""
+        retries = 12
+        while retries > 0:
+            try:
+                self.valid_symbols = []
+                self.invalid_symbols = []
+                
+                for symbol in list(TRADING_SYMBOLS):
+                    try:
+                        ticker = self.client.get_symbol_ticker(symbol=symbol)
+                        print(f"Testing {symbol}: {ticker['price']} USDT")
+                        self.valid_symbols.append(symbol)
+                    except BinanceAPIException as symbol_error:
+                        if symbol_error.code == -1121:  # Invalid symbol error code
+                            print(f"{Fore.RED}Invalid symbol detected: {symbol}")
+                            self.logger.warning(f"Invalid symbol detected: {symbol}")
+                            self.invalid_symbols.append(symbol)
+                            continue
+                        else:
+                            raise symbol_error
+
+                if self.valid_symbols:  # If we have at least one valid symbol
+                    print(f"\n{Fore.GREEN}Successfully connected to {'Testnet' if self.client.API_URL == 'https://testnet.binance.vision/api' else 'Live'} API")
+                    print(f"{Fore.GREEN}Valid symbols: {', '.join(self.valid_symbols)}")
+                    
+                    if self.invalid_symbols:
+                        print(f"{Fore.YELLOW}Invalid symbols removed: {', '.join(self.invalid_symbols)}")
+                        # Update tracking files
+                        self._update_config_file()
+                        self._update_invalid_symbols_file()
+                    
+                    return True
+                else:
+                    raise Exception("No valid trading symbols found")
+                    
+            except BinanceAPIException as e:
+                if "502 Bad Gateway" in str(e):
+                    print(f"{Fore.RED}Binance servers are under maintenance.")
+                    print(f"{Fore.YELLOW}Retrying in 5 minutes... ({retries} attempts remaining)")
+                    time.sleep(300)  # Wait for 5 minutes
+                    retries -= 1
+                else:
+                    print(f"Error testing connection: {str(e)}")
+                    self.logger.error(f"Error testing connection: {str(e)}")
+                    raise
+            except Exception as e:
+                print(f"Unexpected error: {str(e)}")
+                self.logger.error(f"Unexpected error: {str(e)}")
+                raise
+
+        print(f"{Fore.RED}Could not connect after {12-retries} attempts. Please check your connection and API keys.")
+        self.logger.error("Connection attempts exhausted")
+        return False
+
+    def _update_config_file(self):
+        """Update config.json with valid symbols only"""
+        try:
+            config_path = 'config/config.json'
+            with open(config_path, 'r') as f:
+                config_data = json.load(f)
+            
+            config_data['TRADING_SYMBOLS'] = self.valid_symbols
+            
+            with open(config_path, 'w') as f:
+                json.dump(config_data, f, indent=4)
+            
+            print(f"{Fore.GREEN}Updated config.json with valid symbols")
+        except Exception as e:
+            print(f"{Fore.RED}Error updating config file: {e}")
+            self.logger.error(f"Error updating config file: {e}")
+
+    def _update_invalid_symbols_file(self):
+        """Update invalid_symbols.txt with removed symbols"""
+        try:
+            os.makedirs('data', exist_ok=True)
+            with open(self.invalid_symbols_file, 'w') as f:
+                f.write(f"# Invalid symbols removed on {datetime.now()}\n")
+                for symbol in self.invalid_symbols:
+                    f.write(f"{symbol}\n")
+            
+            print(f"{Fore.YELLOW}Invalid symbols saved to {self.invalid_symbols_file}")
+        except Exception as e:
+            print(f"{Fore.RED}Error updating invalid symbols file: {e}")
+            self.logger.error(f"Error updating invalid symbols file: {e}")
+
 if __name__ == "__main__":
     try:
         # 1. First ask about network
