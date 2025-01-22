@@ -72,7 +72,7 @@ class BinanceBot:
 
         # Initialize Telegram handler first if enabled
         self.telegram_handler = None
-        if use_telegram and self.config['USE_TELEGRAM']:
+        if use_telegram and self.config.get('USE_TELEGRAM'):
             self.telegram_handler = TelegramHandler(
                 self.config['TELEGRAM_TOKEN'],
                 self.config['TELEGRAM_CHAT_ID'],
@@ -1110,15 +1110,17 @@ class BinanceBot:
         return references
 
     async def main_loop(self):
-        """Main bot loop with improved shutdown handling"""
+        """Main bot loop with improved Telegram handling"""
         try:
             # Initialize Telegram first if enabled
-            if self.telegram_handler and not self.telegram_handler.initialized:
+            if self.telegram_handler:
                 print(f"{Fore.CYAN}Initializing Telegram...")
                 telegram_success = await self.telegram_handler.initialize()
                 if not telegram_success:
                     print(f"{Fore.YELLOW}Failed to initialize Telegram, continuing without it...")
                     self.telegram_handler = None
+                else:
+                    print(f"{Fore.GREEN}Telegram bot initialized successfully")
 
             # Perform startup checks
             if not await self.startup_checks():
@@ -1156,8 +1158,11 @@ class BinanceBot:
     def run(self):
         """Run the bot with improved error handling"""
         try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+            if not asyncio.get_event_loop().is_running():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            else:
+                loop = asyncio.get_event_loop()
             
             try:
                 loop.run_until_complete(self.main_loop())
@@ -1168,10 +1173,22 @@ class BinanceBot:
                 self.logger.error(f"Error in main loop: {str(e)}")
             finally:
                 # Ensure proper cleanup
+                cleanup_tasks = []
+                if self.ws_manager:
+                    cleanup_tasks.append(self.ws_manager.stop())
                 if self.telegram_handler:
-                    loop.run_until_complete(self.telegram_handler.shutdown())
-                loop.close()
+                    cleanup_tasks.append(self.telegram_handler.shutdown())
                 
+                if cleanup_tasks:
+                    # Run cleanup tasks
+                    try:
+                        loop.run_until_complete(asyncio.gather(*cleanup_tasks))
+                    except Exception as e:
+                        self.logger.error(f"Error during cleanup: {e}")
+                
+                # Close the loop
+                loop.close()
+                    
         except Exception as e:
             print(f"{Fore.RED}Fatal error: {str(e)}")
             self.logger.error(f"Fatal error: {str(e)}")

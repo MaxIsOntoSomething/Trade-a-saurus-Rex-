@@ -1,3 +1,4 @@
+import sys  # Add this import at the top with other imports
 from binance.client import Client
 import asyncio
 import websockets
@@ -45,6 +46,11 @@ class WebSocketManager:
         self.display_lock = asyncio.Lock()
         self.last_display_update = 0
         self.display_update_interval = 1  # Update display every second
+        self.next_reset_times = {
+            'daily': None,
+            'weekly': None,
+            'monthly': None
+        }  # Add this for countdown timers
 
     def add_callback(self, callback):
         """Add callback function to be called when price updates are received"""
@@ -137,23 +143,23 @@ class WebSocketManager:
                 price = float(msg['c'])  # Current price as float
                 price_change = float(msg['P'])  # 24h price change percent as float
 
-                # Store the last price with reduced information
+                # Update last prices atomically
                 self.last_prices[symbol] = {
                     'price': price,
                     'change': price_change,
                     'timestamp': datetime.now()
                 }
 
-                # Update display only if enough time has passed
+                # Call callbacks first
+                for callback in self.callbacks:
+                    asyncio.create_task(callback(symbol, float(price)))
+
+                # Update display with rate limiting
                 current_time = time.time()
                 if current_time - self.last_display_update >= self.display_update_interval:
                     async with self.display_lock:
                         self.last_display_update = current_time
                         await self._update_price_display()
-
-                # Call callbacks without waiting for display
-                for callback in self.callbacks:
-                    asyncio.create_task(callback(symbol, float(price)))
 
         except Exception as e:
             self.logger.error(f"Error processing WebSocket message: {e}")
@@ -162,30 +168,51 @@ class WebSocketManager:
     async def _update_price_display(self):
         """Update price display without blocking"""
         try:
-            # Clear console
+            # Only clear console if we have new prices to show
+            if not self.last_prices:
+                return
+
+            # Clear console and handle stdout flush properly
             os.system('cls' if os.name == 'nt' else 'clear')
             
-            # Print header
+            # Print header with current time
+            current_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+            print(f"\n{Fore.CYAN}Live Price Updates - {current_time} UTC")
             print(f"{Fore.CYAN}{'Symbol':<12} {'Price':<15} {'24h Change':<15}")
             print("-" * 42)
 
-            # Print all prices
+            # Print all prices with proper formatting
             for sym, data in sorted(self.last_prices.items()):
-                color = Fore.GREEN if data['change'] >= 0 else Fore.RED
-                arrow = "↑" if data['change'] >= 0 else "↓"
-                print(f"{Fore.CYAN}{sym:<12} "
-                      f"{color}{data['price']:<15.8f} "
-                      f"{data['change']:+.2f}% {arrow}{Fore.RESET}")
+                try:
+                    color = Fore.GREEN if data['change'] >= 0 else Fore.RED
+                    arrow = "↑" if data['change'] >= 0 else "↓"
+                    
+                    # Format price based on value
+                    price = data['price']
+                    if price < 1:
+                        price_str = f"{price:.8f}"
+                    elif price < 100:
+                        price_str = f"{price:.6f}"
+                    else:
+                        price_str = f"{price:.2f}"
 
-            # Add bottom separator and UTC clock
+                    print(f"{Fore.CYAN}{sym:<12} "
+                          f"{color}{price_str:<15} "
+                          f"{data['change']:+.2f}% {arrow}{Fore.RESET}")
+                except (KeyError, ValueError):
+                    continue
+
             print("-" * 42)
-            print(f"{Fore.YELLOW}UTC: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}")
-
-            # Add countdown timers without blocking
+            
+            # Add countdown timers
             await self._print_countdown_timers()
+            
+            # Force stdout flush
+            sys.stdout.flush()
 
         except Exception as e:
             self.logger.error(f"Error updating price display: {e}")
+            print(f"{Fore.RED}Error updating price display: {e}")
 
     async def _print_countdown_timers(self):
         """Print countdown timers asynchronously"""
@@ -242,21 +269,25 @@ class WebSocketManager:
     async def stop(self):
         """Stop WebSocket connection with improved cleanup"""
         try:
-            # Cancel ping task first
-            if self.ping_task and not self.ping_task.done():
-                self.ping_task.cancel()
+            self.is_connected = False
+
+            # Cancel keepalive task first
+            if self.keepalive_task and not self.keepalive_task.done():
+                self.keepalive_task.cancel()
                 try:
-                    await self.ping_task
+                    await self.keepalive_task
                 except asyncio.CancelledError:
                     pass
 
             # Close WebSocket connection
             if self.ws:
-                await self.ws.close()
-                self.ws = None
-            
-            self.is_connected = False
-            print(f"{Fore.YELLOW}WebSocket connection closed")
+                try:
+                    await self.ws.close()
+                except Exception as e:
+                    self.logger.warning(f"Error closing WebSocket: {e}")
+                finally:
+                    self.ws = None
+
             self.logger.info("WebSocket connection closed")
 
         except Exception as e:

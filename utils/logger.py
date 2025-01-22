@@ -16,12 +16,12 @@ def setup_logger(name='BinanceBot'):
 
     # Create formatters
     detailed_formatter = logging.Formatter(
-        '%(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s',
+        '%(asctime)s - %(name)s - %(levellevel)s - %(filename)s:%(lineno)d - %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
     
     simple_formatter = logging.Formatter(
-        '[%(asctime)s] %(levellevel)s: %(message)s',
+        '[%(asctime)s] %(levelname)s: %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
 
@@ -37,18 +37,27 @@ def setup_logger(name='BinanceBot'):
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(simple_formatter)
 
-    # Create console handler with UTF-8 encoding
-    try:
-        if sys.stdout.encoding != 'utf-8':
-            # For Windows, create a special UTF-8 stream
-            sys.stdout.reconfigure(encoding='utf-8')
-            console_handler = logging.StreamHandler(sys.stdout)
-        else:
-            console_handler = logging.StreamHandler()
-    except AttributeError:
-        # Fallback for older Python versions or if reconfigure is not available
-        console_handler = logging.StreamHandler()
+    # Create console handler with UTF-8 encoding and special handling for Windows
+    if os.name == 'nt':  # Windows
+        import sys
+        import codecs
+
+        class SafeStreamHandler(logging.StreamHandler):
+            def emit(self, record):
+                try:
+                    msg = self.format(record)
+                    stream = self.stream.buffer if hasattr(self.stream, 'buffer') else self.stream
+                    stream.write(msg.encode('utf-8', errors='replace'))
+                    stream.write(b'\n')
+                    self.flush()
+                except Exception:
+                    self.handleError(record)
         
+        sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'replace')
+        console_handler = SafeStreamHandler(sys.stdout)
+    else:
+        console_handler = logging.StreamHandler()
+    
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(simple_formatter)
     
@@ -62,9 +71,5 @@ def setup_logger(name='BinanceBot'):
     
     # Prevent logs from being sent to root logger
     logger.propagate = False
-    
-    # Configure other loggers
-    logging.getLogger('telegram').setLevel(logging.WARNING)
-    logging.getLogger('httpx').setLevel(logging.WARNING)
     
     return logger
