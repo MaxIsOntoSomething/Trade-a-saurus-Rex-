@@ -42,6 +42,9 @@ class WebSocketManager:
         self.ping_timeout = 10
         self.ws = None
         self.keepalive_task = None
+        self.display_lock = asyncio.Lock()
+        self.last_display_update = 0
+        self.display_update_interval = 1  # Update display every second
 
     def add_callback(self, callback):
         """Add callback function to be called when price updates are received"""
@@ -141,57 +144,71 @@ class WebSocketManager:
                     'timestamp': datetime.now()
                 }
 
-                # Clear console for Windows
-                os.system('cls' if os.name == 'nt' else 'clear')
-                
-                # Print header
-                print(f"{Fore.CYAN}{'Symbol':<12} {'Price':<15} {'24h Change':<15}")
-                print("-" * 42)  # Reduced line length
+                # Update display only if enough time has passed
+                current_time = time.time()
+                if current_time - self.last_display_update >= self.display_update_interval:
+                    async with self.display_lock:
+                        self.last_display_update = current_time
+                        await self._update_price_display()
 
-                # Print all prices
-                for sym, data in sorted(self.last_prices.items()):
-                    color = Fore.GREEN if data['change'] >= 0 else Fore.RED
-                    arrow = "↑" if data['change'] >= 0 else "↓"
-                    print(f"{Fore.CYAN}{sym:<12} "
-                          f"{color}{data['price']:<15.8f} "
-                          f"{data['change']:+.2f}% {arrow}{Fore.RESET}")
-
-                # Add bottom separator and UTC clock
-                print("-" * 42)
-                print(f"{Fore.YELLOW}UTC: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}")
-
-                # Add reset countdown timers
-                print(f"{Fore.CYAN}Next Resets:")
-                now = datetime.now(timezone.utc)
-                
-                # Get next reset times from bot instance
-                resets = {}
-                if hasattr(self, 'bot') and self.bot:
-                    resets = self.bot.next_reset_times
-                else:
-                    # Fallback calculations if bot reference not available
-                    resets = {
-                        'daily': now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1),
-                        'weekly': (now + timedelta(days=(7 - now.weekday()))).replace(hour=0, minute=0, second=0, microsecond=0),
-                        'monthly': (now.replace(day=1) + timedelta(days=32)).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-                    }
-
-                # Show relevant countdowns
-                for timeframe, reset_time in sorted(resets.items()):
-                    if reset_time > now:
-                        time_left = reset_time - now
-                        hours = int(time_left.total_seconds() / 3600)
-                        minutes = int((time_left.total_seconds() % 3600) / 60)
-                        seconds = int(time_left.total_seconds() % 60)
-                        print(f"{Fore.YELLOW}{timeframe.capitalize()}: {hours:02d}h {minutes:02d}m {seconds:02d}s")
-
-                # Call all registered callbacks with just the price value
+                # Call callbacks without waiting for display
                 for callback in self.callbacks:
-                    await callback(symbol, float(price))  # Make sure we send just the price float
+                    asyncio.create_task(callback(symbol, float(price)))
 
         except Exception as e:
             self.logger.error(f"Error processing WebSocket message: {e}")
             print(f"{Fore.RED}Error processing WebSocket message: {e}")
+
+    async def _update_price_display(self):
+        """Update price display without blocking"""
+        try:
+            # Clear console
+            os.system('cls' if os.name == 'nt' else 'clear')
+            
+            # Print header
+            print(f"{Fore.CYAN}{'Symbol':<12} {'Price':<15} {'24h Change':<15}")
+            print("-" * 42)
+
+            # Print all prices
+            for sym, data in sorted(self.last_prices.items()):
+                color = Fore.GREEN if data['change'] >= 0 else Fore.RED
+                arrow = "↑" if data['change'] >= 0 else "↓"
+                print(f"{Fore.CYAN}{sym:<12} "
+                      f"{color}{data['price']:<15.8f} "
+                      f"{data['change']:+.2f}% {arrow}{Fore.RESET}")
+
+            # Add bottom separator and UTC clock
+            print("-" * 42)
+            print(f"{Fore.YELLOW}UTC: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}")
+
+            # Add countdown timers without blocking
+            await self._print_countdown_timers()
+
+        except Exception as e:
+            self.logger.error(f"Error updating price display: {e}")
+
+    async def _print_countdown_timers(self):
+        """Print countdown timers asynchronously"""
+        try:
+            print(f"{Fore.CYAN}Next Resets:")
+            now = datetime.now(timezone.utc)
+            
+            resets = {
+                'daily': now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1),
+                'weekly': (now + timedelta(days=(7 - now.weekday()))).replace(hour=0, minute=0, second=0, microsecond=0),
+                'monthly': (now.replace(day=1) + timedelta(days=32)).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            }
+
+            for timeframe, reset_time in sorted(resets.items()):
+                if reset_time > now:
+                    time_left = reset_time - now
+                    hours = int(time_left.total_seconds() / 3600)
+                    minutes = int((time_left.total_seconds() % 3600) / 60)
+                    seconds = int(time_left.total_seconds() % 60)
+                    print(f"{Fore.YELLOW}{timeframe.capitalize()}: {hours:02d}h {minutes:02d}m {seconds:02d}s")
+
+        except Exception as e:
+            self.logger.error(f"Error printing countdown timers: {e}")
 
     async def _handle_reconnection(self):
         """Handle WebSocket reconnection with exponential backoff"""
@@ -324,17 +341,26 @@ class WebSocketManager:
             try:
                 if time.time() - self.last_pong > self.websocket_timeout:
                     print(f"{Fore.YELLOW}Keepalive timeout detected, forcing reconnection...")
-                    if self.ws and self.ws.open:  # Check if ws exists and is open
-                        await self.ws.close(code=1012, reason="Keepalive timeout")
+                    if self.ws:  # Only check if ws exists
+                        try:
+                            await self.ws.close(code=1012, reason="Keepalive timeout")
+                        except:
+                            pass  # Ignore errors during close
                     break
                 
-                if self.ws and self.ws.open:  # Only send ping if connection is open
-                    await self.ws.ping()
+                if self.ws:  # Only attempt ping if ws exists
+                    try:
+                        await self.ws.ping()
+                    except:
+                        # If ping fails, force reconnect
+                        self.is_connected = False
+                        break
                 
                 await asyncio.sleep(self.ping_interval)
                 
             except Exception as e:
                 self.logger.error(f"Keepalive error: {e}")
+                self.is_connected = False  # Force reconnect on error
                 break
 
     async def _subscribe_to_streams(self):

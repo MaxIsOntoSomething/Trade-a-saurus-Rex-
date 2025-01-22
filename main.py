@@ -1107,28 +1107,23 @@ class BinanceBot:
     async def main_loop(self):
         """Main bot loop with improved shutdown handling"""
         try:
-            # Perform startup checks first
+            # Initialize Telegram first if enabled
+            if self.telegram_handler:
+                print(f"{Fore.CYAN}Initializing Telegram...")
+                telegram_success = await self.telegram_handler.initialize()
+                if not telegram_success:
+                    print(f"{Fore.YELLOW}Failed to initialize Telegram, continuing without it...")
+                    self.telegram_handler = None
+                else:
+                    print(f"{Fore.GREEN}Telegram bot initialized successfully")
+
+            # Perform startup checks
             if not await self.startup_checks():
                 raise Exception("Startup checks failed")
 
             # Initialize WebSocket manager
             self.ws_manager = WebSocketManager(self.client, self.valid_symbols, self.logger)
             self.ws_manager.add_callback(self.handle_price_update)
-            
-            # Initialize Telegram if enabled
-            if self.telegram_handler:
-                await self.telegram_handler.initialize()
-                
-                # Send startup notification
-                startup_msg = (
-                    "🚀 Bot Started Successfully!\n\n"
-                    f"Mode: {'Testnet' if self.client.API_URL == 'https://testnet.binance.vision/api' else 'Live'}\n"
-                    f"Trading Pairs: {len(self.valid_symbols)}\n"
-                    f"Order Type: {self.order_type.capitalize()}\n"
-                    f"USDT Reserve: {self.reserve_balance_usdt}\n"
-                    "Use /start to see available commands"
-                )
-                await self.telegram_handler.send_message(startup_msg)
 
             print(f"{Fore.GREEN}Starting WebSocket connection...")
             await self.ws_manager.start()
@@ -1137,7 +1132,6 @@ class BinanceBot:
                 try:
                     # Check for resets
                     await self.check_and_handle_resets()
-                    
                     await asyncio.sleep(1)
                 except asyncio.CancelledError:
                     self.logger.info("Main loop cancelled, shutting down...")
@@ -1152,16 +1146,32 @@ class BinanceBot:
         finally:
             # Proper cleanup sequence
             if self.ws_manager:
-                try:
-                    await self.ws_manager.stop()
-                except Exception as e:
-                    self.logger.error(f"Error stopping WebSocket manager: {e}")
-
+                await self.ws_manager.stop()
             if self.telegram_handler:
-                try:
-                    await self.telegram_handler.shutdown()
-                except Exception as e:
-                    self.logger.error(f"Error shutting down Telegram: {e}")
+                await self.telegram_handler.shutdown()
+
+    def run(self):
+        """Run the bot with improved error handling"""
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            try:
+                loop.run_until_complete(self.main_loop())
+            except KeyboardInterrupt:
+                print(f"{Fore.YELLOW}\nShutdown requested by user...")
+            except Exception as e:
+                print(f"{Fore.RED}\nError in main loop: {str(e)}")
+                self.logger.error(f"Error in main loop: {str(e)}")
+            finally:
+                # Ensure proper cleanup
+                if self.telegram_handler:
+                    loop.run_until_complete(self.telegram_handler.shutdown())
+                loop.close()
+                
+        except Exception as e:
+            print(f"{Fore.RED}Fatal error: {str(e)}")
+            self.logger.error(f"Fatal error: {str(e)}")
 
     async def handle_price_update(self, symbol, price):
         """Handle real-time price updates"""
@@ -1191,81 +1201,6 @@ class BinanceBot:
         except Exception as e:
             self.logger.error(f"Error handling price update for {symbol}: {e}")
             print(f"{Fore.RED}Error handling price update for {symbol}: {e}")
-
-    def run(self):
-        """Run the bot with improved error handling"""
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-            if self.telegram_handler:
-                # Initialize Telegram with proper error handling
-                telegram_success = loop.run_until_complete(self.telegram_handler.initialize())
-                if not telegram_success:
-                    print(f"{Fore.YELLOW}Continuing without Telegram support...")
-                    self.telegram_handler = None
-            
-            loop.run_until_complete(self.main_loop())
-            
-        except Exception as e:
-            print(f"\nError in main loop: {str(e)}")
-            self.logger.error(f"Error in main loop: {str(e)}")
-        finally:
-            if self.telegram_handler:
-                loop.run_until_complete(self.telegram_handler.shutdown())
-            loop.close()
-
-    def __del__(self):
-        """Cleanup when bot is destroyed"""
-        try:
-            if hasattr(self, 'trades') and hasattr(self, 'file_handler'):
-                asyncio.run(self.save_trades())
-        except Exception as e:
-            print(f"Error during cleanup: {e}")
-
-    async def get_symbol_stats(self, symbol):
-        """Get trading statistics for a specific symbol"""
-        try:
-            if symbol not in self.trades:
-                return None
-
-            total_quantity = 0
-            total_cost = 0
-            current_price = await self.get_cached_price(symbol)
-
-            # Calculate totals from all trades for this symbol
-            symbol_trades = {k: v for k, v in self.trades.items() if v['symbol'] == symbol}
-            
-            for trade in symbol_trades.values():
-                total_quantity += trade['quantity']
-                total_cost += trade['total_cost']
-
-            # Calculate averages and profits
-            avg_price = total_cost / total_quantity if total_quantity > 0 else 0
-            current_value = total_quantity * current_price
-            gross_profit = current_value - total_cost
-            tax_amount = abs(gross_profit) * self.tax_rate if gross_profit > 0 else 0
-            net_profit = gross_profit - tax_amount if gross_profit > 0 else gross_profit
-
-            return {
-                'symbol': symbol,
-                'total_quantity': total_quantity,
-                'total_cost': total_cost,
-                'average_price': avg_price,
-                'current_price': current_price,
-                'current_value': current_value,
-                'gross_profit_usdt': gross_profit,
-                'gross_profit_percentage': (gross_profit / total_cost * 100) if total_cost > 0 else 0,
-                'tax_amount': tax_amount,
-                'net_profit_usdt': net_profit,
-                'net_profit_percentage': (net_profit / total_cost * 100) if total_cost > 0 else 0,
-                'number_of_trades': len(symbol_trades),
-                'last_update': datetime.now(timezone.utc).isoformat()
-            }
-
-        except Exception as e:
-            self.logger.error(f"Error calculating symbol stats: {e}")
-            return None
 
     async def startup_checks(self):
         """Perform startup checks and verifications"""
