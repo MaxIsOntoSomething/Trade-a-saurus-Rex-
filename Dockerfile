@@ -35,21 +35,24 @@ ARG GID
 # Set working directory
 WORKDIR /app
 
-# Create non-root user
+# Create non-root user and required directories
 RUN groupadd -g $GID $APP_USER && \
     useradd -m -u $UID -g $GID -s /bin/bash $APP_USER && \
     mkdir -p data/backups logs config && \
-    chown -R $APP_USER:$APP_USER /app
+    chown -R $APP_USER:$APP_USER /app && \
+    chmod -R u+rwx /app/logs && \
+    chmod -R u+rwx /app/data
 
 # Copy Python packages from builder
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 
-# Copy application files
+# Copy application files with correct ownership
 COPY --chown=$APP_USER:$APP_USER . .
 
-# Set permissions
-RUN chmod -R 750 /app && \
-    chmod -R 770 /app/data /app/logs
+# Set proper permissions
+RUN chmod -R u=rwX,g=rX,o= /app && \
+    chmod -R u=rwX,g=rwX,o= /app/data /app/logs && \
+    chown -R $APP_USER:$APP_USER /app/logs /app/data
 
 # Switch to non-root user
 USER $APP_USER
