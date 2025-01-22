@@ -21,7 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # Install Python dependencies
-COPY requirements.txt .
+COPY requirements.txt . 
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Final stage
@@ -41,7 +41,9 @@ RUN groupadd -g $GID $APP_USER && \
     mkdir -p data/backups logs config && \
     chown -R $APP_USER:$APP_USER /app && \
     chmod -R u+rwx /app/logs && \
-    chmod -R u+rwx /app/data
+    chmod -R u+rwx /app/data && \
+    chmod -R 770 /app/logs /app/data && \
+    chmod -R 750 /app/config
 
 # Copy Python packages from builder
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
@@ -49,13 +51,14 @@ COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/pytho
 # Copy application files with correct ownership
 COPY --chown=$APP_USER:$APP_USER . .
 
-# Set proper permissions
-RUN chmod -R u=rwX,g=rX,o= /app && \
-    chmod -R u=rwX,g=rwX,o= /app/data /app/logs && \
-    chown -R $APP_USER:$APP_USER /app/logs /app/data
+# Set proper permissions before switching user
+RUN chown -R $APP_USER:$APP_USER /app && \
+    find /app/logs /app/data -type d -exec chmod 770 {} \; && \
+    find /app/logs /app/data -type f -exec chmod 660 {} \; && \
+    chmod -R u+rwx /app/logs /app/data
 
 # Switch to non-root user
-USER $APP_USER
+USER $APP_USER:$APP_USER
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \

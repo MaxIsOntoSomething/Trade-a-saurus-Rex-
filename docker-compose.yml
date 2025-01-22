@@ -10,11 +10,22 @@ services:
         UID: ${UID:-1000}
         GID: ${GID:-1000}
     container_name: binance-bot
-    user: "${UID:-1000}:${GID:-1000}"
+    user: "1000:1000"  # Explicitly set user:group
     volumes:
-      - ./data:/app/data:rw
-      - ./logs:/app/logs:rw
-      - ./config:/app/config:ro
+      - type: bind
+        source: ./data
+        target: /app/data
+        bind:
+          create_host_path: true
+      - type: bind
+        source: ./logs
+        target: /app/logs
+        bind:
+          create_host_path: true
+      - type: bind
+        source: ./config
+        target: /app/config
+        read_only: true
     environment:
       - TZ=${TZ:-UTC}
       - UMASK=${UMASK:-0027}
