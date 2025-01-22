@@ -78,6 +78,9 @@ class ConfigHandler:
     @staticmethod
     def _load_from_env() -> Dict[str, Any]:
         """Load configuration from environment variables"""
+        # Convert string to list for trading symbols
+        trading_symbols = [s.strip() for s in os.getenv('TRADING_SYMBOLS', '').split(',') if s.strip()]
+        
         config = {
             'BINANCE_API_KEY': os.getenv('BINANCE_API_KEY'),
             'BINANCE_API_SECRET': os.getenv('BINANCE_API_SECRET'),
@@ -85,17 +88,16 @@ class ConfigHandler:
             'TESTNET_API_SECRET': os.getenv('TESTNET_API_SECRET'),
             'TELEGRAM_TOKEN': os.getenv('TELEGRAM_TOKEN'),
             'TELEGRAM_CHAT_ID': os.getenv('TELEGRAM_CHAT_ID'),
-            'TRADING_SYMBOLS': os.getenv('TRADING_SYMBOLS', '').split(','),
+            'TRADING_SYMBOLS': trading_symbols,
             'USE_TESTNET': os.getenv('USE_TESTNET', 'true').lower() == 'true',
             'USE_TELEGRAM': os.getenv('USE_TELEGRAM', 'true').lower() == 'true',
             'ORDER_TYPE': os.getenv('ORDER_TYPE', 'limit'),
             'USE_PERCENTAGE': os.getenv('USE_PERCENTAGE', 'false').lower() == 'true',
             'TRADE_AMOUNT': float(os.getenv('TRADE_AMOUNT', '10')),
             'RESERVE_BALANCE': float(os.getenv('RESERVE_BALANCE', '2000')),
-            'TIME_INTERVAL': os.getenv('TIME_INTERVAL', '1d'),  # Added default time interval
         }
 
-        # Parse timeframe configurations
+        # Parse timeframe configurations from environment
         config['TIMEFRAMES'] = ConfigHandler._parse_timeframe_config()
         
         return config

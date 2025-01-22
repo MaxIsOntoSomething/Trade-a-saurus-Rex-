@@ -1477,142 +1477,170 @@ class BinanceBot:
 
 if __name__ == "__main__":
     try:
-        # 1. First ask about network
-        while True:
-            testnet_input = input("Do you want to use the testnet? (yes/no): ").strip().lower()
-            if testnet_input in ['yes', 'no']:
-                use_testnet = testnet_input == 'yes'
-                break
-            print("Invalid input. Please enter 'yes' or 'no'.")
+        # Check if running in Docker
+        IN_DOCKER = os.environ.get('DOCKER', '').lower() == 'true'
 
-        # 2. Then about Telegram - Add validation
-        while True:
-            telegram_input = input("Do you want to use Telegram notifications? (yes/no): ").strip().lower()
-            if telegram_input in ['yes', 'no']:
-                use_telegram = telegram_input == 'yes'
-                if use_telegram:
-                    if not USE_TELEGRAM:
-                        print(f"{Fore.YELLOW}Telegram will be disabled due to invalid configuration.")
-                        print(f"{Fore.YELLOW}Please check your config.json contains:")
-                        print('  "TELEGRAM_TOKEN": "YOUR_BOT_TOKEN",')
-                        print('  "TELEGRAM_CHAT_ID": "YOUR_CHAT_ID"')
-                        print("\nTo get these values:")
-                        print("1. Token: Talk to @BotFather on Telegram")
-                        print("2. Chat ID: Talk to @userinfobot on Telegram")
-                        use_telegram = False
-                    else:
-                        print(f"{Fore.GREEN}Telegram is properly configured and will be enabled.")
-                break
-            print("Invalid input. Please enter 'yes' or 'no'.")
+        if IN_DOCKER:
+            # Use environment variables when in Docker
+            config = ConfigHandler.load_config(use_env=True)
+            use_testnet = config['USE_TESTNET']
+            use_telegram = config['USE_TELEGRAM']
+            order_type = config['ORDER_TYPE']
+            use_percentage = config['USE_PERCENTAGE']
+            trade_amount = config['TRADE_AMOUNT']
+            reserve_balance_usdt = config['RESERVE_BALANCE']
+            timeframe_config = config['TIMEFRAMES']
 
-        # 3. Then order type
-        while True:
-            order_type = input("Do you want to use limit orders or market orders? (limit/market): ").strip().lower()
-            if order_type in ['limit', 'market']:
-                break
-            print("Invalid input. Please enter 'limit' or 'market'.")
-
-        # 4. Trade amount type
-        while True:
-            percentage_input = input("Do you want to use a percentage of USDT per trade? (yes/no): ").strip().lower()
-            if percentage_input in ['yes', 'no']:
-                use_percentage = percentage_input == 'yes'
-                break
-            print("Invalid input. Please enter 'yes' or 'no'.")
-
-        # 5. Trade amount value
-        while True:
-            try:
-                if use_percentage:
-                    trade_amount = float(input("Enter the percentage of USDT to use per trade (e.g., 10 for 10%): ").strip()) / 100
-                    if 0 < trade_amount <= 1:
-                        break
-                    print("Percentage must be between 0 and 100.")
-                else:
-                    trade_amount = float(input("Enter the amount of USDT to use per trade: ").strip())
-                    if trade_amount > 0:
-                        break
-                    print("Amount must be greater than 0.")
-            except ValueError:
-                print("Please enter a valid number.")
-
-        # 6. USDT reserve
-        while True:
-            try:
-                reserve_balance_usdt = float(input("Enter the USDT reserve balance (minimum USDT to keep): ").strip())
-                if reserve_balance_usdt >= 0:
-                    print(f"USDT Reserve set to: {reserve_balance_usdt} USDT")
-                    break
-                print("Reserve balance must be non-negative.")
-            except ValueError:
-                print("Please enter a valid number.")
-
-        # 7. Finally timeframe configuration
-        timeframe_config = {}
-        timeframes = ['daily', 'weekly', 'monthly']
-        
-        for timeframe in timeframes:
-            print(f"\n{Fore.CYAN}Configure {timeframe.capitalize()} Settings:")
-            print(f"{Fore.YELLOW}Note: Thresholds must be entered in ascending order (e.g., 1%, 2%, 3%)")
-            while True:
-                enabled_input = input(f"Enable {timeframe} trading? (yes/no): ").strip().lower()
-                if enabled_input in ['yes', 'no']:
-                    enabled = enabled_input == 'yes'
-                    break
-                print("Invalid input. Please enter 'yes' or 'no'.")
-            
-            if enabled:
-                while True:
-                    try:
-                        num_thresholds = int(input(f"Enter the number of {timeframe} drop thresholds: ").strip())
-                        if 0 < num_thresholds <= 10:
-                            break
-                        print("Please enter a number between 1 and 10.")
-                    except ValueError:
-                        print("Please enter a valid number.")
-
-                thresholds = []
-                last_threshold = 0  # Keep track of last threshold
-                for i in range(num_thresholds):
-                    while True:
-                        try:
-                            threshold_input = float(input(f"Enter {timeframe} drop threshold {i+1} percentage (must be > {last_threshold:.1f}%): ").strip())
-                            threshold = threshold_input / 100
-                            
-                            # Compare the input values directly, not the converted ones
-                            if threshold_input <= last_threshold:
-                                print(f"Threshold must be higher than {last_threshold:.1f}%")
-                                continue
-                                
-                            if 0 < threshold_input <= 100:
-                                thresholds.append(threshold)
-                                last_threshold = threshold_input  # Store the input percentage, not the converted value
-                                break
-                                
-                            print("Threshold must be between 0 and 100 percent.")
-                        except ValueError:
-                            print("Please enter a valid number.")
-                
-                timeframe_config[timeframe] = {
-                    'enabled': enabled,
-                    'thresholds': thresholds,
-                    'orders_placed': {}
-                }
-            else:
-                timeframe_config[timeframe] = {
-                    'enabled': False,
-                    'thresholds': [],
-                    'orders_placed': {}
-                }
-
-        # Initialize and run bot with error handling
-        try:
-            bot = BinanceBot(use_testnet, use_telegram, timeframe_config, order_type, use_percentage, trade_amount, reserve_balance_usdt)
+            # Initialize and run bot
+            bot = BinanceBot(
+                use_testnet=use_testnet,
+                use_telegram=use_telegram,
+                timeframe_config=timeframe_config,
+                order_type=order_type,
+                use_percentage=use_percentage,
+                trade_amount=trade_amount,
+                reserve_balance_usdt=reserve_balance_usdt
+            )
             bot.test_connection()
             bot.run()
-        except Exception as e:
-            print(f"Error initializing bot: {str(e)}")
-            logging.error(f"Error initializing bot: {str(e)}")
+        else:
+            # Original interactive code for local development
+            # 1. First ask about network
+            while True:
+                testnet_input = input("Do you want to use the testnet? (yes/no): ").strip().lower()
+                if testnet_input in ['yes', 'no']:
+                    use_testnet = testnet_input == 'yes'
+                    break
+                print("Invalid input. Please enter 'yes' or 'no'.")
+
+            # 2. Then about Telegram - Add validation
+            while True:
+                telegram_input = input("Do you want to use Telegram notifications? (yes/no): ").strip().lower()
+                if telegram_input in ['yes', 'no']:
+                    use_telegram = telegram_input == 'yes'
+                    if use_telegram:
+                        if not USE_TELEGRAM:
+                            print(f"{Fore.YELLOW}Telegram will be disabled due to invalid configuration.")
+                            print(f"{Fore.YELLOW}Please check your config.json contains:")
+                            print('  "TELEGRAM_TOKEN": "YOUR_BOT_TOKEN",')
+                            print('  "TELEGRAM_CHAT_ID": "YOUR_CHAT_ID"')
+                            print("\nTo get these values:")
+                            print("1. Token: Talk to @BotFather on Telegram")
+                            print("2. Chat ID: Talk to @userinfobot on Telegram")
+                            use_telegram = False
+                        else:
+                            print(f"{Fore.GREEN}Telegram is properly configured and will be enabled.")
+                    break
+                print("Invalid input. Please enter 'yes' or 'no'.")
+
+            # 3. Then order type
+            while True:
+                order_type = input("Do you want to use limit orders or market orders? (limit/market): ").strip().lower()
+                if order_type in ['limit', 'market']:
+                    break
+                print("Invalid input. Please enter 'limit' or 'market'.")
+
+            # 4. Trade amount type
+            while True:
+                percentage_input = input("Do you want to use a percentage of USDT per trade? (yes/no): ").strip().lower()
+                if percentage_input in ['yes', 'no']:
+                    use_percentage = percentage_input == 'yes'
+                    break
+                print("Invalid input. Please enter 'yes' or 'no'.")
+
+            # 5. Trade amount value
+            while True:
+                try:
+                    if use_percentage:
+                        trade_amount = float(input("Enter the percentage of USDT to use per trade (e.g., 10 for 10%): ").strip()) / 100
+                        if 0 < trade_amount <= 1:
+                            break
+                        print("Percentage must be between 0 and 100.")
+                    else:
+                        trade_amount = float(input("Enter the amount of USDT to use per trade: ").strip())
+                        if trade_amount > 0:
+                            break
+                        print("Amount must be greater than 0.")
+                except ValueError:
+                    print("Please enter a valid number.")
+
+            # 6. USDT reserve
+            while True:
+                try:
+                    reserve_balance_usdt = float(input("Enter the USDT reserve balance (minimum USDT to keep): ").strip())
+                    if reserve_balance_usdt >= 0:
+                        print(f"USDT Reserve set to: {reserve_balance_usdt} USDT")
+                        break
+                    print("Reserve balance must be non-negative.")
+                except ValueError:
+                    print("Please enter a valid number.")
+
+            # 7. Finally timeframe configuration
+            timeframe_config = {}
+            timeframes = ['daily', 'weekly', 'monthly']
+            
+            for timeframe in timeframes:
+                print(f"\n{Fore.CYAN}Configure {timeframe.capitalize()} Settings:")
+                print(f"{Fore.YELLOW}Note: Thresholds must be entered in ascending order (e.g., 1%, 2%, 3%)")
+                while True:
+                    enabled_input = input(f"Enable {timeframe} trading? (yes/no): ").strip().lower()
+                    if enabled_input in ['yes', 'no']:
+                        enabled = enabled_input == 'yes'
+                        break
+                    print("Invalid input. Please enter 'yes' or 'no'.")
+                
+                if enabled:
+                    while True:
+                        try:
+                            num_thresholds = int(input(f"Enter the number of {timeframe} drop thresholds: ").strip())
+                            if 0 < num_thresholds <= 10:
+                                break
+                            print("Please enter a number between 1 and 10.")
+                        except ValueError:
+                            print("Please enter a valid number.")
+
+                    thresholds = []
+                    last_threshold = 0  # Keep track of last threshold
+                    for i in range(num_thresholds):
+                        while True:
+                            try:
+                                threshold_input = float(input(f"Enter {timeframe} drop threshold {i+1} percentage (must be > {last_threshold:.1f}%): ").strip())
+                                threshold = threshold_input / 100
+                                
+                                # Compare the input values directly, not the converted ones
+                                if threshold_input <= last_threshold:
+                                    print(f"Threshold must be higher than {last_threshold:.1f}%")
+                                    continue
+                                    
+                                if 0 < threshold_input <= 100:
+                                    thresholds.append(threshold)
+                                    last_threshold = threshold_input  # Store the input percentage, not the converted value
+                                    break
+                                    
+                                print("Threshold must be between 0 and 100 percent.")
+                            except ValueError:
+                                print("Please enter a valid number.")
+                    
+                    timeframe_config[timeframe] = {
+                        'enabled': enabled,
+                        'thresholds': thresholds,
+                        'orders_placed': {}
+                    }
+                else:
+                    timeframe_config[timeframe] = {
+                        'enabled': False,
+                        'thresholds': [],
+                        'orders_placed': {}
+                    }
+
+            # Initialize and run bot with error handling
+            try:
+                bot = BinanceBot(use_testnet, use_telegram, timeframe_config, order_type, use_percentage, trade_amount, reserve_balance_usdt)
+                bot.test_connection()
+                bot.run()
+            except Exception as e:
+                print(f"Error initializing bot: {str(e)}")
+                logging.error(f"Error initializing bot: {str(e)}")
 
     except KeyboardInterrupt:
         print("\nBot shutdown requested by user.")
