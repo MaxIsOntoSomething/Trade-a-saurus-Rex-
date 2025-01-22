@@ -45,9 +45,16 @@ class ConfigHandler:
             if ConfigHandler._config_validated and ConfigHandler._config_cache:
                 return ConfigHandler._config_cache
 
-            if use_env and os.path.exists('.env'):
+            # Always check for DOCKER env variable first
+            is_docker = os.environ.get('DOCKER', '').lower() == 'true'
+            
+            # Force use_env if running in Docker
+            if is_docker:
+                use_env = True
+
+            if use_env:
                 config = ConfigHandler._load_from_env()
-                print("Using Docker configuration from .env")
+                print("Using configuration from environment variables")
             else:
                 config_path = Path('config/config.json')
                 if config_path.exists():
@@ -78,29 +85,40 @@ class ConfigHandler:
     @staticmethod
     def _load_from_env() -> Dict[str, Any]:
         """Load configuration from environment variables"""
-        # Convert string to list for trading symbols
-        trading_symbols = [s.strip() for s in os.getenv('TRADING_SYMBOLS', '').split(',') if s.strip()]
-        
-        config = {
-            'BINANCE_API_KEY': os.getenv('BINANCE_API_KEY'),
-            'BINANCE_API_SECRET': os.getenv('BINANCE_API_SECRET'),
-            'TESTNET_API_KEY': os.getenv('TESTNET_API_KEY'),
-            'TESTNET_API_SECRET': os.getenv('TESTNET_API_SECRET'),
-            'TELEGRAM_TOKEN': os.getenv('TELEGRAM_TOKEN'),
-            'TELEGRAM_CHAT_ID': os.getenv('TELEGRAM_CHAT_ID'),
-            'TRADING_SYMBOLS': trading_symbols,
-            'USE_TESTNET': os.getenv('USE_TESTNET', 'true').lower() == 'true',
-            'USE_TELEGRAM': os.getenv('USE_TELEGRAM', 'true').lower() == 'true',
-            'ORDER_TYPE': os.getenv('ORDER_TYPE', 'limit'),
-            'USE_PERCENTAGE': os.getenv('USE_PERCENTAGE', 'false').lower() == 'true',
-            'TRADE_AMOUNT': float(os.getenv('TRADE_AMOUNT', '10')),
-            'RESERVE_BALANCE': float(os.getenv('RESERVE_BALANCE', '2000')),
-        }
+        try:
+            # Convert string to list for trading symbols
+            trading_symbols = [s.strip() for s in os.getenv('TRADING_SYMBOLS', '').split(',') if s.strip()]
+            
+            config = {
+                'BINANCE_API_KEY': os.getenv('BINANCE_API_KEY'),
+                'BINANCE_API_SECRET': os.getenv('BINANCE_API_SECRET'),
+                'TESTNET_API_KEY': os.getenv('TESTNET_API_KEY'),
+                'TESTNET_API_SECRET': os.getenv('TESTNET_API_SECRET'),
+                'TELEGRAM_TOKEN': os.getenv('TELEGRAM_TOKEN'),
+                'TELEGRAM_CHAT_ID': os.getenv('TELEGRAM_CHAT_ID'),
+                'TRADING_SYMBOLS': trading_symbols,
+                'USE_TESTNET': os.getenv('USE_TESTNET', 'true').lower() == 'true',
+                'USE_TELEGRAM': os.getenv('USE_TELEGRAM', 'true').lower() == 'true',
+                'ORDER_TYPE': os.getenv('ORDER_TYPE', 'limit'),
+                'USE_PERCENTAGE': os.getenv('USE_PERCENTAGE', 'false').lower() == 'true',
+                'TRADE_AMOUNT': float(os.getenv('TRADE_AMOUNT', '10')),
+                'RESERVE_BALANCE': float(os.getenv('RESERVE_BALANCE', '2000')),
+            }
 
-        # Parse timeframe configurations from environment
-        config['TIMEFRAMES'] = ConfigHandler._parse_timeframe_config()
-        
-        return config
+            # Parse timeframe configurations from environment
+            timeframes = ConfigHandler._parse_timeframe_config()
+            config['TIMEFRAMES'] = timeframes
+            config['timeframe_config'] = timeframes  # Add both keys for compatibility
+            
+            return config
+            
+        except Exception as e:
+            print(f"Error loading environment configuration: {e}")
+            print("Environment variables available:")
+            for key, value in os.environ.items():
+                if not any(secret in key.lower() for secret in ['key', 'secret', 'token']):
+                    print(f"{key}: {value}")
+            raise
 
     @staticmethod
     def _parse_timeframe_config() -> Dict[str, Dict]:
