@@ -50,24 +50,27 @@ class ConfigHandler:
                 config_path = Path('config/config.json')
                 if config_path.exists():
                     with open(config_path) as f:
-            if config_path.exists():
-                with open(config_path) as f:
-                    config = json.load(f)
-                print("Using configuration from config.json")
+                        config = json.load(f)
+                    print("Using configuration from config.json")
+                    
+                    if isinstance(config.get('TRADING_SYMBOLS'), list):
+                        config['TRADING_SYMBOLS'] = [str(symbol) for symbol in config['TRADING_SYMBOLS']]
+                    
+                    if 'TIMEFRAMES' in config:
+                        config['timeframe_config'] = config['TIMEFRAMES']
+                else:
+                    raise FileNotFoundError("config.json not found")
+
+            # Only validate once
+            if not ConfigHandler._config_validated:
+                ConfigHandler.validate_config(config)
+                ConfigHandler._config_validated = True
                 
-                # Convert TRADING_SYMBOLS from list to required format if needed
-                if isinstance(config.get('TRADING_SYMBOLS'), list):
-                    config['TRADING_SYMBOLS'] = [str(symbol) for symbol in config['TRADING_SYMBOLS']]
-                
-                # Ensure timeframe configuration exists
-                if 'TIMEFRAMES' in config:
-                    config['timeframe_config'] = config['TIMEFRAMES']
-            else:
-                raise FileNotFoundError("config.json not found")
-        
-        # Validate the configuration
-        ConfigHandler.validate_config(config)
-        return config
+            return config
+            
+        except Exception as e:
+            print(f"Error loading configuration: {e}")
+            raise
 
     @staticmethod
     def _load_from_env() -> Dict[str, Any]:

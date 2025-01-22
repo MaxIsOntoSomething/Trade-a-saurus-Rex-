@@ -56,7 +56,7 @@ class BinanceBot:
     balance_pause_reason = None  # New variable to track why trading is paused
 
     def __init__(self, use_testnet, use_telegram, timeframe_config, order_type, use_percentage, trade_amount, reserve_balance_usdt):
-        # First load proper configuration
+        # Load configuration only once
         self.config = ConfigHandler.load_config(use_env=IN_DOCKER)
         
         # Use config values if not running from CLI
@@ -68,6 +68,15 @@ class BinanceBot:
             use_percentage = self.config.get('USE_PERCENTAGE', False)
             trade_amount = self.config.get('TRADE_AMOUNT', 10)
             reserve_balance_usdt = self.config.get('RESERVE_BALANCE', 2000)
+
+        # Initialize Telegram handler first if enabled
+        self.telegram_handler = None
+        if use_telegram and self.config['USE_TELEGRAM']:
+            self.telegram_handler = TelegramHandler(
+                self.config['TELEGRAM_TOKEN'],
+                self.config['TELEGRAM_CHAT_ID'],
+                self
+            )
 
         # Add timestamp sync
         self.recv_window = 60000
@@ -106,11 +115,6 @@ class BinanceBot:
         from utils.graph_generator import GraphGenerator
         self.graph_generator = GraphGenerator()
 
-        # Replace Telegram initialization with new handler
-        self.telegram_handler = None
-        if use_telegram:
-            self.telegram_handler = TelegramHandler(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, self)
-        
         self.last_order_time = {}
         self.orders_placed_today = {}
         self.total_bought = {}
@@ -1108,14 +1112,12 @@ class BinanceBot:
         """Main bot loop with improved shutdown handling"""
         try:
             # Initialize Telegram first if enabled
-            if self.telegram_handler:
+            if self.telegram_handler and not self.telegram_handler.initialized:
                 print(f"{Fore.CYAN}Initializing Telegram...")
                 telegram_success = await self.telegram_handler.initialize()
                 if not telegram_success:
                     print(f"{Fore.YELLOW}Failed to initialize Telegram, continuing without it...")
                     self.telegram_handler = None
-                else:
-                    print(f"{Fore.GREEN}Telegram bot initialized successfully")
 
             # Perform startup checks
             if not await self.startup_checks():
