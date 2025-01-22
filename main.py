@@ -30,7 +30,8 @@ init(autoreset=True)
 # Check if running in Docker
 IN_DOCKER = os.environ.get('DOCKER', '').lower() == 'true'
 
-# Load configuration based on environment
+# Initialize configuration handling
+ConfigHandler.reset_cache()  # Reset any previous cache
 config = ConfigHandler.load_config(use_env=IN_DOCKER)
 
 # Initialize mandatory settings
@@ -56,8 +57,8 @@ class BinanceBot:
     balance_pause_reason = None  # New variable to track why trading is paused
 
     def __init__(self, use_testnet, use_telegram, timeframe_config, order_type, use_percentage, trade_amount, reserve_balance_usdt):
-        # Load configuration only once
-        self.config = ConfigHandler.load_config(use_env=IN_DOCKER)
+        # Get configuration from cache or load new
+        self.config = ConfigHandler.get_config()
         
         # Use config values if not running from CLI
         if IN_DOCKER or not any([timeframe_config, order_type, use_percentage, trade_amount, reserve_balance_usdt]):

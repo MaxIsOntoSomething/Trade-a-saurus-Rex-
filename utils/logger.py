@@ -1,15 +1,15 @@
 import logging
 from datetime import datetime
+import sys
 import os
-from logging.handlers import RotatingFileHandler
 
-def setup_logger(name='BinanceBot'):
+def setup_logger():
     """Setup logger with enhanced configuration"""
     # Create logs directory if it doesn't exist
     os.makedirs('logs', exist_ok=True)
 
     # Create logger
-    logger = logging.getLogger(name)
+    logger = logging.getLogger('BinanceBot')
     logger.setLevel(logging.DEBUG)
 
     # Create formatters
@@ -23,26 +23,27 @@ def setup_logger(name='BinanceBot'):
         datefmt='%Y-%m-%d %H:%M:%S'
     )
 
-    # Create rotating file handler for detailed debug logs
-    debug_handler = RotatingFileHandler(
+    # Create rotating file handler with UTF-8 encoding
+    debug_handler = logging.FileHandler(
         f'logs/debug_{datetime.now().strftime("%Y%m%d")}.log',
-        maxBytes=10*1024*1024,  # 10MB
-        backupCount=5
+        encoding='utf-8'  # Add UTF-8 encoding
     )
     debug_handler.setLevel(logging.DEBUG)
     debug_handler.setFormatter(detailed_formatter)
 
-    # Create rotating file handler for regular logs
-    file_handler = RotatingFileHandler(
+    # Create file handler with UTF-8 encoding
+    file_handler = logging.FileHandler(
         f'logs/trades_{datetime.now().strftime("%Y%m%d")}.log',
-        maxBytes=5*1024*1024,  # 5MB
-        backupCount=3
+        encoding='utf-8'  # Add UTF-8 encoding
     )
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(simple_formatter)
 
-    # Create console handler
-    console_handler = logging.StreamHandler()
+    # Create UTF-8 console handler
+    if sys.stdout.encoding != 'utf-8':
+        console_handler = logging.StreamHandler(stream=open(sys.stdout.fileno(), mode='w', encoding='utf-8', buffering=1))
+    else:
+        console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(simple_formatter)
 

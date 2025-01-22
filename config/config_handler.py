@@ -5,8 +5,9 @@ from typing import Dict, Any
 import re
 
 class ConfigHandler:
-    _config_validated = False  # Add class variable to track validation state
-    
+    _config_cache = None  # Add cache for config
+    _config_validated = False
+
     @staticmethod
     def is_valid_token(token: str) -> bool:
         """Validate Telegram bot token format"""
@@ -40,9 +41,10 @@ class ConfigHandler:
     def load_config(use_env: bool = False) -> Dict[str, Any]:
         """Load configuration based on environment"""
         try:
-            if ConfigHandler._config_validated:
-                return config  # Return cached config if already validated
-            
+            # Return cached config if already validated
+            if ConfigHandler._config_validated and ConfigHandler._config_cache:
+                return ConfigHandler._config_cache
+
             if use_env and os.path.exists('.env'):
                 config = ConfigHandler._load_from_env()
                 print("Using Docker configuration from .env")
@@ -61,11 +63,12 @@ class ConfigHandler:
                 else:
                     raise FileNotFoundError("config.json not found")
 
-            # Only validate once
+            # Validate and cache config
             if not ConfigHandler._config_validated:
                 ConfigHandler.validate_config(config)
                 ConfigHandler._config_validated = True
-                
+                ConfigHandler._config_cache = config
+
             return config
             
         except Exception as e:
@@ -141,3 +144,16 @@ class ConfigHandler:
     def get_logs_dir() -> Path:
         """Get platform-specific logs directory"""
         return Path('logs')
+
+    @staticmethod
+    def reset_cache():
+        """Reset the configuration cache"""
+        ConfigHandler._config_cache = None
+        ConfigHandler._config_validated = False
+
+    @staticmethod
+    def get_config():
+        """Get the current configuration"""
+        if not ConfigHandler._config_cache:
+            raise RuntimeError("Configuration not loaded. Call load_config() first.")
+        return ConfigHandler._config_cache
