@@ -29,11 +29,21 @@ class TelegramHandler:
         self.batch_size = 5  # Process messages in small batches
         self.batch_delay = 0.1  # Small delay between batches
 
-        self.command_queue = asyncio.PriorityQueue()
+        self.command_queue = asyncio.Queue()  # Changed from PriorityQueue to regular Queue
         self.command_workers = 3  # Number of workers processing commands
         self.initialized = False  # Add this flag
         self.message_processor_task = None
         self.command_workers = []  # Add this to track workers
+
+        self.logger = logging.getLogger('TelegramHandler')
+        self.logger.setLevel(logging.DEBUG)  # Set to DEBUG for more detailed logs
+        
+        # Add file handler for Telegram-specific logs
+        telegram_handler = logging.FileHandler('logs/telegram_bot.log')
+        telegram_handler.setFormatter(
+            logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        )
+        self.logger.addHandler(telegram_handler)
 
     async def send_startup_notification(self):
         """Send comprehensive startup notification"""
@@ -74,23 +84,29 @@ class TelegramHandler:
             self.logger.error(f"Error sending startup notification: {e}")
 
     async def initialize(self):
-        """Initialize Telegram bot with message processor"""
+        """Initialize Telegram bot with enhanced logging"""
         try:
             if self.initialized:
                 return True
 
-            # Create and initialize application
+            self.logger.info("Initializing Telegram bot...")
             self.app = Application.builder().token(self.token).build()
-            await self.app.initialize()
-
-            # Test connection synchronously first
-            test_response = await self.app.bot.get_me()
-            if not test_response:
-                self.logger.error("Failed to connect to Telegram")
+            
+            # Test connection
+            try:
+                await self.app.initialize()
+                test_response = await self.app.bot.get_me()
+                if test_response:
+                    self.logger.info(f"Connected to Telegram as {test_response.username}")
+                else:
+                    raise Exception("Failed to get bot information")
+            except Exception as e:
+                self.logger.error(f"Telegram connection test failed: {e}")
                 return False
 
-            # Register handlers BEFORE starting polling
+            # Register handlers
             self.register_handlers()
+            self.logger.info("Command handlers registered")
 
             # Start bot and polling
             await self.app.start()
@@ -98,19 +114,17 @@ class TelegramHandler:
                 allowed_updates=Update.ALL_TYPES,
                 drop_pending_updates=True
             )
-
-            # Send startup notification immediately
+            
+            # Send startup message
             startup_msg = self._get_startup_message()
             await self.send_message(startup_msg, priority=True)
             
             self.initialized = True
-            print(f"{Fore.GREEN}Telegram bot initialized successfully")
-            self.logger.info("Telegram bot initialized successfully")
+            self.logger.info("Telegram bot initialization complete")
             return True
 
         except Exception as e:
-            self.logger.error(f"Telegram initialization failed: {e}")
-            print(f"{Fore.RED}Telegram initialization failed: {e}")
+            self.logger.exception(f"Fatal error during Telegram initialization: {e}")
             return False
 
     async def _process_commands(self):
@@ -127,35 +141,46 @@ class TelegramHandler:
                 await asyncio.sleep(1)
 
     async def handle_command_wrapper(self, handler, update, context):
-        """Queue commands with high priority"""
-        command = update.message.text.split()[0][1:]
-        
-        if command in self.processing_commands:
-            await self.send_message("Command already processing, please wait...")
-            return
+        """Handle commands directly without prioritization"""
+        try:
+            command = update.message.text.split()[0][1:]
+            
+            if command in self.processing_commands:
+                await self.send_message("Command already processing, please wait...")
+                return
 
-        priority = 1  # High priority for commands
-        await self.command_queue.put((
-            priority,
-            lambda: self._execute_command(handler, update, context, command)
-        ))
+            self.logger.debug(f"Received command: {command}")
+            await self._execute_command(handler, update, context, command)
+            
+        except Exception as e:
+            self.logger.exception(f"Error in command wrapper: {e}")
+            await self.send_message("An error occurred processing your command. Please try again.")
 
     async def _execute_command(self, handler, update, context, command):
-        """Execute command with proper error handling"""
+        """Execute command with enhanced logging"""
         try:
             self.processing_commands.add(command)
+            self.logger.info(f"Executing command: {command}")
+            
             async with self.command_lock:
                 await self.app.bot.send_chat_action(
                     chat_id=update.effective_chat.id,
                     action="typing"
                 )
                 
-                await asyncio.wait_for(
-                    handler(update, context),
-                    timeout=self.command_timeout
-                )
+                # Execute command with timeout
+                try:
+                    await asyncio.wait_for(
+                        handler(update, context),
+                        timeout=self.command_timeout
+                    )
+                    self.logger.info(f"Command completed successfully: {command}")
+                except asyncio.TimeoutError:
+                    self.logger.error(f"Command timed out: {command}")
+                    await self.send_message(f"Command {command} timed out. Please try again.")
+                    
         except Exception as e:
-            self.logger.error(f"Error in command {command}: {e}")
+            self.logger.exception(f"Error executing command {command}: {e}")
             await self.send_message(
                 f"Error processing command {command}. Please try again."
             )
@@ -254,13 +279,14 @@ class TelegramHandler:
                 await asyncio.sleep(1)
 
     async def send_message(self, text, parse_mode=None, reply_markup=None, priority=False):
-        """Send message with improved error handling"""
+        """Send message with enhanced error handling and logging"""
         try:
             if not self.initialized:
                 self.logger.error("Attempting to send message before initialization")
                 return None
 
-            return await self.app.bot.send_message(
+            self.logger.debug(f"Sending message: {text[:100]}...")
+            response = await self.app.bot.send_message(
                 chat_id=self.chat_id,
                 text=text,
                 parse_mode=parse_mode,
@@ -270,9 +296,12 @@ class TelegramHandler:
                 connect_timeout=30,
                 pool_timeout=30
             )
+            self.logger.debug("Message sent successfully")
+            return response
+            
         except Exception as e:
-            self.logger.error(f"Error sending message: {e}")
-            # Only queue if sending failed
+            self.logger.exception(f"Error sending message: {e}")
+            # Only queue if direct send fails
             await self.queue_message(text, parse_mode, reply_markup, priority)
 
     async def _send_with_retry(self, text, parse_mode=None, reply_markup=None, max_retries=3):
@@ -781,34 +810,20 @@ class TelegramHandler:
             del self.trade_conv_state[chat_id]
 
     async def shutdown(self):
-        """Safely shutdown Telegram bot"""
+        """Safely shutdown Telegram bot with logging"""
         try:
-            # Cancel message processor and command workers
-            if self.message_processor_task:
-                self.message_processor_task.cancel()
+            self.logger.info("Initiating Telegram bot shutdown...")
             
-            for worker in self.command_workers:
-                worker.cancel()
-
-            # Cancel polling task
-            if hasattr(self, 'polling_task'):
-                self.polling_task.cancel()
-                try:
-                    await self.polling_task
-                except asyncio.CancelledError:
-                    pass
-
-            # Stop the application
             if self.initialized:
+                # Stop the application
                 await self.app.stop()
                 await self.app.shutdown()
-                
+                self.logger.info("Telegram bot stopped successfully")
+            
             self.initialized = False
-            print(f"{Fore.GREEN}Telegram bot stopped successfully")
             
         except Exception as e:
-            self.logger.error(f"Error during Telegram shutdown: {e}")
-            print(f"{Fore.YELLOW}Note: Error during Telegram shutdown: {e}")
+            self.logger.exception(f"Error during Telegram shutdown: {e}")
 
     def _get_startup_message(self):
         """Generate startup message"""

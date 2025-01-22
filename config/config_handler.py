@@ -5,6 +5,8 @@ from typing import Dict, Any
 import re
 
 class ConfigHandler:
+    _config_validated = False  # Add class variable to track validation state
+    
     @staticmethod
     def is_valid_token(token: str) -> bool:
         """Validate Telegram bot token format"""
@@ -17,39 +19,37 @@ class ConfigHandler:
     @staticmethod
     def validate_config(config: Dict[str, Any]) -> None:
         """Validate critical configuration settings"""
-        # First check if Telegram settings exist
         telegram_token = config.get('TELEGRAM_TOKEN', '')
         telegram_chat_id = config.get('TELEGRAM_CHAT_ID', '')
-
-        # Default to False if settings are invalid
+        
         telegram_enabled = False
         
-        # Only validate if both token and chat_id are present and not placeholder values
-        if (telegram_token and telegram_chat_id and 
-            telegram_token not in ['YOUR_TELEGRAM_BOT_TOKEN', 'your_telegram_token'] and
-            telegram_chat_id not in ['YOUR_TELEGRAM_CHAT_ID', 'your_chat_id']):
+        if telegram_token and telegram_chat_id and \
+           telegram_token not in ['YOUR_TELEGRAM_BOT_TOKEN', 'your_telegram_token'] and \
+           telegram_chat_id not in ['YOUR_TELEGRAM_CHAT_ID', 'your_chat_id']:
             
             if ConfigHandler.is_valid_token(telegram_token) and str(telegram_chat_id).lstrip('-').isdigit():
                 telegram_enabled = True
-                print(f"Telegram configuration validated successfully")
+                print("Telegram configuration validated successfully")
             else:
-                print(f"Warning: Invalid Telegram configuration")
-
-        # Set the final Telegram state
+                print("Warning: Invalid Telegram configuration")
+        
         config['USE_TELEGRAM'] = telegram_enabled
 
     @staticmethod
     def load_config(use_env: bool = False) -> Dict[str, Any]:
         """Load configuration based on environment"""
-        config = {}
-        
-        if use_env and os.path.exists('.env'):
-            # Docker environment - use .env
-            config = ConfigHandler._load_from_env()
-            print("Using Docker configuration from .env")
-        else:
-            # Manual run - use config.json
-            config_path = Path('config/config.json')
+        try:
+            if ConfigHandler._config_validated:
+                return config  # Return cached config if already validated
+            
+            if use_env and os.path.exists('.env'):
+                config = ConfigHandler._load_from_env()
+                print("Using Docker configuration from .env")
+            else:
+                config_path = Path('config/config.json')
+                if config_path.exists():
+                    with open(config_path) as f:
             if config_path.exists():
                 with open(config_path) as f:
                     config = json.load(f)
