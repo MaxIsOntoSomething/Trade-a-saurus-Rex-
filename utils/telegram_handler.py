@@ -66,6 +66,30 @@ class TelegramHandler:
         self.error_reset_time = time.time()
         self.error_reset_interval = 300  # 5 minutes
 
+        # Add timeout settings
+        self.connect_timeout = 30
+        self.read_timeout = 30
+        self.write_timeout = 30
+        self.pool_timeout = 30
+        self.command_timeout = 60  # Increased from 30 to 60 seconds
+        
+        # Add connection health tracking
+        self.last_successful_connection = 0
+        self.connection_failures = 0
+        self.max_failures = 5
+        self.backoff_time = 0
+        self.connection_check_interval = 300  # 5 minutes
+
+        # Add priority queue
+        self.priority_queue = asyncio.PriorityQueue()
+        self.normal_queue = asyncio.Queue()
+        self.emergency_stop_code = None  # Will be set randomly on startup
+        self.emergency_confirmed = False
+        
+        # Generate random emergency stop code
+        self.emergency_stop_code = ''.join(random.choices('0123456789', k=6))
+        self.logger.info(f"Emergency stop code generated: {self.emergency_stop_code}")
+
     async def send_startup_notification(self):
         """Send comprehensive startup notification"""
         try:
@@ -228,7 +252,7 @@ class TelegramHandler:
             self.processing_commands.discard(command)
 
     def register_handlers(self):
-        """Register command handlers directly without queuing"""
+        """Register command handlers with emergency stop"""
         handlers = {
             "start": self.handle_start,
             "positions": self.handle_positions,
@@ -246,6 +270,7 @@ class TelegramHandler:
             "symbol": self.handle_symbol_stats,
             "summary": self.handle_portfolio_summary,
             "addtrade": self.handle_addtrade,
+            "emergency": self.handle_emergency_stop,  # Add emergency stop handler
         }
 
         # Clear existing handlers
@@ -263,27 +288,67 @@ class TelegramHandler:
         ))
 
     def _wrap_handler(self, handler):
-        """Wrap handler for direct execution"""
+        """Enhanced command handler wrapper with timeout and retry logic"""
         async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 if not self.initialized:
-                    await self.send_message("Bot is still initializing, please wait...")
+                    await self.safe_send_message("Bot is still initializing, please wait...")
                     return
 
                 command = update.message.text.split()[0][1:]
                 self.logger.debug(f"Processing command: {command}")
                 
-                await self.app.bot.send_chat_action(
-                    chat_id=update.effective_chat.id,
-                    action="typing"
-                )
+                # Check connection health before proceeding
+                if not await self._check_connection():
+                    await self.safe_send_message(
+                        "⚠️ Connection issues detected. Command processing may be delayed.",
+                        priority=True
+                    )
                 
-                await handler(update, context)
-                
+                # Send typing action with retry
+                for attempt in range(3):
+                    try:
+                        await self.app.bot.send_chat_action(
+                            chat_id=update.effective_chat.id,
+                            action="typing",
+                            read_timeout=self.read_timeout,
+                            write_timeout=self.write_timeout,
+                            connect_timeout=self.connect_timeout,
+                            pool_timeout=self.pool_timeout
+                        )
+                        break
+                    except telegram.error.TimedOut:
+                        if attempt == 2:
+                            self.logger.warning("Failed to send typing action after 3 attempts")
+                        await asyncio.sleep(1)
+                    except Exception as e:
+                        self.logger.error(f"Error sending typing action: {e}")
+                        break
+
+                # Execute command with timeout
+                try:
+                    result = await asyncio.wait_for(
+                        handler(update, context),
+                        timeout=self.command_timeout
+                    )
+                    # Update connection health on success
+                    self.last_successful_connection = time.time()
+                    self.connection_failures = 0
+                    return result
+                    
+                except asyncio.TimeoutError:
+                    error_msg = f"Command {command} timed out. Please try again."
+                    self.logger.error(f"Command timeout: {command}")
+                    await self.safe_send_message(error_msg)
+                    self.connection_failures += 1
+                    
             except Exception as e:
                 self.logger.exception(f"Error in command {update.message.text}: {e}")
-                await self.send_message("Error processing command. Please try again.")
-        
+                await self.safe_send_message(
+                    f"Error processing command. Please try again later."
+                )
+                self.connection_failures += 1
+                
         return wrapped
 
     async def queue_message(self, text, parse_mode=None, reply_markup=None, priority=False):
@@ -307,112 +372,70 @@ class TelegramHandler:
             self.logger.error(f"Error queuing message: {e}")
 
     async def _process_message_queue(self):
-        """Process message queue with improved error handling"""
+        """Enhanced message queue processor with priority handling"""
         while True:
             try:
-                if time.time() < self.backoff_until:
-                    await asyncio.sleep(1)
+                # Check priority queue first
+                if not self.priority_queue.empty():
+                    priority, msg_data = await self.priority_queue.get()
+                    try:
+                        await self._send_with_retry(
+                            text=msg_data['text'],
+                            parse_mode=msg_data.get('parse_mode'),
+                            reply_markup=msg_data.get('reply_markup')
+                        )
+                    finally:
+                        self.priority_queue.task_done()
                     continue
 
-                messages = []
+                # Then check normal queue
                 try:
-                    # Get up to batch_size messages
-                    for _ in range(self.batch_size):
-                        if self.message_queue.empty():
-                            break
-                        messages.append(await self.message_queue.get_nowait())
-                except asyncio.QueueEmpty:
-                    pass
-
-                if messages:
-                    # Sort by priority and timestamp
-                    messages.sort(key=lambda x: (not x['priority'], x['timestamp']))
-                    
-                    # Process messages
-                    for message in messages:
-                        try:
-                            await self._send_with_retry(
-                                message['text'],
-                                message['parse_mode'],
-                                message['reply_markup']
-                            )
-                            self.message_queue.task_done()
-                        except Exception as e:
-                            self.logger.error(f"Error processing queued message: {e}")
-                            # Re-queue message if it's not too old
-                            if time.time() - message['timestamp'] < 3600:  # 1 hour timeout
-                                await self.message_queue.put(message)
-                    
-                    # Small delay between batches
-                    await asyncio.sleep(self.batch_delay)
-                else:
+                    msg_data = await asyncio.wait_for(
+                        self.normal_queue.get(),
+                        timeout=0.1
+                    )
+                    await self._send_with_retry(
+                        text=msg_data['text'],
+                        parse_mode=msg_data.get('parse_mode'),
+                        reply_markup=msg_data.get('reply_markup')
+                    )
+                    self.normal_queue.task_done()
+                except asyncio.TimeoutError:
                     await asyncio.sleep(0.1)
-
+                    
             except Exception as e:
                 self.logger.error(f"Error in message processor: {e}")
                 await asyncio.sleep(1)
 
-    async def send_message(self, text, parse_mode=None, reply_markup=None, priority=False):
-        """Send message with improved error handling and backoff"""
+    async def send_message(self, text, parse_mode=None, reply_markup=None, priority=False, **kwargs):
+        """Enhanced message sending with priority queue"""
         if not text or not self.initialized:
             return None
 
-        # Check error rate
-        current_time = time.time()
-        if current_time - self.error_reset_time > self.error_reset_interval:
-            self.error_count = 0
-            self.error_reset_time = current_time
-
-        if self.error_count >= self.max_errors:
-            self.logger.error("Too many errors, messages will be queued only")
-            await self.queue_message(text, parse_mode, reply_markup, priority)
-            return None
-
-        current_time = time.time()
-        if current_time < self.backoff_until:
-            self.logger.warning("In backoff period, queuing message")
-            await self.queue_message(text, parse_mode, reply_markup, priority)
-            return None
+        message_data = {
+            'text': text,
+            'chat_id': self.chat_id,
+            'parse_mode': parse_mode,
+            'reply_markup': reply_markup,
+            **kwargs
+        }
 
         try:
-            # Break long messages into chunks
-            if len(text) > 4096:
-                chunks = [text[i:i+4096] for i in range(0, len(text), 4096)]
-                responses = []
-                for chunk in chunks:
-                    try:
-                        response = await self._send_with_retry(chunk, parse_mode, reply_markup)
-                        if response:
-                            responses.append(response)
-                    except Exception as e:
-                        self.logger.error(f"Error sending chunk: {e}")
-                        continue
-                return responses[-1] if responses else None
-            
-            return await self._send_with_retry(text, parse_mode, reply_markup)
-            
-        except telegram.error.NetworkError as e:
-            self.error_count += 1
-            self.logger.warning(f"Network error: {e}")
-            await self.queue_message(text, parse_mode, reply_markup, priority)
-            return None
-        except telegram.error.RetryAfter as e:
-            self.logger.warning(f"Rate limited. Waiting {e.retry_after} seconds")
-            await asyncio.sleep(e.retry_after)
-            await self.queue_message(text, parse_mode, reply_markup, priority)
-            return None
+            if priority:
+                # Priority 1 for emergency/critical messages
+                await self.priority_queue.put((1, message_data))
+            else:
+                # Priority 2 for normal messages
+                await self.normal_queue.put(message_data)
         except Exception as e:
-            self.error_count += 1
-            self.logger.error(f"Error sending message: {e}")
-            await self.queue_message(text, parse_mode, reply_markup, priority)
-            return None
+            self.logger.error(f"Error queuing message: {e}")
 
     async def _send_with_retry(self, text, parse_mode=None, reply_markup=None):
         """Send message with retries and proper error handling"""
         for attempt in range(self.max_retries):
             try:
                 return await self.app.bot.send_message(
-                    chat_id=self.chat_id,
+                    chat_id=self.chat_id,  # Use instance chat_id instead of parameter
                     text=text,
                     parse_mode=parse_mode,
                     reply_markup=reply_markup,
@@ -432,6 +455,80 @@ class TelegramHandler:
                 if attempt == self.max_retries - 1:
                     raise
                 await asyncio.sleep(1)
+
+    async def safe_send_message(self, text, priority=False, **kwargs):
+        """Send message with enhanced safety and retry logic"""
+        if not text or not self.initialized:
+            return None
+            
+        if time.time() < self.backoff_time:
+            if priority:
+                self.logger.warning("High priority message during backoff period")
+            else:
+                await self.queue_message(text, priority=priority, **kwargs)
+                return None
+
+        for attempt in range(self.max_retries):
+            try:
+                # Split long messages
+                if len(text) > 4096:
+                    chunks = [text[i:i+4096] for i in range(0, len(text), 4096)]
+                    responses = []
+                    for chunk in chunks:
+                        response = await self.app.bot.send_message(
+                            chat_id=self.chat_id,
+                            text=chunk,
+                            read_timeout=self.read_timeout,
+                            write_timeout=self.write_timeout,
+                            connect_timeout=self.connect_timeout,
+                            pool_timeout=self.pool_timeout,
+                            **kwargs
+                        )
+                        responses.append(response)
+                        await asyncio.sleep(0.5)  # Small delay between chunks
+                    return responses[-1]
+                else:
+                    return await self.app.bot.send_message(
+                        chat_id=self.chat_id,
+                        text=text,
+                        read_timeout=self.read_timeout,
+                        write_timeout=self.write_timeout,
+                        connect_timeout=self.connect_timeout,
+                        pool_timeout=self.pool_timeout,
+                        **kwargs
+                    )
+                    
+            except telegram.error.TimedOut:
+                self.connection_failures += 1
+                delay = min(30, (2 ** attempt))
+                self.logger.warning(f"Message timed out, retrying in {delay}s")
+                await asyncio.sleep(delay)
+                
+            except Exception as e:
+                self.logger.error(f"Error sending message: {e}")
+                if attempt == self.max_retries - 1:
+                    await self.queue_message(text, priority=priority, **kwargs)
+                    return None
+                await asyncio.sleep(1)
+
+        return None
+
+    async def _check_connection(self):
+        """Check Telegram connection health"""
+        current_time = time.time()
+        
+        # Reset failures if enough time has passed
+        if current_time - self.last_successful_connection > self.connection_check_interval:
+            self.connection_failures = 0
+            
+        # Implement exponential backoff if too many failures
+        if self.connection_failures >= self.max_failures:
+            backoff_duration = min(300, (2 ** (self.connection_failures - self.max_failures)) * 30)
+            self.backoff_time = current_time + backoff_duration
+            self.logger.warning(f"Too many connection failures. Backing off for {backoff_duration}s")
+            return False
+            
+        return True
 
     async def handle_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command"""
@@ -468,8 +565,11 @@ class TelegramHandler:
     async def handle_positions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show trading positions with thresholds and reset times"""
         try:
-            # Send initial response
-            processing_message = await self.send_message("📊 Fetching positions...")
+            # Send loading message and store the message object
+            processing_msg = await self.app.bot.send_message(
+                chat_id=self.chat_id,
+                text="📊 Fetching positions..."
+            )
 
             positions = []
             cached_prices = self.bot.ws_manager.last_prices
@@ -521,7 +621,6 @@ class TelegramHandler:
                                 else:  # monthly
                                     reset_time = last_order + timedelta(days=30)
                                 
-                                # Rest of the code
                                 if now < reset_time:
                                     time_left = reset_time - now
                                     hours = int(time_left.total_seconds() / 3600)
@@ -548,14 +647,32 @@ class TelegramHandler:
             message += "\n".join(positions)
             message += f"\n\nLast Update: {now.strftime('%H:%M:%S UTC')}"
 
-            # Edit the processing message
-            await self.app.bot.edit_message_text(
-                chat_id=self.chat_id,
-                message_id=processing_message.message_id,
-                text=message
-            )
+            # Update the processing message with the full data
+            try:
+                await self.app.bot.edit_message_text(
+                    chat_id=self.chat_id,
+                    message_id=processing_msg.message_id,
+                    text=message
+                )
+            except telegram.error.BadRequest as e:
+                # If message is too long, send as new message
+                if "message is too long" in str(e):
+                    await self.app.bot.delete_message(
+                        chat_id=self.chat_id,
+                        message_id=processing_msg.message_id
+                    )
+                    # Split message if needed
+                    chunks = [message[i:i+4000] for i in range(0, len(message), 4000)]
+                    for chunk in chunks:
+                        await self.app.bot.send_message(
+                            chat_id=self.chat_id,
+                            text=chunk
+                        )
+                else:
+                    raise
 
         except Exception as e:
+            self.logger.error(f"Error fetching positions: {e}")
             await self.send_message(f"❌ Error fetching positions: {e}")
 
     async def handle_balance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -919,6 +1036,61 @@ class TelegramHandler:
             await self.send_message(f"❌ Error: {str(e)}\nUse /addtrade to start over.")
             del self.trade_conv_state[chat_id]
 
+    async def handle_emergency_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle emergency stop command"""
+        try:
+            if not context.args:
+                # First confirmation step
+                message = (
+                    "⚠️ EMERGENCY STOP REQUESTED\n\n"
+                    "This will:\n"
+                    "1. Cancel all open orders\n"
+                    "2. Stop all trading activities\n"
+                    "3. Close WebSocket connections\n\n"
+                    f"To confirm, use:\n/emergency {self.emergency_stop_code}"
+                )
+                await self.send_message(message, priority=True)
+                return
+
+            if context.args[0] == self.emergency_stop_code:
+                self.emergency_confirmed = True
+                
+                # Send high priority notification
+                await self.send_message(
+                    "🚨 EMERGENCY STOP CONFIRMED\nInitiating shutdown...",
+                    priority=True
+                )
+                
+                # Cancel all orders
+                await self.bot.cancel_all_orders()
+                
+                # Stop WebSocket
+                if self.bot.ws_manager:
+                    await self.bot.ws_manager.stop()
+                
+                # Final confirmation
+                await self.send_message(
+                    "✅ Emergency stop completed:\n"
+                    "• All orders cancelled\n"
+                    "• Trading stopped\n"
+                    "• Connections closed",
+                    priority=True
+                )
+                
+                # Initiate bot shutdown
+                asyncio.create_task(self.bot.shutdown())
+            else:
+                await self.send_message(
+                    "❌ Invalid emergency code. Command cancelled.",
+                    priority=True
+                )
+        except Exception as e:
+            self.logger.error(f"Error in emergency stop: {e}")
+            await self.send_message(
+                "❌ Error executing emergency stop",
+                priority=True
+            )
+
     async def shutdown(self):
         """Safely shutdown Telegram bot"""
         try:
@@ -977,3 +1149,4 @@ class TelegramHandler:
             "🟢 Bot is actively monitoring markets!"
         )
         return startup_msg
+

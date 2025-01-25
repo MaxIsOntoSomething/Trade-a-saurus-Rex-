@@ -23,6 +23,7 @@ from utils.websocket_manager import WebSocketManager
 from utils.rate_limiter import RateLimiter
 from utils.telegram_handler import TelegramHandler
 from utils.file_handler import AsyncFileHandler  # Add import
+from utils.dashboard import TradingDashboard  # Correct import path
 
 # Initialize colorama
 init(autoreset=True)
@@ -50,38 +51,54 @@ USE_TELEGRAM = config.get('USE_TELEGRAM', False)
 # TIME_INTERVAL = config['TIME_INTERVAL']
 
 class BinanceBot:
-    # Class-level variables
-    valid_trading_symbols = []
-    insufficient_balance_timestamp = None
-    balance_check_cooldown = timedelta(hours=24)
-    balance_pause_reason = None  # New variable to track why trading is paused
+    def __init__(self, config):
+        # Initialize loggers
+        self.logger, self.api_logger = setup_logger()
+        self.logger.info("Initializing BinanceBot...")
 
-    def __init__(self, use_testnet, use_telegram, timeframe_config, order_type, use_percentage, trade_amount, reserve_balance_usdt):
-        # Get configuration from cache or load new
-        self.config = ConfigHandler.get_config()
-        
-        # Use config values if not running from CLI
-        if IN_DOCKER or not any([timeframe_config, order_type, use_percentage, trade_amount, reserve_balance_usdt]):
-            use_testnet = self.config.get('USE_TESTNET', True)
-            use_telegram = self.config.get('USE_TELEGRAM', False)
-            timeframe_config = self.config.get('timeframe_config', {})
-            order_type = self.config.get('ORDER_TYPE', 'limit')
-            use_percentage = self.config.get('USE_PERCENTAGE', False)
-            trade_amount = self.config.get('TRADE_AMOUNT', 10)
-            reserve_balance_usdt = self.config.get('RESERVE_BALANCE', 2000)
+        # Store config and required settings
+        self.config = config
+        self.use_testnet = config.get('USE_TESTNET', True)
+        self.use_telegram = config.get('USE_TELEGRAM', False)
+        self.telegram_token = config.get('TELEGRAM_TOKEN', '')
+        self.telegram_chat_id = config.get('TELEGRAM_CHAT_ID', '')
+        self.order_type = config.get('ORDER_TYPE', 'limit')
+        self.use_percentage = config.get('USE_PERCENTAGE', False)
+        self.trade_amount = config.get('TRADE_AMOUNT', 10)
+        self.reserve_balance_usdt = config.get('RESERVE_BALANCE', 2000)
+        self.timeframe_config = config.get('TIMEFRAMES', {})
+        self.valid_symbols = []
+        self.invalid_symbols = []
 
-        # Initialize Telegram handler first if enabled
+        # Initialize Telegram handler if enabled
         self.telegram_handler = None
-        if use_telegram and self.config.get('USE_TELEGRAM'):
+        if self.use_telegram and self.telegram_token and self.telegram_chat_id:
             self.telegram_handler = TelegramHandler(
-                self.config['TELEGRAM_TOKEN'],
-                self.config['TELEGRAM_CHAT_ID'],
+                self.telegram_token,
+                self.telegram_chat_id,
                 self
             )
 
+        # Initialize client based on testnet setting
+        if self.use_testnet:
+            self.client = Client(
+                config.get('TESTNET_API_KEY', ''),
+                config.get('TESTNET_API_SECRET', ''),
+                testnet=True
+            )
+            self.client.API_URL = 'https://testnet.binance.vision/api'
+        else:
+            self.client = Client(
+                config.get('BINANCE_API_KEY', ''),
+                config.get('BINANCE_API_SECRET', '')
+            )
+
         # Add timestamp sync
-        self.recv_window = 60000
+        self.recv_window = 60000  # Increase from 5000 to 60000
         self.time_offset = 0
+        self.last_time_sync = 0
+        self.sync_interval = 3600  # Sync every hour
+        self.max_timestamp_attempts = 3
         self.start_time = datetime.now()
         self.valid_symbols = []  # Add this to track valid symbols
         self.invalid_symbols = []  # Add this to track invalid symbols
@@ -90,27 +107,16 @@ class BinanceBot:
         self.tax_rate = 0.28  # Add 28% tax rate
         self.symbol_stats = {}  # Track per-symbol statistics
         
-        if use_testnet:
-            self.client = Client(TESTNET_API_KEY, TESTNET_API_SECRET, testnet=True)
-            self.client.API_URL = 'https://testnet.binance.vision/api'
-        else:
-            self.client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
-        
+        # Add balance tracking attributes
+        self.insufficient_balance_timestamp = None
+        self.balance_pause_reason = None
+        self.balance_check_cooldown = timedelta(hours=24)  # 24-hour cooldown
+
         # Sync time with Binance servers
-        server_time = self.client.get_server_time()
-        self.time_offset = server_time['serverTime'] - int(time.time() * 1000)
-        
-        # Add timeframe_config as instance variable
-        self.timeframe_config = timeframe_config
+        self._sync_server_time()
         
         # Fix the strategy initialization
-        self.strategy = PriceDropStrategy(timeframe_config)
-        self.logger = setup_logger()
-        self.use_telegram = use_telegram
-        self.order_type = order_type
-        self.use_percentage = use_percentage
-        self.trade_amount = trade_amount
-        self.reserve_balance_usdt = reserve_balance_usdt
+        self.strategy = PriceDropStrategy(self.timeframe_config)
 
         # Add GraphGenerator
         from utils.graph_generator import GraphGenerator
@@ -136,7 +142,7 @@ class BinanceBot:
         # Initialize orders_placed with correct structure
         self.orders_placed = {
             symbol: {
-                timeframe: {} for timeframe in timeframe_config.keys()
+                timeframe: {} for timeframe in self.timeframe_config.keys()
             } for symbol in TRADING_SYMBOLS
         }
 
@@ -161,11 +167,127 @@ class BinanceBot:
             for trade_id, trade in self.trades.items() 
             if trade['trade_info']['status'] == 'PENDING'
         }
+        self.is_shutting_down = False
+
+        # Initialize dashboard only if enabled
+        self.dashboard = None
+        if config.get('DASHBOARD_SETTINGS', {}).get('ENABLED', False):
+            try:
+                from utils.dashboard import TradingDashboard
+                self.dashboard = TradingDashboard(
+                    self,
+                    host=config['DASHBOARD_SETTINGS'].get('HOST', 'localhost'),
+                    port=config['DASHBOARD_SETTINGS'].get('PORT', 8050)
+                )
+            except ImportError:
+                self.logger.warning("Dashboard dependencies not installed. Skipping dashboard initialization.")
+
+    async def shutdown(self):
+        """Enhanced graceful shutdown sequence"""
+        if self.is_shutting_down:
+            return
+            
+        self.is_shutting_down = True
+        self.logger.info("Initiating shutdown sequence...")
+        
+        try:
+            # Cancel all pending orders first
+            await self.cancel_all_orders()
+            cleanup_tasks = []
+
+            # Stop WebSocket connection
+            if self.ws_manager:
+                cleanup_tasks.append(self.ws_manager.stop())
+
+            # Save current state
+            cleanup_tasks.append(self._save_trades_atomic())
+
+            # Stop Telegram bot
+            if self.telegram_handler:
+                cleanup_tasks.append(self.telegram_handler.shutdown())
+
+            # Wait for all cleanup tasks with timeout
+            if cleanup_tasks:
+                try:
+                    await asyncio.wait_for(asyncio.gather(*cleanup_tasks), timeout=15)
+                except asyncio.TimeoutError:
+                    self.logger.warning("Cleanup tasks took too long")
+                    
+        except Exception as e:
+            self.logger.error(f"Error during shutdown: {e}")
+        finally:
+            self.logger.info("Shutdown sequence completed")
+
+    def _sync_server_time(self):
+        """Synchronize local time with Binance server time"""
+        try:
+            for _ in range(self.max_timestamp_attempts):
+                # Remove timestamp from get_server_time call
+                server_time = self.client.get_server_time()
+                local_time = int(time.time() * 1000)
+                self.time_offset = server_time['serverTime'] - local_time
+                
+                # Additional verification step for testnet
+                if hasattr(self.client, 'API_URL') and 'testnet' in self.client.API_URL:
+                    # Add a small buffer for testnet latency
+                    self.time_offset += 1000  # Add 1 second buffer
+                
+                self.last_time_sync = time.time()
+                self.logger.info(f"Time synchronized. Offset: {self.time_offset}ms")
+                return True
+                    
+            raise Exception("Failed to synchronize time after multiple attempts")
+            
+        except Exception as e:
+            self.logger.error(f"Error synchronizing time: {e}")
+            return False
+
+    def _get_timestamp(self):
+        """Get current timestamp with server offset"""
+        return int(time.time() * 1000) + self.time_offset
+
+    def _check_time_sync(self):
+        """Check if time needs to be resynced"""
+        if time.time() - self.last_time_sync > self.sync_interval:
+            self._sync_server_time()
 
     async def _make_api_call(self, func, *args, **kwargs):
-        """Wrapper for API calls with rate limiting"""
+        """Enhanced API call wrapper with timestamp handling and logging"""
         await self.rate_limiter.acquire()
-        return func(*args, **kwargs)
+        
+        self._check_time_sync()
+        if 'timestamp' not in kwargs:
+            kwargs['timestamp'] = self._get_timestamp()
+        
+        # Log the API request
+        self.api_logger.debug(
+            f"API Request - Function: {func.__name__}\n"
+            f"Args: {args}\n"
+            f"Kwargs: {kwargs}"
+        )
+        
+        for attempt in range(self.max_timestamp_attempts):
+            try:
+                response = func(*args, **kwargs)
+                # Log the successful response
+                self.api_logger.debug(
+                    f"API Response - Function: {func.__name__}\n"
+                    f"Response: {response}"
+                )
+                return response
+            except BinanceAPIException as e:
+                # Log the error
+                self.api_logger.error(
+                    f"API Error - Function: {func.__name__}\n"
+                    f"Error Code: {e.code}\n"
+                    f"Error Message: {e.message}"
+                )
+                if e.code == -1021 and attempt < self.max_timestamp_attempts - 1:
+                    self._sync_server_time()
+                    kwargs['timestamp'] = self._get_timestamp()
+                    continue
+                raise
+        raise Exception("Max timestamp retry attempts reached")
 
     async def get_cached_price(self, symbol):
         """Get cached price or fetch new one"""
@@ -330,7 +452,7 @@ class BinanceBot:
             raise
 
     async def execute_trade(self, symbol, price):
-        """Execute trade with new structure"""
+        """Execute trade with proper order tracking and logging"""
         try:
             # Check balance status first
             if not await self.check_balance_status():
@@ -352,19 +474,16 @@ class BinanceBot:
 
             # Get price filter for precision
             price_filter = next((f for f in symbol_info['filters'] if f['filterType'] == 'PRICE_FILTER'), None)
-            if price_filter:
-                tick_size = float(price_filter['tickSize'])
-                price_precision = len(str(tick_size).rstrip('0').split('.')[-1])
-                formatted_price = f"{current_price:.{price_precision}f}"
+            if not price_filter:
+                raise ValueError(f"Price filter not found for {symbol}")
 
-            # Calculate and format quantity with proper precision
+            tick_size = float(price_filter['tickSize'])
+            price_precision = len(str(tick_size).rstrip('0').split('.')[-1])
+            formatted_price = f"{current_price:.{price_precision}f}"
+
+            # Check and handle insufficient balance
             available_usdt = await self.get_available_usdt()
             if available_usdt < self.trade_amount:
-                print(f"{Fore.RED}Balance issue detected:")
-                print(f"Available: {available_usdt} USDT")
-                print(f"Required: {self.trade_amount} USDT")
-                print(f"Reserve: {self.reserve_balance_usdt} USDT")
-                
                 # Set cooldown timestamp and reason
                 self.insufficient_balance_timestamp = datetime.now(timezone.utc)
                 self.balance_pause_reason = "insufficient" if available_usdt > 0 else "reserve"
@@ -382,52 +501,73 @@ class BinanceBot:
                 )
                 
                 print(f"{Fore.YELLOW}{pause_message}")
-                
-                if self.use_telegram:
-                    await self.send_telegram_message(pause_message)
+                if self.telegram_handler:
+                    await self.telegram_handler.send_message(pause_message)
                 return
 
+            # Calculate trade amount
             trade_amount = available_usdt * self.trade_amount if self.use_percentage else min(self.trade_amount, available_usdt)
             
             # Get lot size filter for quantity precision
             lot_size_filter = next((f for f in symbol_info['filters'] if f['filterType'] == 'LOT_SIZE'), None)
-            if lot_size_filter:
-                step_size = float(lot_size_filter['stepSize'])
-                quantity_precision = len(str(step_size).rstrip('0').split('.')[-1])
-                quantity = (trade_amount / current_price)
-                quantity = round(quantity - (quantity % float(step_size)), quantity_precision)
-                formatted_quantity = f"{quantity:.{quantity_precision}f}"
+            if not lot_size_filter:
+                raise ValueError(f"Lot size filter not found for {symbol}")
 
-            # Create order with proper formatting
-            timestamp = int(time.time() * 1000) + self.time_offset
+            step_size = float(lot_size_filter['stepSize'])
+            quantity_precision = len(str(step_size).rstrip('0').split('.')[-1])
+            quantity = (trade_amount / current_price)
+            quantity = round(quantity - (quantity % float(step_size)), quantity_precision)
+            formatted_quantity = f"{quantity:.{quantity_precision}f}"
+
+            # Create order parameters with proper validation
             order_params = {
                 'symbol': symbol,
                 'side': SIDE_BUY,
-                'quantity': f"%.{quantity_precision}f" % quantity,
-                'recvWindow': self.recv_window,
-                'timestamp': timestamp
+                'recvWindow': self.recv_window
             }
 
             if self.order_type == "limit":
                 order_params.update({
                     'type': ORDER_TYPE_LIMIT,
                     'timeInForce': TIME_IN_FORCE_GTC,
-                    'price': f"%.8f" % price
+                    'price': formatted_price,
+                    'quantity': formatted_quantity
                 })
             else:
-                order_params['type'] = ORDER_TYPE_MARKET
+                # Market order: remove 'price'/'quantity', only use quoteOrderQty
+                order_params.update({
+                    'type': ORDER_TYPE_MARKET,
+                    'quoteOrderQty': f"{trade_amount:.{quantity_precision}f}"
+                })
 
-            # Generate unique bot order ID
-            bot_order_id = self.generate_order_id(symbol)
-            
+            # Add timestamp last
+            order_params['timestamp'] = self._get_timestamp()
+
+            # Log the order parameters before sending
+            self.api_logger.debug(
+                f"Preparing order - Symbol: {symbol}\n"
+                f"Order Parameters: {order_params}"
+            )
+
             # Place order with rate limiting
             order = await self._make_api_call(self.client.create_order, **order_params)
             
-            # Use UTC for all datetime operations
+            # Log the successful order
+            self.api_logger.info(
+                f"Order placed successfully:\n"
+                f"Order ID: {order['orderId']}\n"
+                f"Symbol: {symbol}\n"
+                f"Type: {order_params['type']}\n"
+                f"Side: {order_params['side']}\n"
+                f"Quantity: {formatted_quantity if 'quantity' in order_params else 'N/A'}\n"
+                f"Price: {formatted_price if 'price' in order_params else 'MARKET'}\n"
+                f"Quote Quantity: {order_params.get('quoteOrderQty', 'N/A')}"
+            )
+
+            # Create trade entry with new structure
             order_time = datetime.now(timezone.utc)
             cancel_time = order_time + self.limit_order_timeout
             
-            # Create trade entry with new structure
             self.trades[bot_order_id] = {
                 'trade_info': {
                     'symbol': symbol,
@@ -454,21 +594,21 @@ class BinanceBot:
             # Start monitoring task
             asyncio.create_task(self.monitor_order(bot_order_id))
             
+            return True
+            
         except BinanceAPIException as e:
-            error_msg = f"Binance API error in execute_trade: {str(e)}"
-            self.logger.error(error_msg)
-            print(f"{Fore.RED}{error_msg}")
+            self.logger.error(f"Binance API error in execute_trade: {str(e)}")
+            print(f"{Fore.RED}Binance API error in execute_trade: {str(e)}")
+            return False
+            
         except Exception as e:
-            error_msg = f"Error executing trade for {symbol}: {str(e)}"
-            self.logger.error(error_msg)
-            print(f"{Fore.RED}{error_msg}")
+            self.api_logger.error(f"Trade execution failed:\nSymbol: {symbol}\nError: {str(e)}")
+            print(f"{Fore.RED}Error executing trade for {symbol}: {str(e)}")
             # Clean up if something went wrong
-            if bot_order_id in self.pending_orders:
-                del self.pending_orders[bot_order_id]
-                self.save_pending_orders()
-            if bot_order_id in self.trades:
+            if 'bot_order_id' in locals() and bot_order_id in self.trades:
                 del self.trades[bot_order_id]
-                self.save_trades()
+                await self._save_trades_atomic()
+            return False
 
     async def monitor_order(self, trade_id):
         """Monitor order with new structure"""
@@ -476,13 +616,13 @@ class BinanceBot:
             trade = self.trades[trade_id]
             symbol = trade['trade_info']['symbol']
             order_id = trade['order_metadata']['order_id']
-            placed_time = datetime.fromisoformat(trade['order_metadata']['placed_time'])
+            cancel_time = datetime.fromisoformat(trade['order_metadata']['cancel_time'])
             
             while True:
                 now = datetime.now(timezone.utc)
                 
                 # Check for timeout
-                if now - placed_time > self.limit_order_timeout:
+                if now >= cancel_time:
                     await self._cancel_order(symbol, order_id)
                     trade['trade_info']['status'] = 'CANCELLED'
                     await self._save_trades_atomic()
@@ -490,6 +630,12 @@ class BinanceBot:
                 
                 # Get order status
                 order_status = await self._get_order_status_with_retry(symbol, order_id)
+                
+                if not order_status:
+                    self.logger.warning(f"Order {order_id} not found, assuming cancelled")
+                    trade['trade_info']['status'] = 'CANCELLED'
+                    await self._save_trades_atomic()
+                    break
                 
                 if order_status['status'] == 'FILLED':
                     # Update trade info
@@ -500,12 +646,26 @@ class BinanceBot:
                         'actual_quantity': float(order_status['executedQty'])
                     })
                     await self._save_trades_atomic()
+                    
+                    # Log successful fill
+                    fill_msg = (
+                        f"✅ Order filled:\n"
+                        f"Symbol: {symbol}\n"
+                        f"Price: {float(order_status['price'])}\n"
+                        f"Quantity: {float(order_status['executedQty'])}"
+                    )
+                    self.logger.info(fill_msg)
+                    if self.telegram_handler:
+                        await self.telegram_handler.send_message(fill_msg)
                     break
                     
                 await asyncio.sleep(10)
                 
         except Exception as e:
-            self.logger.error(f"Error monitoring order: {e}")
+            self.logger.error(f"Error monitoring order {trade_id}: {e}")
+            if trade_id in self.trades:
+                self.trades[trade_id]['trade_info']['status'] = 'ERROR'
+                await self._save_trades_atomic()
 
     def get_historical_data(self, symbol, interval, start_str):
         klines = self.client.get_historical_klines(
@@ -527,32 +687,49 @@ class BinanceBot:
             self.logger.info(f"Daily open price for {symbol} at 00:00 UTC: {daily_open_price}")
 
     def get_balance(self, asset=None):
-        """Get balance for specific asset or all assets"""
+        """Get balance for specific asset or all assets with improved timestamp handling"""
         try:
-            timestamp = int(time.time() * 1000) + self.time_offset
-            balances = self.client.get_account(
-                recvWindow=self.recv_window,
-                timestamp=timestamp
-            )['balances']
+            # Ensure time is synced
+            self._sync_server_time()
             
-            # Convert to dictionary for easier access
-            balance_report = {}
-            for balance in balances:
-                free = float(balance['free'])
-                locked = float(balance['locked'])
-                total = free + locked
-                if total > 0:  # Only include non-zero balances
-                    balance_report[balance['asset']] = {
-                        'free': free,
-                        'locked': locked,
-                        'total': total
-                    }
+            # Use a larger recvWindow for testnet
+            recv_window = 60000 if hasattr(self.client, 'API_URL') and 'testnet' in self.client.API_URL else self.recv_window
             
-            # Return specific asset balance if requested
-            if asset:
-                return balance_report.get(asset, None)
-            return balance_report
+            timestamp = self._get_timestamp()
             
+            # Try up to 3 times with increasing recvWindow
+            for attempt in range(3):
+                try:
+                    balances = self.client.get_account(
+                        recvWindow=recv_window * (attempt + 1),
+                        timestamp=timestamp
+                    )['balances']
+                    
+                    # Convert to dictionary for easier access
+                    balance_report = {}
+                    for balance in balances:
+                        free = float(balance['free'])
+                        locked = float(balance['locked'])
+                        total = free + locked
+                        if total > 0:  # Add missing colon
+                            balance_report[balance['asset']] = {
+                                'free': free,
+                                'locked': locked,
+                                'total': total
+                            }
+                    
+                    # Return specific asset balance if requested
+                    if asset:
+                        return balance_report.get(asset, None)
+                    return balance_report
+                    
+                except BinanceAPIException as e:
+                    if e.code == -1021 and attempt < 2:  # Add missing colon
+                        self._sync_server_time()
+                        timestamp = self._get_timestamp()
+                        continue
+                    raise
+                    
         except Exception as e:
             self.logger.error(f"Error fetching balance: {str(e)}")
             return None
@@ -781,19 +958,34 @@ class BinanceBot:
     async def get_available_usdt(self):
         """Enhanced balance check with reserve protection"""
         try:
-            timestamp = int(time.time() * 1000) + self.time_offset
-            balance = self.client.get_asset_balance(
-                asset='USDT',
-                recvWindow=self.recv_window,
-                timestamp=timestamp
-            )
-            total_usdt = float(balance['free'])
-            available_usdt = total_usdt - self.reserve_balance_usdt
+            self._check_time_sync()  # Check time sync before request
             
-            if total_usdt < self.reserve_balance_usdt:
-                self.balance_pause_reason = "reserve"
-                return 0
-            return max(available_usdt, 0)
+            timestamp = self._get_timestamp()
+            
+            for attempt in range(self.max_timestamp_attempts):
+                try:
+                    balance = self.client.get_asset_balance(
+                        asset='USDT',
+                        recvWindow=self.recv_window,
+                        timestamp=timestamp
+                    )
+                    
+                    total_usdt = float(balance['free'])
+                    available_usdt = total_usdt - self.reserve_balance_usdt
+                    
+                    if total_usdt < self.reserve_balance_usdt:
+                        self.balance_pause_reason = "reserve"
+                        return 0
+                    return max(available_usdt, 0)
+                    
+                except BinanceAPIException as e:
+                    if e.code == -1021:  # Timestamp error
+                        if attempt < self.max_timestamp_attempts - 1:
+                            self._sync_server_time()
+                            timestamp = self._get_timestamp()
+                            continue
+                    raise
+                    
         except Exception as e:
             self.logger.error(f"Error getting USDT balance: {e}")
             return 0
@@ -847,19 +1039,16 @@ class BinanceBot:
 
             # Get price filter for precision
             price_filter = next((f for f in symbol_info['filters'] if f['filterType'] == 'PRICE_FILTER'), None)
-            if price_filter:
-                tick_size = float(price_filter['tickSize'])
-                price_precision = len(str(tick_size).rstrip('0').split('.')[-1])
-                formatted_price = f"{current_price:.{price_precision}f}"
+            if not price_filter:
+                raise ValueError(f"Price filter not found for {symbol}")
 
-            # Calculate and format quantity with proper precision
+            tick_size = float(price_filter['tickSize'])
+            price_precision = len(str(tick_size).rstrip('0').split('.')[-1])
+            formatted_price = f"{current_price:.{price_precision}f}"
+
+            # Check and handle insufficient balance
             available_usdt = await self.get_available_usdt()
             if available_usdt < self.trade_amount:
-                print(f"{Fore.RED}Balance issue detected:")
-                print(f"Available: {available_usdt} USDT")
-                print(f"Required: {self.trade_amount} USDT")
-                print(f"Reserve: {self.reserve_balance_usdt} USDT")
-                
                 # Set cooldown timestamp and reason
                 self.insufficient_balance_timestamp = datetime.now(timezone.utc)
                 self.balance_pause_reason = "insufficient" if available_usdt > 0 else "reserve"
@@ -877,52 +1066,73 @@ class BinanceBot:
                 )
                 
                 print(f"{Fore.YELLOW}{pause_message}")
-                
-                if self.use_telegram:
-                    await self.send_telegram_message(pause_message)
+                if self.telegram_handler:
+                    await self.telegram_handler.send_message(pause_message)
                 return
 
+            # Calculate trade amount
             trade_amount = available_usdt * self.trade_amount if self.use_percentage else min(self.trade_amount, available_usdt)
             
             # Get lot size filter for quantity precision
             lot_size_filter = next((f for f in symbol_info['filters'] if f['filterType'] == 'LOT_SIZE'), None)
-            if lot_size_filter:
-                step_size = float(lot_size_filter['stepSize'])
-                quantity_precision = len(str(step_size).rstrip('0').split('.')[-1])
-                quantity = (trade_amount / current_price)
-                quantity = round(quantity - (quantity % float(step_size)), quantity_precision)
-                formatted_quantity = f"{quantity:.{quantity_precision}f}"
+            if not lot_size_filter:
+                raise ValueError(f"Lot size filter not found for {symbol}")
 
-            # Create order with proper formatting
-            timestamp = int(time.time() * 1000) + self.time_offset
+            step_size = float(lot_size_filter['stepSize'])
+            quantity_precision = len(str(step_size).rstrip('0').split('.')[-1])
+            quantity = (trade_amount / current_price)
+            quantity = round(quantity - (quantity % float(step_size)), quantity_precision)
+            formatted_quantity = f"{quantity:.{quantity_precision}f}"
+
+            # Create order parameters with proper validation
             order_params = {
                 'symbol': symbol,
                 'side': SIDE_BUY,
-                'quantity': f"%.{quantity_precision}f" % quantity,
-                'recvWindow': self.recv_window,
-                'timestamp': timestamp
+                'recvWindow': self.recv_window
             }
 
             if self.order_type == "limit":
                 order_params.update({
                     'type': ORDER_TYPE_LIMIT,
                     'timeInForce': TIME_IN_FORCE_GTC,
-                    'price': f"%.8f" % price
+                    'price': formatted_price,
+                    'quantity': formatted_quantity
                 })
             else:
-                order_params['type'] = ORDER_TYPE_MARKET
+                # Market order: remove 'price'/'quantity', only use quoteOrderQty
+                order_params.update({
+                    'type': ORDER_TYPE_MARKET,
+                    'quoteOrderQty': f"{trade_amount:.{quantity_precision}f}"
+                })
 
-            # Generate unique bot order ID
-            bot_order_id = self.generate_order_id(symbol)
-            
+            # Add timestamp last
+            order_params['timestamp'] = self._get_timestamp()
+
+            # Log the order parameters before sending
+            self.api_logger.debug(
+                f"Preparing order - Symbol: {symbol}\n"
+                f"Order Parameters: {order_params}"
+            )
+
             # Place order with rate limiting
             order = await self._make_api_call(self.client.create_order, **order_params)
             
-            # Use UTC for all datetime operations
+            # Log the successful order
+            self.api_logger.info(
+                f"Order placed successfully:\n"
+                f"Order ID: {order['orderId']}\n"
+                f"Symbol: {symbol}\n"
+                f"Type: {order_params['type']}\n"
+                f"Side: {order_params['side']}\n"
+                f"Quantity: {formatted_quantity if 'quantity' in order_params else 'N/A'}\n"
+                f"Price: {formatted_price if 'price' in order_params else 'MARKET'}\n"
+                f"Quote Quantity: {order_params.get('quoteOrderQty', 'N/A')}"
+            )
+
+            # Create trade entry with new structure
             order_time = datetime.now(timezone.utc)
             cancel_time = order_time + self.limit_order_timeout
             
-            # Create trade entry with new structure
             self.trades[bot_order_id] = {
                 'trade_info': {
                     'symbol': symbol,
@@ -949,50 +1159,25 @@ class BinanceBot:
             # Start monitoring task
             asyncio.create_task(self.monitor_order(bot_order_id))
             
+            return True
+            
         except BinanceAPIException as e:
-            error_msg = f"Binance API error in execute_trade: {str(e)}"
-            self.logger.error(error_msg)
-            print(f"{Fore.RED}{error_msg}")
+            self.logger.error(f"Binance API error in execute_trade: {str(e)}")
+            print(f"{Fore.RED}Binance API error in execute_trade: {str(e)}")
+            return False
+            
         except Exception as e:
-            error_msg = f"Error executing trade for {symbol}: {str(e)}"
-            self.logger.error(error_msg)
-            print(f"{Fore.RED}{error_msg}")
+            self.api_logger.error(f"Trade execution failed:\nSymbol: {symbol}\nError: {str(e)}")
+            print(f"{Fore.RED}Error executing trade for {symbol}: {str(e)}")
             # Clean up if something went wrong
-            if bot_order_id in self.pending_orders:
-                del self.pending_orders[bot_order_id]
-                self.save_pending_orders()
-            if bot_order_id in self.trades:
+            if 'bot_order_id' in locals() and bot_order_id in self.trades:
                 del self.trades[bot_order_id]
-                self.save_trades()
-
-    async def cancel_all_orders(self):
-        """Cancel all pending orders"""
-        try:
-            for symbol in self.valid_symbols:
-                try:
-                    # Get all open orders for the symbol
-                    open_orders = self.client.get_open_orders(symbol=symbol)
-                    for order in open_orders:
-                        self.client.cancel_order(
-                            symbol=symbol,
-                            orderId=order['orderId']
-                        )
-                        print(f"{Fore.YELLOW}Cancelled order {order['orderId']} for {symbol}")
-                except Exception as e:
-                    print(f"{Fore.RED}Error cancelling orders for {symbol}: {e}")
-                    continue
-        except Exception as e:
-            print(f"{Fore.RED}Error in cancel_all_orders: {e}")
-            self.logger.error(f"Error in cancel_all_orders: {e}")
+                await self._save_trades_atomic()
+            return False
 
     def fetch_current_price(self, symbol):
         try:
             # Show clean loading animation
-            print(f"\r{Fore.CYAN}Loading {symbol} price... ⟳", end="")
-            
-            # Get current price and 24h stats
-            ticker = self.client.get_symbol_ticker(symbol=symbol)
-            stats_24h = self.client.get_ticker(symbol=symbol)
             current_price = float(ticker['price'])
             price_change = float(stats_24h['priceChangePercent'])
             
@@ -1132,6 +1317,19 @@ class BinanceBot:
 
             print(f"{Fore.GREEN}Starting WebSocket connection...")
             await self.ws_manager.start()
+
+            # Start dashboard if enabled
+            if self.dashboard:
+                try:
+                    import threading
+                    dashboard_thread = threading.Thread(
+                        target=self.dashboard.run,
+                        daemon=True
+                    )
+                    dashboard_thread.start()
+                    self.logger.info(f"Dashboard started at http://{self.dashboard.host}:{self.dashboard.port}")
+                except Exception as e:
+                    self.logger.error(f"Failed to start dashboard: {e}")
 
             while True:
                 try:
@@ -1477,176 +1675,26 @@ class BinanceBot:
 
 if __name__ == "__main__":
     try:
-        # Check if running in Docker
-        IN_DOCKER = os.environ.get('DOCKER', '').lower() == 'true'
-
-        if IN_DOCKER:
-            # Use environment variables when in Docker
-            config = ConfigHandler.load_config(use_env=True)
-            use_testnet = config['USE_TESTNET']
-            use_telegram = config['USE_TELEGRAM']
-            order_type = config['ORDER_TYPE']
-            use_percentage = config['USE_PERCENTAGE']
-            trade_amount = config['TRADE_AMOUNT']
-            reserve_balance_usdt = config['RESERVE_BALANCE']
-            timeframe_config = config['TIMEFRAMES']
-
-            # Initialize and run bot
-            bot = BinanceBot(
-                use_testnet=use_testnet,
-                use_telegram=use_telegram,
-                timeframe_config=timeframe_config,
-                order_type=order_type,
-                use_percentage=use_percentage,
-                trade_amount=trade_amount,
-                reserve_balance_usdt=reserve_balance_usdt
-            )
-            bot.test_connection()
-            bot.run()
-        else:
-            # Original interactive code for local development
-            # 1. First ask about network
-            while True:
-                testnet_input = input("Do you want to use the testnet? (yes/no): ").strip().lower()
-                if testnet_input in ['yes', 'no']:
-                    use_testnet = testnet_input == 'yes'
-                    break
-                print("Invalid input. Please enter 'yes' or 'no'.")
-
-            # 2. Then about Telegram - Add validation
-            while True:
-                telegram_input = input("Do you want to use Telegram notifications? (yes/no): ").strip().lower()
-                if telegram_input in ['yes', 'no']:
-                    use_telegram = telegram_input == 'yes'
-                    if use_telegram:
-                        if not USE_TELEGRAM:
-                            print(f"{Fore.YELLOW}Telegram will be disabled due to invalid configuration.")
-                            print(f"{Fore.YELLOW}Please check your config.json contains:")
-                            print('  "TELEGRAM_TOKEN": "YOUR_BOT_TOKEN",')
-                            print('  "TELEGRAM_CHAT_ID": "YOUR_CHAT_ID"')
-                            print("\nTo get these values:")
-                            print("1. Token: Talk to @BotFather on Telegram")
-                            print("2. Chat ID: Talk to @userinfobot on Telegram")
-                            use_telegram = False
-                        else:
-                            print(f"{Fore.GREEN}Telegram is properly configured and will be enabled.")
-                    break
-                print("Invalid input. Please enter 'yes' or 'no'.")
-
-            # 3. Then order type
-            while True:
-                order_type = input("Do you want to use limit orders or market orders? (limit/market): ").strip().lower()
-                if order_type in ['limit', 'market']:
-                    break
-                print("Invalid input. Please enter 'limit' or 'market'.")
-
-            # 4. Trade amount type
-            while True:
-                percentage_input = input("Do you want to use a percentage of USDT per trade? (yes/no): ").strip().lower()
-                if percentage_input in ['yes', 'no']:
-                    use_percentage = percentage_input == 'yes'
-                    break
-                print("Invalid input. Please enter 'yes' or 'no'.")
-
-            # 5. Trade amount value
-            while True:
-                try:
-                    if use_percentage:
-                        trade_amount = float(input("Enter the percentage of USDT to use per trade (e.g., 10 for 10%): ").strip()) / 100
-                        if 0 < trade_amount <= 1:
-                            break
-                        print("Percentage must be between 0 and 100.")
-                    else:
-                        trade_amount = float(input("Enter the amount of USDT to use per trade: ").strip())
-                        if trade_amount > 0:
-                            break
-                        print("Amount must be greater than 0.")
-                except ValueError:
-                    print("Please enter a valid number.")
-
-            # 6. USDT reserve
-            while True:
-                try:
-                    reserve_balance_usdt = float(input("Enter the USDT reserve balance (minimum USDT to keep): ").strip())
-                    if reserve_balance_usdt >= 0:
-                        print(f"USDT Reserve set to: {reserve_balance_usdt} USDT")
-                        break
-                    print("Reserve balance must be non-negative.")
-                except ValueError:
-                    print("Please enter a valid number.")
-
-            # 7. Finally timeframe configuration
-            timeframe_config = {}
-            timeframes = ['daily', 'weekly', 'monthly']
-            
-            for timeframe in timeframes:
-                print(f"\n{Fore.CYAN}Configure {timeframe.capitalize()} Settings:")
-                print(f"{Fore.YELLOW}Note: Thresholds must be entered in ascending order (e.g., 1%, 2%, 3%)")
-                while True:
-                    enabled_input = input(f"Enable {timeframe} trading? (yes/no): ").strip().lower()
-                    if enabled_input in ['yes', 'no']:
-                        enabled = enabled_input == 'yes'
-                        break
-                    print("Invalid input. Please enter 'yes' or 'no'.")
-                
-                if enabled:
-                    while True:
-                        try:
-                            num_thresholds = int(input(f"Enter the number of {timeframe} drop thresholds: ").strip())
-                            if 0 < num_thresholds <= 10:
-                                break
-                            print("Please enter a number between 1 and 10.")
-                        except ValueError:
-                            print("Please enter a valid number.")
-
-                    thresholds = []
-                    last_threshold = 0  # Keep track of last threshold
-                    for i in range(num_thresholds):
-                        while True:
-                            try:
-                                threshold_input = float(input(f"Enter {timeframe} drop threshold {i+1} percentage (must be > {last_threshold:.1f}%): ").strip())
-                                threshold = threshold_input / 100
-                                
-                                # Compare the input values directly, not the converted ones
-                                if threshold_input <= last_threshold:
-                                    print(f"Threshold must be higher than {last_threshold:.1f}%")
-                                    continue
-                                    
-                                if 0 < threshold_input <= 100:
-                                    thresholds.append(threshold)
-                                    last_threshold = threshold_input  # Store the input percentage, not the converted value
-                                    break
-                                    
-                                print("Threshold must be between 0 and 100 percent.")
-                            except ValueError:
-                                print("Please enter a valid number.")
-                    
-                    timeframe_config[timeframe] = {
-                        'enabled': enabled,
-                        'thresholds': thresholds,
-                        'orders_placed': {}
-                    }
-                else:
-                    timeframe_config[timeframe] = {
-                        'enabled': False,
-                        'thresholds': [],
-                        'orders_placed': {}
-                    }
-
-            # Initialize and run bot with error handling
-            try:
-                bot = BinanceBot(use_testnet, use_telegram, timeframe_config, order_type, use_percentage, trade_amount, reserve_balance_usdt)
-                bot.test_connection()
-                bot.run()
-            except Exception as e:
-                print(f"Error initializing bot: {str(e)}")
-                logging.error(f"Error initializing bot: {str(e)}")
-
+        config = ConfigHandler.load_config(use_env=os.environ.get('DOCKER', '').lower() == 'true')
+        bot = BinanceBot(config)
+        bot.test_connection()
+        bot.run()
     except KeyboardInterrupt:
         print("\nBot shutdown requested by user.")
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         logging.error(f"Unexpected error: {str(e)}")
+
+
+
+
+
+
+
+
+
+
+
 
 
 

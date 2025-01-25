@@ -14,9 +14,9 @@ def setup_logger(name='BinanceBot'):
     logger = logging.getLogger(name)
     logger.setLevel(logging.DEBUG)
 
-    # Create formatters
+    # Create formatters - Fix the typo in levelname
     detailed_formatter = logging.Formatter(
-        '%(asctime)s - %(name)s - %(levellevel)s - %(filename)s:%(lineno)d - %(message)s',
+        '%(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
     
@@ -25,39 +25,42 @@ def setup_logger(name='BinanceBot'):
         datefmt='%Y-%m-%d %H:%M:%S'
     )
 
-    # Create debug file handler with UTF-8 encoding
+    # Create debug file handler
     debug_file = f'logs/debug_{datetime.now().strftime("%Y%m%d")}.log'
-    debug_handler = logging.FileHandler(debug_file, encoding='utf-8', mode='a')
+    debug_handler = RotatingFileHandler(
+        debug_file,
+        maxBytes=10*1024*1024,  # 10MB
+        backupCount=5,
+        encoding='utf-8'
+    )
     debug_handler.setLevel(logging.DEBUG)
     debug_handler.setFormatter(detailed_formatter)
     
-    # Create trades file handler with UTF-8 encoding
+    # Create trades file handler
     trades_file = f'logs/trades_{datetime.now().strftime("%Y%m%d")}.log'
-    file_handler = logging.FileHandler(trades_file, encoding='utf-8', mode='a')
+    file_handler = RotatingFileHandler(
+        trades_file,
+        maxBytes=10*1024*1024,  # 10MB
+        backupCount=5,
+        encoding='utf-8'
+    )
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(simple_formatter)
 
-    # Create console handler with UTF-8 encoding and special handling for Windows
-    if os.name == 'nt':  # Windows
-        import sys
-        import codecs
+    # Fixed SafeStreamHandler implementation
+    class SafeStreamHandler(logging.StreamHandler):
+        def emit(self, record):
+            try:
+                msg = self.format(record)
+                stream = self.stream
+                # Write directly as string, not bytes
+                stream.write(msg + self.terminator)
+                self.flush()
+            except Exception:
+                self.handleError(record)
 
-        class SafeStreamHandler(logging.StreamHandler):
-            def emit(self, record):
-                try:
-                    msg = self.format(record)
-                    stream = self.stream.buffer if hasattr(self.stream, 'buffer') else self.stream
-                    stream.write(msg.encode('utf-8', errors='replace'))
-                    stream.write(b'\n')
-                    self.flush()
-                except Exception:
-                    self.handleError(record)
-        
-        sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'replace')
-        console_handler = SafeStreamHandler(sys.stdout)
-    else:
-        console_handler = logging.StreamHandler()
-    
+    # Configure console handler
+    console_handler = SafeStreamHandler(sys.stdout)
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(simple_formatter)
     
@@ -71,5 +74,23 @@ def setup_logger(name='BinanceBot'):
     
     # Prevent logs from being sent to root logger
     logger.propagate = False
+
+    # Add API request logger
+    api_handler = RotatingFileHandler(
+        'logs/api_requests.log',
+        maxBytes=10*1024*1024,  # 10MB
+        backupCount=5,
+        encoding='utf-8'
+    )
+    api_handler.setLevel(logging.DEBUG)
+    api_handler.setFormatter(
+        logging.Formatter('%(asctime)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+    )
+
+    # Create API logger
+    api_logger = logging.getLogger('API_Requests')
+    api_logger.setLevel(logging.DEBUG)
+    api_logger.addHandler(api_handler)
+    api_logger.propagate = False
     
-    return logger
+    return logger, api_logger

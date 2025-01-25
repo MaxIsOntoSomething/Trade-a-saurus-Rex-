@@ -3,11 +3,22 @@
     "BINANCE_API_SECRET": "YOUR_BINANCE_API_SECRET",
     "TESTNET_API_KEY": "YOUR_TESTNET_API_KEY",
     "TESTNET_API_SECRET": "YOUR_TESTNET_API_SECRET",
-    "TRADING_SYMBOLS": ["BTCUSDT", "ETHUSDT"],
-    "TIME_INTERVAL": "1d",
-    "TELEGRAM_TOKEN": "YOUR_TELEGRAM_BOT_TOKEN",
-    "TELEGRAM_CHAT_ID": "YOUR_TELEGRAM_CHAT_ID",
-    "DEFAULT_RESERVE_BALANCE": 1000,
+    "USE_TESTNET": true,
+    "TRADING_SYMBOLS": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+    
+    "TELEGRAM_SETTINGS": {
+        "USE_TELEGRAM": false,
+        "TELEGRAM_TOKEN": "",
+        "TELEGRAM_CHAT_ID": ""
+    },
+    
+    "TRADING_SETTINGS": {
+        "ORDER_TYPE": "limit",
+        "USE_PERCENTAGE": false,
+        "TRADE_AMOUNT": 10,
+        "RESERVE_BALANCE": 2000
+    },
+
     "TIMEFRAMES": {
         "daily": {
             "enabled": true,
@@ -15,11 +26,17 @@
         },
         "weekly": {
             "enabled": true,
-            "thresholds": [0.01, 0.02, 0.03]
+            "thresholds": [0.03, 0.05, 0.07]
         },
         "monthly": {
             "enabled": true,
-            "thresholds": [0.01, 0.02, 0.03]
+            "thresholds": [0.05, 0.08, 0.12]
         }
+    },
+
+    "DASHBOARD_SETTINGS": {
+        "ENABLED": false,
+        "PORT": 8050,
+        "HOST": "localhost"
     }
 }

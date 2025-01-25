@@ -1,6 +1,6 @@
 # Binance Trading Bot
 
-A sophisticated cryptocurrency trading bot that implements a drop-based buying strategy across multiple timeframes with advanced visualization capabilities and portfolio management.
+A Self Made Cryptocurrency Bot that buys for me to safe Money on the side , this is a hobby project.
 
 ## Core Features 🚀
 
@@ -246,6 +246,7 @@ Features:
 
 ### Docker Management Commands
 
+```sh
 # Build the container
 docker-compose build
 
@@ -263,6 +264,51 @@ docker-compose down -v
 
 # Rebuild and restart
 docker-compose up -d --build
+```
+
+## Example Calculations
+
+### Price Drop Calculation
+
+Assume the following configuration for daily timeframe:
+- Enabled: true
+- Thresholds: [0.01, 0.02, 0.03]
+
+If the reference price (open price) for BTCUSDT is $50,000 and the current price drops to $49,000:
+- Drop percentage = (50,000 - 49,000) / 50,000 = 0.02 (2%)
+
+The bot will trigger a buy order at the 2% drop threshold.
+
+### Profit Calculation
+
+Assume a trade with the following details:
+- Entry price: $49,000
+- Quantity: 0.1 BTC
+- Current price: $51,000
+
+Gross profit:
+- Gross profit = (51,000 - 49,000) * 0.1 = $200
+
+Tax (28%):
+- Tax = 200 * 0.28 = $56
+
+Net profit:
+- Net profit = 200 - 56 = $144
+
+### Portfolio Summary
+
+Assume the following trades:
+- BTCUSDT: 0.1 BTC at $49,000
+- ETHUSDT: 1 ETH at $3,000
+
+Current prices:
+- BTCUSDT: $51,000
+- ETHUSDT: $3,200
+
+Portfolio value:
+- BTC value = 0.1 * 51,000 = $5,100
+- ETH value = 1 * 3,200 = $3,200
+- Total value = $5,100 + $3,200 = $8,300
 
 ## 🚧 TODO & Future Features
 

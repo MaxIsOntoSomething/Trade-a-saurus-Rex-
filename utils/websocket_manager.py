@@ -52,69 +52,181 @@ class WebSocketManager:
             'monthly': None
         }  # Add this for countdown timers
 
+        # Add resync settings
+        self.last_sync_time = 0
+        self.sync_interval = 1800  # Sync every 30 minutes
+        self.client = client
+        self._ensure_time_sync()
+
+        # Add connection state tracking
+        self.connection_state = {
+            'ws': None,
+            'is_connected': False,
+            'last_pong': time.time(),
+            'last_sync': 0
+        }
+
+    def _ensure_time_sync(self):
+        """Ensure time is synced with Binance server"""
+        current_time = time.time()
+        if current_time - self.last_sync_time > self.sync_interval:
+            try:
+                server_time = self.client.get_server_time()
+                self.time_offset = server_time['serverTime'] - int(current_time * 1000)
+                self.last_sync_time = current_time
+                self.logger.debug(f"Time synced with server. Offset: {self.time_offset}ms")
+            except Exception as e:
+                self.logger.error(f"Failed to sync time: {e}")
+
     def add_callback(self, callback):
         """Add callback function to be called when price updates are received"""
         self.callbacks.append(callback)
 
+    async def _ensure_connection(self):
+        """Verify connection is alive and websocket is open"""
+        if (not self.connection_state['is_connected'] or 
+            not self.connection_state['ws'] or 
+            not self.connection_state['ws'].open):
+            await self._reconnect()
+            return False
+        return True
+
+    async def _reconnect(self):
+        """Handle reconnection with proper cleanup"""
+        self.connection_state['is_connected'] = False
+        if self.connection_state['ws']:
+            try:
+                await self.connection_state['ws'].close()
+            except Exception:
+                pass
+        self.connection_state['ws'] = None
+        
+        # Reset timestamp sync
+        await self._sync_time()
+        
+        # Trigger reconnection
+        self.connection_attempts += 1
+        await self.start()
+
+    async def _sync_time(self):
+        """Synchronize time with Binance server"""
+        try:
+            # Call server time directly without _make_api_call to avoid recursion
+            server_time = self.client.get_server_time()
+            self.time_offset = server_time['serverTime'] - int(time.time() * 1000)
+            self.connection_state['last_sync'] = time.time()
+            self.logger.debug(f"Time synchronized. Offset: {self.time_offset}ms")
+        except Exception as e:
+            self.logger.error(f"Time sync failed: {e}")
+
+    async def _make_api_call(self, func, *args, **kwargs):
+        """Make API call with timestamp"""
+        # Don't sync time here to avoid recursion with _sync_time
+        if 'timestamp' in kwargs or func.__name__ not in ['get_server_time']:
+            kwargs['timestamp'] = int(time.time() * 1000) + self.time_offset
+        
+        return func(*args, **kwargs)
+
     async def start(self):
-        """Start WebSocket connection with improved error handling"""
+        """Start WebSocket connection with improved state management"""
         while True:
             try:
-                # Select endpoint based on connection attempts
-                endpoint = self.backup_endpoints[self.connection_attempts % len(self.backup_endpoints)]
+                # Ensure time sync before connection
+                await self._sync_time()
                 
-                # Calculate backoff with jitter
+                endpoint = self.backup_endpoints[self.connection_attempts % len(self.backup_endpoints)]
                 delay = min(300, (2 ** self.connection_attempts)) * (0.8 + 0.4 * random.random())
                 
                 if self.connection_attempts > 0:
-                    print(f"Reconnecting in {delay:.1f} seconds using {endpoint}")
+                    self.logger.info(f"Reconnecting in {delay:.1f}s using {endpoint}")
                     await asyncio.sleep(delay)
 
-                async with websockets.connect(
+                # Create WebSocket connection with shorter timeouts
+                websocket = await websockets.connect(
                     endpoint,
-                    ping_interval=self.ping_interval,
-                    ping_timeout=self.ping_timeout,
-                    close_timeout=self.websocket_timeout
-                ) as websocket:
-                    self.ws = websocket
-                    self.is_connected = True
-                    self.connection_attempts = 0
-                    self.last_pong = time.time()
-                    
-                    # Start keepalive task
-                    self.keepalive_task = asyncio.create_task(self._keepalive_loop())
-                    
-                    # Subscribe to streams
-                    await self._subscribe_to_streams()
-                    
+                    ping_interval=20,  # Reduce ping interval
+                    ping_timeout=10,    # Shorter ping timeout
+                    close_timeout=10,   # Shorter close timeout
+                    compression=None
+                )
+
+                # Update connection state
+                self.connection_state.update({
+                    'ws': websocket,
+                    'is_connected': True,
+                    'last_pong': time.time()
+                })
+                
+                # Update class-level ws reference
+                self.ws = websocket
+                self.connection_attempts = 0
+                
+                # Start keepalive task
+                if self.keepalive_task and not self.keepalive_task.done():
+                    self.keepalive_task.cancel()
+                self.keepalive_task = asyncio.create_task(self._keepalive_loop())
+                
+                # Subscribe to streams
+                await self._subscribe_to_streams()
+                
+                # Initial prices update
+                await self._send_initial_prices()
+                
+                try:
+                    # Main message loop
                     while True:
                         try:
                             message = await asyncio.wait_for(
                                 websocket.recv(),
-                                timeout=self.websocket_timeout
+                                timeout=30  # 30 second timeout for messages
                             )
-                            self.last_pong = time.time()
+                            self.connection_state['last_pong'] = time.time()
                             await self._handle_socket_message(json.loads(message))
+                            
                         except asyncio.TimeoutError:
-                            print(f"{Fore.YELLOW}WebSocket timeout, reconnecting...")
-                            break
+                            # Send ping on timeout
+                            try:
+                                await websocket.ping()
+                                self.logger.debug("Ping sent")
+                                continue
+                            except:
+                                break
                         except websockets.ConnectionClosed as e:
-                            print(f"{Fore.YELLOW}WebSocket closed: {e.code} {e.reason}")
+                            self.logger.warning(f"WebSocket closed: {e.code} {e.reason}")
                             break
-                
+                            
+                finally:
+                    # Cleanup tasks on loop exit
+                    if self.keepalive_task and not self.keepalive_task.done():
+                        self.keepalive_task.cancel()
+                    
             except Exception as e:
-                self.is_connected = False
+                self.connection_state['is_connected'] = False
                 self.logger.error(f"WebSocket error: {e}")
                 
-                if self.keepalive_task:
-                    self.keepalive_task.cancel()
-                    
+                # Reset WebSocket references
+                self.ws = None
+                self.connection_state['ws'] = None
+                
+                # Increment connection attempts
                 self.connection_attempts += 1
+                
                 if self.connection_attempts >= self.max_reconnect_attempts:
-                    print(f"{Fore.RED}Max reconnection attempts reached. Waiting for manual intervention.")
-                    await asyncio.sleep(300)  # Wait 5 minutes before trying again
+                    self.logger.error("Max reconnection attempts reached")
+                    await asyncio.sleep(300)  # 5 minute cooldown
                     self.connection_attempts = 0
-                continue
+
+    async def _heartbeat_loop(self):
+        """Send periodic heartbeats to keep connection alive"""
+        while self.connection_state['is_connected']:
+            try:
+                if self.connection_state['ws'] and not self.connection_state['ws'].closed:
+                    await self.connection_state['ws'].ping()
+                    self.logger.debug("Heartbeat ping sent")
+                await asyncio.sleep(15)  # Send heartbeat every 15 seconds
+            except Exception as e:
+                self.logger.error(f"Heartbeat error: {e}")
+                break
 
     async def _send_initial_prices(self):
         """Send initial prices for all symbols"""
@@ -269,9 +381,11 @@ class WebSocketManager:
     async def stop(self):
         """Stop WebSocket connection with improved cleanup"""
         try:
+            # Set connection state first to stop loops
+            self.connection_state['is_connected'] = False
             self.is_connected = False
 
-            # Cancel keepalive task first
+            # Cancel keepalive task with proper cleanup
             if self.keepalive_task and not self.keepalive_task.done():
                 self.keepalive_task.cancel()
                 try:
@@ -279,24 +393,26 @@ class WebSocketManager:
                 except asyncio.CancelledError:
                     pass
 
-            # Close WebSocket connection
-            if self.ws:
+            # Close WebSocket connection with proper state handling
+            if self.connection_state['ws']:
+                ws = self.connection_state['ws']
                 try:
-                    await self.ws.close()
+                    if not ws.closed and not ws._closed:
+                        await ws.close()
                 except Exception as e:
                     self.logger.warning(f"Error closing WebSocket: {e}")
                 finally:
-                    self.ws = None
+                    self.connection_state['ws'] = None
 
+            # Clear other tasks and state
+            self.callbacks = []
+            self.last_prices = {}
+            self.initial_prices_sent = False
+            
             self.logger.info("WebSocket connection closed")
 
         except Exception as e:
             self.logger.error(f"Error stopping WebSocket: {e}")
-        finally:
-            # Ensure we clear all state
-            self.callbacks = []
-            self.last_prices = {}
-            self.initial_prices_sent = False
 
     async def _refresh_timer(self):
         """Force refresh prices every 60 seconds"""
@@ -367,40 +483,66 @@ class WebSocketManager:
                 break
 
     async def _keepalive_loop(self):
-        """Maintain WebSocket connection with keepalive pings"""
-        while self.is_connected:
+        """Improved keepalive with proper state checking"""
+        while self.connection_state['is_connected']:
             try:
-                if time.time() - self.last_pong > self.websocket_timeout:
-                    print(f"{Fore.YELLOW}Keepalive timeout detected, forcing reconnection...")
-                    if self.ws:  # Only check if ws exists
-                        try:
-                            await self.ws.close(code=1012, reason="Keepalive timeout")
-                        except:
-                            pass  # Ignore errors during close
+                current_time = time.time()
+                
+                # Check connection health
+                if current_time - self.connection_state['last_pong'] > self.websocket_timeout:
+                    self.logger.warning("Keepalive timeout detected")
+                    await self._reconnect()
                     break
                 
-                if self.ws:  # Only attempt ping if ws exists
+                # Check websocket state properly
+                ws = self.connection_state['ws']
+                if ws:
                     try:
-                        await self.ws.ping()
-                    except:
-                        # If ping fails, force reconnect
-                        self.is_connected = False
+                        # Use ping to check connection
+                        pong_waiter = await ws.ping()
+                        await asyncio.wait_for(pong_waiter, timeout=self.ping_timeout)
+                        self.connection_state['last_pong'] = time.time()
+                    except Exception:
+                        self.logger.warning("WebSocket ping failed")
+                        await self._reconnect()
                         break
-                
+                        
                 await asyncio.sleep(self.ping_interval)
                 
             except Exception as e:
                 self.logger.error(f"Keepalive error: {e}")
-                self.is_connected = False  # Force reconnect on error
+                await self._reconnect()
                 break
 
     async def _subscribe_to_streams(self):
         """Subscribe to price streams"""
-        streams = [f"{symbol.lower()}@ticker" for symbol in self.symbols]
-        subscribe_msg = {
-            "method": "SUBSCRIBE",
-            "params": streams,
-            "id": 1
-        }
-        await self.ws.send(json.dumps(subscribe_msg))
+        try:
+            # Use connection_state['ws'] instead of self.ws
+            if not self.connection_state['ws']:
+                self.logger.error("WebSocket not initialized")
+                return
+                
+            streams = [f"{symbol.lower()}@ticker" for symbol in self.symbols]
+            subscribe_msg = {
+                "method": "SUBSCRIBE",
+                "params": streams,
+                "id": 1
+            }
+            
+            await self.connection_state['ws'].send(json.dumps(subscribe_msg))
+            self.logger.info(f"Subscribed to {len(streams)} streams")
+            
+        except Exception as e:
+            self.logger.error(f"Error subscribing to streams: {e}")
+            # Trigger reconnection on subscription error
+            await self._reconnect()
+
+    async def _handle_connection_error(self):
+        """Handle connection errors with exponential backoff"""
+        self.connection_attempts += 1
+        if self.connection_attempts >= self.max_reconnect_attempts:
+            self.logger.error("Max reconnection attempts reached")
+            await asyncio.sleep(300)  # 5 minute cooldown
+            self.connection_attempts = 0
+        await self._sync_time()  # Ensure time is synced after error
 
