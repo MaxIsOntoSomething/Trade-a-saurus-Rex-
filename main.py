@@ -530,120 +530,60 @@ class BinanceBot:
             raise
 
     async def execute_trade(self, symbol, price):
-        """Execute trade with proper order tracking"""
+        """Execute trade with improved feedback"""
         try:
-            # Check balance status first
             if not await self.check_balance_status():
-                return
-
-            # Use cached price instead of fetching new one
-            current_price = await self.get_cached_price(symbol)
-            
-            # Get exchange info without timestamp for both Testnet and Live API
-            try:
-                if not hasattr(self, 'symbol_info_cache'):
-                    self.symbol_info_cache = {}
-                    
-                    # Handle both Testnet and Live API differently
-                    try:
-                        if self.use_testnet:
-                            # Testnet requires simpler call
-                            exchange_info = self.client.get_exchange_info()
-                        else:
-                            # Live API can use the full call
-                            exchange_info = await self._make_api_call(
-                                self.client.get_exchange_info,
-                                _no_timestamp=True
-                            )
-                            
-                        # Cache all symbols
-                        for info in exchange_info['symbols']:
-                            self.symbol_info_cache[info['symbol']] = info
-                            
-                    except Exception as e:
-                        self.logger.error(f"Error getting exchange info: {e}")
-                        return False
-
-                # Get symbol info from cache or fetch directly
-                symbol_info = self.symbol_info_cache.get(symbol)
-                if not symbol_info:
-                    try:
-                        if self.use_testnet:
-                            # For testnet, get full exchange info and find symbol
-                            exchange_info = self.client.get_exchange_info()
-                            symbol_info = next(
-                                (info for info in exchange_info['symbols'] if info['symbol'] == symbol),
-                                None
-                            )
-                        else:
-                            # For live API, get specific symbol info
-                            symbol_info = await self._make_api_call(
-                                self.client.get_symbol_info,
-                                symbol=symbol,
-                                _no_timestamp=True
-                            )
-                            
-                        if not symbol_info:
-                            raise ValueError(f"Symbol info not found for {symbol}")
-                            
-                        self.symbol_info_cache[symbol] = symbol_info
-                        
-                    except Exception as e:
-                        self.logger.error(f"Error getting symbol info for {symbol}: {e}")
-                        return False
-
-            except Exception as e:
-                self.logger.error(f"Error getting symbol info for {symbol}: {e}")
                 return False
 
-            # Get price filter for precision
-            price_filter = next((f for f in symbol_info['filters'] if f['filterType'] == 'PRICE_FILTER'), None)
-            if not price_filter:
-                raise ValueError(f"Price filter not found for {symbol}")
-
-            tick_size = float(price_filter['tickSize'])
-            price_precision = len(str(tick_size).rstrip('0').split('.')[-1])
-            formatted_price = f"{current_price:.{price_precision}f}"
-
-            # Check and handle insufficient balance
+            print(f"\n🎯 Trade opportunity detected for {symbol}")
+            
+            # Get available balance
             available_usdt = await self.get_available_usdt()
             if available_usdt < self.trade_amount:
-                # Set cooldown timestamp and reason
-                self.insufficient_balance_timestamp = datetime.now(timezone.utc)
-                self.balance_pause_reason = "insufficient" if available_usdt > 0 else "reserve"
-                
-                # Cancel all pending orders
-                await self.cancel_all_orders()
-                
-                pause_message = (
-                    "🚨 Trading paused for 24 hours\n"
-                    f"Reason: {'Balance below reserve' if self.balance_pause_reason == 'reserve' else 'Insufficient balance'}\n"
-                    f"Available: {available_usdt} USDT\n"
-                    f"Required: {self.trade_amount} USDT\n"
-                    f"Reserve: {self.reserve_balance_usdt} USDT\n"
-                    "All pending orders have been cancelled."
-                )
-                
-                print(f"{Fore.YELLOW}{pause_message}")
-                if self.telegram_handler:
-                    await self.telegram_handler.send_message(pause_message)
-                return
+                print(f"\n⚠️ Insufficient balance: {available_usdt:.2f} USDT")
+                return False
 
             # Calculate trade amount
-            trade_amount = available_usdt * self.trade_amount if self.use_percentage else min(self.trade_amount, available_usdt)
-            
-            # Get lot size filter for quantity precision
-            lot_size_filter = next((f for f in symbol_info['filters'] if f['filterType'] == 'LOT_SIZE'), None)
-            if not lot_size_filter:
-                raise ValueError(f"Lot size filter not found for {symbol}")
+            trade_amount = (
+                available_usdt * self.trade_amount 
+                if self.use_percentage 
+                else min(self.trade_amount, available_usdt)
+            )
 
-            step_size = float(lot_size_filter['stepSize'])
-            quantity_precision = len(str(step_size).rstrip('0').split('.')[-1])
-            quantity = (trade_amount / current_price)
-            quantity = round(quantity - (quantity % float(step_size)), quantity_precision)
-            formatted_quantity = f"{quantity:.{quantity_precision}f}"
+            print(f"💰 Trade amount: {trade_amount:.2f} USDT")
 
-            # Create order parameters with proper validation
+            # Get symbol info from API handler
+            symbol_info = await self.api_handler.get_symbol_info(symbol)
+            if not symbol_info:
+                raise ValueError(f"Symbol info not found for {symbol}")
+
+            # Create and execute order
+            order = await self._create_order(symbol, price, trade_amount, symbol_info)
+            if not order:
+                return False
+
+            # Log successful order
+            print(f"\n✅ Order placed successfully for {symbol}")
+            print(f"   Price: {order['price']}")
+            print(f"   Quantity: {order['origQty']}")
+            print(f"   Total: {float(order['price']) * float(order['origQty']):.2f} USDT")
+
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Trade execution failed for {symbol}: {e}")
+            print(f"\r❌ Trade failed for {symbol}: {e}")
+            return False
+
+    async def _create_order(self, symbol, price, amount, symbol_info):
+        """Create order with proper formatting"""
+        try:
+            # Format price and quantity
+            formatted_price, formatted_quantity = await self.api_handler._format_order_amounts(
+                symbol_info, price, amount
+            )
+
+            # Create order parameters
             order_params = {
                 'symbol': symbol,
                 'side': SIDE_BUY,
@@ -658,83 +598,21 @@ class BinanceBot:
                     'quantity': formatted_quantity
                 })
             else:
-                # Market order: remove 'price'/'quantity', only use quoteOrderQty
                 order_params.update({
                     'type': ORDER_TYPE_MARKET,
-                    'quoteOrderQty': f"{trade_amount:.{quantity_precision}f}"
+                    'quoteOrderQty': f"{amount:.2f}"
                 })
 
-            # Add timestamp last
+            # Add timestamp and execute order
             order_params['timestamp'] = self._get_timestamp()
-
-            # Log the order parameters before sending
-            self.api_logger.debug(
-                f"Preparing order - Symbol: {symbol}\n"
-                f"Order Parameters: {order_params}"
+            return await self._make_api_call(
+                self.client.create_order,
+                **order_params
             )
 
-            # Place order with rate limiting
-            order = await self._make_api_call(self.client.create_order, **order_params)
-            
-            # Log the successful order
-            self.api_logger.info(
-                f"Order placed successfully:\n"
-                f"Order ID: {order['orderId']}\n"
-                f"Symbol: {symbol}\n"
-                f"Type: {order_params['type']}\n"
-                f"Side: {order_params['side']}\n"
-                f"Quantity: {formatted_quantity if 'quantity' in order_params else 'N/A'}\n"
-                f"Price: {formatted_price if 'price' in order_params else 'MARKET'}\n"
-                f"Quote Quantity: {order_params.get('quoteOrderQty', 'N/A')}"
-            )
-
-            # Create trade entry with new structure
-            order_time = datetime.now(timezone.utc)
-            cancel_time = order_time + self.limit_order_timeout
-            
-            bot_order_id = self.generate_order_id(symbol)  # Add this line to generate order ID
-            
-            self.trades[bot_order_id] = {
-                'trade_info': {
-                    'symbol': symbol,
-                    'entry_price': float(formatted_price),
-                    'quantity': float(formatted_quantity),
-                    'total_cost': float(formatted_price) * float(formatted_quantity),
-                    'current_value': None,
-                    'profit_usdt': None,
-                    'profit_percentage': None,
-                    'status': 'PENDING',
-                    'type': 'bot'
-                },
-                'order_metadata': {
-                    'order_id': order['orderId'],  # Fix: orderId instead of OrderId
-                    'placed_time': order_time.isoformat(),
-                    'cancel_time': cancel_time.isoformat(),
-                    'last_check': order_time.isoformat()
-                }
-            }
-            
-            # Save trades immediately
-            await self._save_trades_atomic()
-            
-            # Start monitoring task
-            asyncio.create_task(self.monitor_order(bot_order_id))
-            
-            return True
-            
-        except BinanceAPIException as e:
-            self.logger.error(f"Binance API error in execute_trade: {str(e)}")
-            print(f"{Fore.RED}Binance API error in execute_trade: {str(e)}")
-            return False
-            
         except Exception as e:
-            self.api_logger.error(f"Trade execution failed:\nSymbol: {symbol}\nError: {str(e)}")
-            print(f"{Fore.RED}Error executing trade for {symbol}: {str(e)}")
-            # Clean up if something went wrong
-            if 'bot_order_id' in locals() and bot_order_id in self.trades:
-                del self.trades[bot_order_id]
-                await self._save_trades_atomic()
-            return False
+            self.logger.error(f"Order creation failed: {e}")
+            raise
 
     async def monitor_order(self, trade_id):
         """Monitor order with new structure"""

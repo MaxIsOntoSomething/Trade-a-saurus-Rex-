@@ -75,8 +75,26 @@ def setup_logger(name='BinanceBot'):
     # Prevent logs from being sent to root logger
     logger.propagate = False
 
-    # Create unified API logger with comprehensive formatting
-    api_formatter = logging.Formatter(
+    # Replace the old API formatter section with this improved version
+    class APIFormatter(logging.Formatter):
+        def format(self, record):
+            # Add default attributes if not present
+            defaults = {
+                'api_type': 'API_CALL',
+                'request_data': 'N/A',
+                'response_data': 'N/A',
+                'duration': 0.0,
+                'details': ''
+            }
+            
+            for key, default in defaults.items():
+                if not hasattr(record, key):
+                    setattr(record, key, default)
+                    
+            return super().format(record)
+
+    # Create API formatter instance
+    api_formatter = APIFormatter(
         '%(asctime)s - [%(levelname)s] - %(message)s\n'
         'Type: %(api_type)s\n'
         'Request: %(request_data)s\n'
@@ -84,17 +102,10 @@ def setup_logger(name='BinanceBot'):
         'Duration: %(duration).3fms\n'
         'Details: %(details)s\n'
         '----------------------------------------',
-        datefmt='%Y-%m-%d %H:%M:%S',
-        defaults={
-            'api_type': 'API_CALL',
-            'request_data': 'N/A',
-            'response_data': 'N/A',
-            'duration': 0.0,
-            'details': ''
-        }
+        datefmt='%Y-%m-%d %H:%M:%S'
     )
-    
-    # Single API log handler
+
+    # Update API handler to use new formatter
     api_handler = RotatingFileHandler(
         'logs/api.log',
         maxBytes=10*1024*1024,
@@ -104,7 +115,7 @@ def setup_logger(name='BinanceBot'):
     api_handler.setLevel(logging.DEBUG)
     api_handler.setFormatter(api_formatter)
 
-    # Create unified API logger
+    # Remove the old duplicate section and replace with:
     api_logger = logging.getLogger('API')
     api_logger.setLevel(logging.DEBUG)
     api_logger.addHandler(api_handler)

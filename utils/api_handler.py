@@ -21,6 +21,9 @@ class APIHandler:
         self.recv_window = 5000
         self.time_offset = 0
         self.last_sync = 0
+        self.symbol_info_cache = {}  # Add symbol info cache
+        self.last_info_update = 0
+        self.info_update_interval = 3600  # Update exchange info every hour
 
         # Update no_timestamp_methods to include all read-only endpoints
         self.no_timestamp_methods = {
@@ -59,39 +62,58 @@ class APIHandler:
     async def _make_api_call(self, func, *args, _no_timestamp=False, **kwargs):
         """Make API call with rate limiting and visual feedback"""
         await self.rate_limiter.acquire()
-        
-        # Get endpoint name from function
+        call_time = datetime.now(timezone.utc)
         endpoint = func.__name__.replace('get_', '').replace('_', ' ').title()
         
+        log_data = {
+            'api_type': 'API_CALL',
+            'request_data': {
+                'function': func.__name__,
+                'args': args,
+                'kwargs': {k: v for k, v in kwargs.items() 
+                          if not k.lower() in ['apikey', 'secret']}
+            }
+        }
+        
         try:
-            # Special handling for Testnet endpoints
-            is_testnet = hasattr(self.client, 'API_URL') and 'testnet' in self.client.API_URL
-            
-            # Remove timestamp for certain endpoints
-            if func.__name__ in self.no_timestamp_methods or _no_timestamp:
-                kwargs.pop('timestamp', None)
-                
-            # Special handling for exchange info in Testnet
-            if is_testnet and func.__name__ in ['get_exchange_info', 'get_symbol_info']:
-                try:
-                    if func.__name__ == 'get_exchange_info':
-                        return self.client.get_exchange_info()
-                    elif func.__name__ == 'get_symbol_info':
-                        exchange_info = self.client.get_exchange_info()
-                        symbol = kwargs.get('symbol')
-                        return next((s for s in exchange_info['symbols'] if s['symbol'] == symbol), None)
-                except Exception as e:
-                    print(f"\r❌ {endpoint} failed in Testnet: {str(e)}", end='', flush=True)
-                    raise
-            
             print(f"\r📡 {endpoint}: Calling API...", end='', flush=True)
             response = func(*args, **kwargs)
-            print(f"\r✅ {endpoint}: Success", end='', flush=True)
+            duration = (datetime.now(timezone.utc) - call_time).total_seconds() * 1000
             
+            # Safely handle response logging
+            log_data.update({
+                'response_data': (
+                    response if isinstance(response, (dict, list)) 
+                    else str(response)
+                ),
+                'duration': duration
+            })
+            
+            self.logger.debug(
+                "API Call completed successfully",
+                extra=log_data
+            )
+            
+            print(f"\r✅ {endpoint}: Success {' '*20}", end='', flush=True)
             return response
             
         except Exception as e:
-            print(f"\r❌ {endpoint}: Failed - {str(e)}", end='', flush=True)
+            duration = (datetime.now(timezone.utc) - call_time).total_seconds() * 1000
+            
+            log_data.update({
+                'response_data': {
+                    'error_type': type(e).__name__,
+                    'error_message': str(e)
+                },
+                'duration': duration
+            })
+            
+            self.logger.error(
+                f"API Error: {str(e)}",
+                extra=log_data
+            )
+            
+            print(f"\r❌ {endpoint}: Failed - {str(e)}{' '*20}", end='', flush=True)
             raise
 
     async def _price_update_loop(self):
@@ -184,3 +206,89 @@ class APIHandler:
         except Exception as e:
             self.logger.error(f"Error fetching price for {symbol}: {e}")
             return None
+
+    async def get_symbol_info(self, symbol):
+        """Get cached symbol info or fetch new"""
+        current_time = time.time()
+        
+        # Update cache if expired
+        if current_time - self.last_info_update > self.info_update_interval:
+            try:
+                # Handle both testnet and live API
+                if hasattr(self.client, 'API_URL') and 'testnet' in self.client.API_URL:
+                    exchange_info = self.client.get_exchange_info()
+                else:
+                    exchange_info = await self._make_api_call(
+                        self.client.get_exchange_info,
+                        _no_timestamp=True
+                    )
+                
+                # Update cache
+                self.symbol_info_cache = {
+                    s['symbol']: s for s in exchange_info['symbols']
+                }
+                self.last_info_update = current_time
+                
+            except Exception as e:
+                self.logger.error(f"Error updating exchange info: {e}")
+                if not self.symbol_info_cache:
+                    raise
+        
+        return self.symbol_info_cache.get(symbol)
+
+    async def execute_trade(self, symbol, price, trade_amount):
+        """Execute trade with enhanced feedback"""
+        try:
+            print(f"\n🎯 Preparing trade for {symbol}...")
+            
+            # Get symbol info
+            symbol_info = await self.get_symbol_info(symbol)
+            if not symbol_info:
+                raise ValueError(f"Symbol info not found for {symbol}")
+            
+            # Format amounts using symbol info
+            formatted_price, formatted_quantity = await self._format_order_amounts(
+                symbol_info, price, trade_amount
+            )
+            
+            print(f"📊 Order details:\n"
+                  f"  Symbol: {symbol}\n"
+                  f"  Price: {formatted_price}\n"
+                  f"  Quantity: {formatted_quantity}\n"
+                  f"  Total: {float(formatted_price) * float(formatted_quantity):.2f} USDT")
+            
+            # Execute order code here...
+            
+        except Exception as e:
+            self.logger.error(f"Trade execution failed for {symbol}: {e}")
+            print(f"\r❌ Trade failed for {symbol}: {e}")
+            return False
+
+    async def _format_order_amounts(self, symbol_info, price, amount):
+        """Format order amounts according to symbol rules"""
+        try:
+            price_filter = next(
+                f for f in symbol_info['filters'] 
+                if f['filterType'] == 'PRICE_FILTER'
+            )
+            lot_size = next(
+                f for f in symbol_info['filters'] 
+                if f['filterType'] == 'LOT_SIZE'
+            )
+
+            tick_size = float(price_filter['tickSize'])
+            step_size = float(lot_size['stepSize'])
+
+            # Calculate precisions
+            price_precision = len(str(tick_size).rstrip('0').split('.')[-1])
+            quantity_precision = len(str(step_size).rstrip('0').split('.')[-1])
+
+            # Format price and quantity
+            formatted_price = f"{price:.{price_precision}f}"
+            quantity = amount / price
+            formatted_quantity = f"{(quantity - quantity % float(step_size)):.{quantity_precision}f}"
+
+            return formatted_price, formatted_quantity
+            
+        except Exception as e:
+            raise ValueError(f"Error formatting amounts: {e}")
