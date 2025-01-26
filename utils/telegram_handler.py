@@ -243,13 +243,14 @@ class TelegramHandler:
             # Essential commands only
             handlers = {
                 "start": self.handle_start,
-                "status": self.handle_status,      # New combined status command
-                "trades": self.handle_trades,      # Simplified trades view
-                "add": self.handle_addtrade,       # Manual trade entry
-                "stop": self.handle_emergency_stop,# Emergency stop
-                "help": self.handle_help          # Help command
+                "status": self.handle_status,      
+                "trades": self.handle_trades,      
+                "add": self.handle_addtrade,       
+                "stop": self.handle_emergency_stop,
+                "help": self.handle_help,
+                "thresholds": self.handle_thresholds  # Add new command
             }
-
+            
             # Register handlers
             for command, handler in handlers.items():
                 self.app.add_handler(CommandHandler(
@@ -260,6 +261,80 @@ class TelegramHandler:
         except Exception as e:
             self.logger.error(f"Error registering handlers: {e}")
             raise
+
+    async def handle_thresholds(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show detailed threshold information for all timeframes"""
+        try:
+            message = "📊 Threshold Status Overview\n\n"
+            now = datetime.now(timezone.utc)
+
+            for timeframe, config in self.bot.timeframe_config.items():
+                if not config.get('enabled', False):
+                    continue
+
+                # Get next reset time
+                next_reset = self.bot.next_reset_times[timeframe]
+                time_to_reset = next_reset - now
+                hours, remainder = divmod(time_to_reset.seconds, 3600)
+                minutes, _ = divmod(remainder, 60)
+
+                message += f"⏱️ {timeframe.upper()} Timeframe\n"
+                message += f"Next reset in: {time_to_reset.days}d {hours}h {minutes}m\n"
+                message += "Thresholds:\n"
+
+                # Get thresholds and their status
+                thresholds = config.get('thresholds', [])
+                for threshold in thresholds:
+                    threshold_pct = threshold * 100
+                    triggered = False
+                    last_trigger = None
+
+                    # Check if threshold was triggered in orders_placed
+                    for symbol in self.bot.valid_symbols:
+                        if (symbol in self.bot.orders_placed and 
+                            timeframe in self.bot.orders_placed[symbol] and
+                            threshold in self.bot.orders_placed[symbol][timeframe]):
+                            triggered = True
+                            last_trigger = self.bot.orders_placed[symbol][timeframe][threshold]
+                            break
+
+                    # Format status
+                    if triggered:
+                        trigger_time = datetime.fromisoformat(last_trigger)
+                        time_since = now - trigger_time
+                        message += f"  {threshold_pct:>5.2f}% ✅ ({time_since.days}d {time_since.seconds//3600}h ago)\n"
+                    else:
+                        message += f"  {threshold_pct:>5.2f}% ⏳ (waiting)\n"
+
+                message += "\n"
+
+            # Add current price changes
+            message += "Current Price Changes:\n"
+            for symbol in self.bot.valid_symbols:
+                ref_prices = self.bot.get_reference_prices(symbol)
+                if not ref_prices:
+                    continue
+
+                message += f"\n{symbol}:\n"
+                for timeframe, prices in ref_prices.items():
+                    if not prices['open']:
+                        continue
+                        
+                    # Get current price
+                    ticker = await self.bot.api.get_symbol_ticker(symbol)
+                    if not ticker:
+                        continue
+                        
+                    current_price = float(ticker['price'])
+                    change = ((current_price - prices['open']) / prices['open']) * 100
+                    arrow = "↑" if change >= 0 else "↓"
+                    
+                    message += f"  {timeframe}: {change:+.2f}% {arrow}\n"
+
+            await self.send_message(message)
+
+        except Exception as e:
+            await self.send_message(f"❌ Error getting threshold status: {e}")
 
     async def handle_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Combined status command showing prices, positions, and balance"""
@@ -303,6 +378,7 @@ class TelegramHandler:
             "/status - Show current prices and balance\n"
             "/trades - List active trades\n"
             "/add - Start manual trade entry\n"
+            "/thresholds - Show threshold status\n"
             "/stop - Emergency stop\n"
             "/help - Show this help message"
         )
