@@ -718,14 +718,6 @@ class TelegramHandler:
             if (symbol in self.bot.strategy.order_history[timeframe] and 
                 threshold in self.bot.strategy.order_history[timeframe][symbol]):
                 
-    def _format_threshold_status(self, symbol, timeframe, threshold, threshold_pct, 
-                               current_drop, now):
-        """Format single threshold status"""
-        try:
-            # Check if threshold is locked
-            if (symbol in self.bot.strategy.order_history[timeframe] and 
-                threshold in self.bot.strategy.order_history[timeframe][symbol]):
-                
                 last_order = self.bot.strategy.order_history[timeframe][symbol][threshold]
                 reset_time = self._get_reset_time(last_order, timeframe)
                 

@@ -22,6 +22,18 @@ class APIHandler:
         self.time_offset = 0
         self.last_sync = 0
 
+        # Update no_timestamp_methods to include more endpoints
+        self.no_timestamp_methods = {
+            'get_symbol_ticker',
+            'get_exchange_info',
+            'get_symbol_info',
+            'get_server_time',
+            'get_historical_klines',
+            'get_ticker',
+            'get_symbol_ticker',
+            'get_klines'
+        }
+
     def add_callback(self, callback):
         """Add callback function"""
         self.callbacks.append(callback)
@@ -54,59 +66,26 @@ class APIHandler:
         start_time = time.time()
         
         try:
-            # List of methods that don't need timestamp
-            no_timestamp_methods = {
-                'get_symbol_ticker',
-                'get_exchange_info',
-                'get_symbol_info',
-                'get_server_time',
-                'get_historical_klines'
-            }
+            # Remove timestamp for specific endpoints
+            if func.__name__ in self.no_timestamp_methods:
+                kwargs.pop('timestamp', None)
+                _no_timestamp = True
 
-            # Only add timestamp if needed and the method requires it
-            if not _no_timestamp and func.__name__ not in no_timestamp_methods:
+            if not _no_timestamp:
                 kwargs['timestamp'] = int(time.time() * 1000 + self.time_offset)
             
-            # Log request details
-            self.logger.debug(
-                'API Call',
-                extra={
-                    'api_type': 'API_CALL',
-                    'request_data': {
-                        'function': func.__name__,
-                        'args': args,
-                        'kwargs': {k: v for k, v in kwargs.items() if 'key' not in k.lower()}
-                    },
-                    'response_data': 'Pending',
-                    'duration': 0
-                }
-            )
+            # Clean up output with carriage return
+            print(f"\r⏳ Processing {endpoint}..." + " " * 50, end='', flush=True)
             
-            start_time = time.time()
             response = func(*args, **kwargs)
             duration = (time.time() - start_time) * 1000
 
-            # Log successful response
-            self.logger.debug(
-                'API Call completed successfully',
-                extra={
-                    'api_type': 'API_CALL',
-                    'request_data': {
-                        'function': func.__name__,
-                        'args': args,
-                        'kwargs': {k: v for k, v in kwargs.items() if 'key' not in k.lower()}
-                    },
-                    'response_data': response,
-                    'duration': duration
-                }
-            )
-            
-            print(f"\r✅ {endpoint} completed in {duration:.0f}ms")
+            print(f"\r✅ {endpoint} completed in {duration:.0f}ms" + " " * 50)
             return response
             
         except Exception as e:
             duration = (time.time() - start_time) * 1000
-            print(f"\r❌ {endpoint} failed after {duration:.0f}ms: {str(e)}")
+            print(f"\r❌ {endpoint} failed after {duration:.0f}ms: {str(e)}" + " " * 50)
             self.logger.error(
                 'API Call failed',
                 extra={
