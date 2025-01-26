@@ -1217,9 +1217,12 @@ class BinanceBot:
             if not await self.startup_checks():
                 raise Exception("Startup checks failed")
 
-            # Initialize price checking - Use BinanceAPI instead of APIHandler
+            # Initialize API
             if not await self.api.initialize_exchange_info():
                 raise Exception("Failed to initialize exchange info")
+
+            print(f"{Fore.GREEN}Starting price monitoring...")
+            self.logger.info("Starting price monitoring loop")
 
             while True:
                 try:
@@ -1232,6 +1235,7 @@ class BinanceBot:
                     await asyncio.sleep(2)
                     
                 except asyncio.CancelledError:
+                    print(f"{Fore.YELLOW}Price monitoring stopped")
                     break
                 except Exception as e:
                     self.logger.error(f"Error in main loop: {e}")
@@ -1240,9 +1244,6 @@ class BinanceBot:
         except Exception as e:
             self.logger.error(f"Fatal error in main loop: {e}")
             raise
-        finally:
-            if self.api_handler:
-                await self.api_handler.stop()
 
     async def handle_price_update(self, symbol, price):
         """Handle real-time price updates"""
@@ -1616,7 +1617,12 @@ class BinanceBot:
                     print(f"{Fore.RED}Failed to initialize Telegram - continuing without it")
                     self.telegram_handler = None
 
+            # Initialize bot
+            if not await self.initialize():
+                raise Exception("Failed to initialize bot")
+
             # Start main loop
+            print(f"{Fore.GREEN}Bot initialization complete. Starting main loop...")
             await self.main_loop()
             
         except Exception as e:
@@ -1742,9 +1748,6 @@ class BinanceBot:
             # Initialize API first
             if not await self.api.initialize_exchange_info():
                 raise Exception("Failed to initialize exchange info")
-
-            # Start price monitoring
-            await self.start_price_monitoring()
             return True
             
         except Exception as e:
