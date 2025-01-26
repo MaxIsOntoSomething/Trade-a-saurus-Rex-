@@ -465,7 +465,8 @@ class WebSocketManager:
             if self.connection_state['ws']:
                 ws = self.connection_state['ws']
                 try:
-                    if not ws.closed:
+                    # Use proper WebSocket check
+                    if hasattr(ws, 'close') and not getattr(ws, 'closed', False):
                         await ws.close()
                 except Exception as e:
                     self.logger.warning(f"Error closing WebSocket: {e}")

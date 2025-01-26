@@ -1092,30 +1092,47 @@ class TelegramHandler:
             )
 
     async def shutdown(self):
-        """Safely shutdown Telegram bot"""
+        """Enhanced Telegram shutdown with proper cleanup"""
         try:
             if not self.initialized:
                 return
 
             self.logger.info("Shutting down Telegram bot...")
             
-            # Cancel message processor
-            if self.message_processor_task:
-                self.message_processor_task.cancel()
-            
-            # Cancel polling task
-            if self.polling_task:
-                self.polling_task.cancel()
-            
-            # Stop application
-            await self.app.stop()
-            await self.app.shutdown()
-            
-            self.initialized = False
-            self.logger.info("Telegram bot shutdown complete")
-            
+            try:
+                # Cancel message processor first
+                if self.message_processor_task:
+                    self.message_processor_task.cancel()
+                    try:
+                        await self.message_processor_task
+                    except asyncio.CancelledError:
+                        pass
+
+                # Stop polling first
+                if hasattr(self.app, 'updater') and self.app.updater.running:
+                    await self.app.updater.stop()
+
+                # Then stop application
+                if self.app.running:
+                    await self.app.stop()
+                    await self.app.shutdown()
+                    
+                self.initialized = False
+                self.logger.info("Telegram bot shutdown complete")
+                
+            except Exception as e:
+                self.logger.error(f"Error during shutdown: {e}")
+                
         except Exception as e:
-            self.logger.error(f"Error during shutdown: {e}")
+            self.logger.error(f"Fatal error during shutdown: {e}")
+            
+        finally:
+            # Ensure everything is marked as not running
+            self.initialized = False
+            if hasattr(self, 'app'):
+                self.app.running = False
+                if hasattr(self.app, 'updater'):
+                    self.app.updater.running = False
 
     def _get_startup_message(self):
         """Generate startup message"""

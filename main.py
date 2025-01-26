@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 import psutil  # Add missing import
 import logging  # Add missing import
 import os  # Add missing import
+from pathlib import Path  # Add this import
 from config.config_handler import ConfigHandler
 from telegram.ext import Application  # Update import
 
@@ -169,17 +170,28 @@ class BinanceBot:
         }
         self.is_shutting_down = False
 
+        # Create data directory and trades file
+        self.trades_dir = Path('data')
+        self.trades_dir.mkdir(exist_ok=True)
+        self.trades_file = self.trades_dir / 'trades.json'
+        
+        # Initialize trades file if it doesn't exist
+        if not self.trades_file.exists():
+            with open(self.trades_file, 'w') as f:
+                json.dump({}, f)
+        
+        self.trades = self.load_trades()
+
     async def shutdown(self):
         """Enhanced graceful shutdown sequence"""
         if self.is_shutting_down:
             return
             
         self.is_shutting_down = True
-        self.logger.info("Initiating shutdown sequence...")
+        self.logger.info("Initiating clean shutdown sequence...")
         
         try:
-            # Cancel all pending orders first
-            await self.cancel_all_orders()
+            # Note: Removed cancel_all_orders for clean shutdown
             cleanup_tasks = []
 
             # Stop WebSocket connection
@@ -203,7 +215,7 @@ class BinanceBot:
         except Exception as e:
             self.logger.error(f"Error during shutdown: {e}")
         finally:
-            self.logger.info("Shutdown sequence completed")
+            self.logger.info("Shutdown sequence completed. Orders preserved.")
 
     def _sync_server_time(self):
         """Synchronize local time with Binance server time"""
@@ -329,8 +341,11 @@ class BinanceBot:
             current_time - self.price_cache[symbol]['timestamp'] < self.cache_duration):
             return self.price_cache[symbol]['price']
         
-        # If no cache or expired, fetch new price
-        ticker = await self._make_api_call(self.client.get_symbol_ticker, symbol=symbol)
+        # If no cache or expired, fetch new price - Remove timestamp from this call
+        ticker = await self._make_api_call(
+            self.client.get_symbol_ticker,
+            symbol=symbol  # Remove timestamp parameter
+        )
         price = float(ticker['price'])
         
         self.price_cache[symbol] = {
@@ -476,9 +491,16 @@ class BinanceBot:
             raise
 
     async def _save_trades_atomic(self):
-        """Save trades atomically"""
+        """Save trades atomically with initialization"""
         try:
+            # Ensure trades file exists
+            if not self.trades_file.exists():
+                self.trades_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(self.trades_file, 'w') as f:
+                    json.dump({}, f)
+                    
             await self.file_handler.save_json_atomic(self.trades_file, self.trades)
+            
         except Exception as e:
             self.logger.error(f"Error saving trades: {e}")
             raise
@@ -927,9 +949,16 @@ class BinanceBot:
             raise
 
     async def _save_trades_atomic(self):
-        """Save trades atomically"""
+        """Save trades atomically with initialization"""
         try:
+            # Ensure trades file exists
+            if not self.trades_file.exists():
+                self.trades_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(self.trades_file, 'w') as f:
+                    json.dump({}, f)
+                    
             await self.file_handler.save_json_atomic(self.trades_file, self.trades)
+            
         except Exception as e:
             self.logger.error(f"Error saving trades: {e}")
             raise
@@ -1446,7 +1475,7 @@ class BinanceBot:
                 # Run main loop with proper error handling
                 loop.run_until_complete(self.main_loop())
             except KeyboardInterrupt:
-                print(f"{Fore.YELLOW}\nShutdown requested by user...")
+                print(f"{Fore.YELLOW}\nClean shutdown requested. Preserving open orders...")
                 loop.run_until_complete(self.shutdown())
             except Exception as e:
                 print(f"{Fore.RED}\nError in main loop: {str(e)}")
@@ -1771,6 +1800,65 @@ class BinanceBot:
             print(f"{Fore.RED}Error updating invalid symbols file: {e}")
             self.logger.error(f"Error updating invalid symbols file: {e}")
 
+    async def cancel_all_orders(self):
+        """Cancel all pending orders and cleanup trades file"""
+        try:
+            self.logger.info("Cancelling all pending orders...")
+            cancelled = 0
+            
+            # Track which trades need status update
+            cancelled_trade_ids = set()
+            
+            for symbol in self.valid_symbols:
+                try:
+                    # Get open orders for symbol
+                    open_orders = await self._make_api_call(
+                        self.client.get_open_orders,
+                        symbol=symbol
+                    )
+                    
+                    for order in open_orders:
+                        try:
+                            await self._make_api_call(
+                                self.client.cancel_order,
+                                symbol=symbol,
+                                orderId=order['orderId']
+                            )
+                            
+                            # Find corresponding trade ID
+                            for trade_id, trade in self.trades.items():
+                                if (trade['trade_info']['status'] == 'PENDING' and 
+                                    trade['order_metadata']['order_id'] == order['orderId']):
+                                    cancelled_trade_ids.add(trade_id)
+                                    
+                            cancelled += 1
+                            
+                        except BinanceAPIException as e:
+                            if e.code == -2011:  # Order not found or already cancelled
+                                continue
+                            raise
+                            
+                except Exception as e:
+                    self.logger.error(f"Error cancelling orders for {symbol}: {e}")
+                    continue
+            
+            # Update trades file
+            if cancelled_trade_ids:
+                for trade_id in cancelled_trade_ids:
+                    if trade_id in self.trades:
+                        self.trades[trade_id]['trade_info']['status'] = 'CANCELLED'
+                        self.trades[trade_id]['trade_info']['cancel_time'] = datetime.now(timezone.utc).isoformat()
+                
+                # Save updates to trades file
+                await self._save_trades_atomic()
+            
+            self.logger.info(f"Cancelled {cancelled} pending orders and updated trades file")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error in cancel_all_orders: {e}")
+            return False
+
 # Update the main entry point
 if __name__ == "__main__":
     try:
@@ -1809,6 +1897,7 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         logging.error(f"Unexpected error: {str(e)}")
+
 
 
 
