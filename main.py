@@ -226,11 +226,7 @@ class BinanceBot:
         try:
             cleanup_tasks = []
 
-            # Stop API handler first
-            if self.api_handler:
-                cleanup_tasks.append(self.api_handler.stop())
-
-            # Try to save current state
+            # Save current state
             try:
                 await self._save_trades_atomic()
             except Exception as e:
@@ -1194,19 +1190,16 @@ class BinanceBot:
             self.logger.error(f"Error handling price update for {symbol}: {e}")
 
     async def check_prices(self):
-        """Check prices using new BinanceAPI"""
+        """Check prices using BinanceAPI"""
         try:
             for symbol in self.valid_symbols:
-                # Get price and 24h stats
+                # Get price and 24h stats using BinanceAPI
                 ticker = await self.api.get_symbol_ticker(symbol)
-                stats = await self.api.get_24h_stats(symbol)
-                
-                price = float(ticker['price'])
-                change = float(stats['priceChangePercent'])
-
-                # Process price update
-                await self.handle_price_update(symbol, price, change)
-                await asyncio.sleep(0.5)
+                if ticker:
+                    price = float(ticker['price'])
+                    # Process price update
+                    await self.handle_price_update(symbol, price)
+                await asyncio.sleep(0.5)  # Rate limiting
                 
         except Exception as e:
             self.logger.error(f"Error checking prices: {e}")
@@ -1218,9 +1211,9 @@ class BinanceBot:
             if not await self.startup_checks():
                 raise Exception("Startup checks failed")
 
-            # Initialize price checking
-            self.api_handler = APIHandler(self.client, self.valid_symbols, self.logger)
-            await self.api_handler.start()
+            # Initialize price checking - Use BinanceAPI instead of APIHandler
+            if not await self.api.initialize_exchange_info():
+                raise Exception("Failed to initialize exchange info")
 
             while True:
                 try:
@@ -1327,6 +1320,8 @@ class BinanceBot:
                 
                 # Update next reset time
                 if timeframe == 'daily':
+                    self.next_reset_times[timeframe] = reset_time + timedelta(days=1)
+                elif timeframe == 'weekly':
                     self.next_reset_times[timeframe] = reset_time + timedelta(days=1)
                 elif timeframe == 'weekly':
                     self.next_reset_times[timeframe] = reset_time + timedelta(days=7)
@@ -1463,6 +1458,8 @@ class BinanceBot:
                             raise symbol_error
 
                 if self.valid_symbols:  # If we have at least one valid symbol
+                    print(f"\n{Fore.GREEN}Successfully connected to {'Testnet' if self.client.API_URL == 'https://testnet.binance.vision/api' else 'Live'} API")
+                    print(f"{Fore.GREEN}Valid symbols: {', '.join(self.valid_symbols)}")
                     print(f"\n{Fore.GREEN}Successfully connected to {'Testnet' if self.client.API_URL == 'https://testnet.binance.vision/api' else 'Live'} API")
                     print(f"{Fore.GREEN}Valid symbols: {', '.join(self.valid_symbols)}")
                     
@@ -1770,10 +1767,6 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         logging.error(f"Unexpected error: {str(e)}")
-
-
-
-
 
 
 
