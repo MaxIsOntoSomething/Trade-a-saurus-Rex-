@@ -37,30 +37,6 @@ class ConfigHandler:
         
         config['USE_TELEGRAM'] = telegram_enabled
 
-        # Add dashboard validation
-        dashboard_settings = config.get('DASHBOARD_SETTINGS', {})
-        if dashboard_settings:
-            try:
-                dashboard_enabled = dashboard_settings.get('ENABLED', False)
-                if dashboard_enabled:
-                    # Validate host
-                    host = dashboard_settings.get('HOST', 'localhost')
-                    if not isinstance(host, str):
-                        print("Warning: Invalid dashboard host, using default 'localhost'")
-                        dashboard_settings['HOST'] = 'localhost'
-
-                    # Validate port
-                    port = dashboard_settings.get('PORT', 8050)
-                    if not isinstance(port, int) or port < 0 or port > 65535:
-                        print("Warning: Invalid dashboard port, using default 8050")
-                        dashboard_settings['PORT'] = 8050
-
-                    print(f"Dashboard configuration validated: http://{host}:{port}")
-                config['DASHBOARD_SETTINGS'] = dashboard_settings
-            except Exception as e:
-                print(f"Warning: Error in dashboard configuration: {e}")
-                config['DASHBOARD_SETTINGS'] = {'ENABLED': False}
-
     @staticmethod
     def load_config(use_env: bool = False) -> Dict[str, Any]:
         """Load configuration based on environment"""
@@ -126,12 +102,7 @@ class ConfigHandler:
                 'ORDER_TYPE': os.getenv('ORDER_TYPE', 'limit'),
                 'USE_PERCENTAGE': os.getenv('USE_PERCENTAGE', 'false').lower() == 'true',
                 'TRADE_AMOUNT': float(os.getenv('TRADE_AMOUNT', '10')),
-                'RESERVE_BALANCE': float(os.getenv('RESERVE_BALANCE', '2000')),
-                'DASHBOARD_SETTINGS': {
-                    'ENABLED': os.getenv('DASHBOARD_ENABLED', 'false').lower() == 'true',
-                    'HOST': os.getenv('DASHBOARD_HOST', 'localhost'),
-                    'PORT': int(os.getenv('DASHBOARD_PORT', '8050'))
-                }
+                'RESERVE_BALANCE': float(os.getenv('RESERVE_BALANCE', '2000'))
             }
 
             # Parse timeframe configurations from environment

@@ -23,7 +23,7 @@ from utils.websocket_manager import WebSocketManager
 from utils.rate_limiter import RateLimiter
 from utils.telegram_handler import TelegramHandler
 from utils.file_handler import AsyncFileHandler  # Add import
-from utils.dashboard import TradingDashboard  # Correct import path
+import sys  # Add this at the top with other imports
 
 # Initialize colorama
 init(autoreset=True)
@@ -52,8 +52,8 @@ USE_TELEGRAM = config.get('USE_TELEGRAM', False)
 
 class BinanceBot:
     def __init__(self, config):
-        # Initialize loggers
-        self.logger, self.api_logger = setup_logger()
+        # Update logger initialization
+        self.logger, self.api_logger, self.ws_logger = setup_logger()
         self.logger.info("Initializing BinanceBot...")
 
         # Store config and required settings
@@ -169,19 +169,6 @@ class BinanceBot:
         }
         self.is_shutting_down = False
 
-        # Initialize dashboard only if enabled
-        self.dashboard = None
-        if config.get('DASHBOARD_SETTINGS', {}).get('ENABLED', False):
-            try:
-                from utils.dashboard import TradingDashboard
-                self.dashboard = TradingDashboard(
-                    self,
-                    host=config['DASHBOARD_SETTINGS'].get('HOST', 'localhost'),
-                    port=config['DASHBOARD_SETTINGS'].get('PORT', 8050)
-                )
-            except ImportError:
-                self.logger.warning("Dashboard dependencies not installed. Skipping dashboard initialization.")
-
     async def shutdown(self):
         """Enhanced graceful shutdown sequence"""
         if self.is_shutting_down:
@@ -252,42 +239,87 @@ class BinanceBot:
             self._sync_server_time()
 
     async def _make_api_call(self, func, *args, **kwargs):
-        """Enhanced API call wrapper with timestamp handling and logging"""
+        """Enhanced API call wrapper with detailed logging"""
         await self.rate_limiter.acquire()
         
         self._check_time_sync()
         if 'timestamp' not in kwargs:
             kwargs['timestamp'] = self._get_timestamp()
         
-        # Log the API request
-        self.api_logger.debug(
-            f"API Request - Function: {func.__name__}\n"
-            f"Args: {args}\n"
-            f"Kwargs: {kwargs}"
-        )
+        start_time = time.time()
+        log_data = {
+            'request_data': {
+                'function': func.__name__,
+                'args': args,
+                'kwargs': {k: v for k, v in kwargs.items() if not k.lower() in ['apikey', 'secret', 'token']}
+            },
+            'response_data': None,
+            'duration': 0
+        }
         
-        for attempt in range(self.max_timestamp_attempts):
-            try:
-                response = func(*args, **kwargs)
-                # Log the successful response
-                self.api_logger.debug(
-                    f"API Response - Function: {func.__name__}\n"
-                    f"Response: {response}"
-                )
-                return response
-            except BinanceAPIException as e:
-                # Log the error
-                self.api_logger.error(
-                    f"API Error - Function: {func.__name__}\n"
-                    f"Error Code: {e.code}\n"
-                    f"Error Message: {e.message}"
-                )
-                if e.code == -1021 and attempt < self.max_timestamp_attempts - 1:
-                    self._sync_server_time()
-                    kwargs['timestamp'] = self._get_timestamp()
-                    continue
-                raise
-        raise Exception("Max timestamp retry attempts reached")
+        try:
+            for attempt in range(self.max_timestamp_attempts):
+                try:
+                    response = func(*args, **kwargs)
+                    duration = (time.time() - start_time) * 1000  # Convert to milliseconds
+                    
+                    # Safe copy of response for logging
+                    safe_response = self._sanitize_response(response)
+                    log_data.update({
+                        'response_data': safe_response,
+                        'duration': duration
+                    })
+                    
+                    self.api_logger.debug(
+                        "API Call completed successfully",
+                        extra=log_data
+                    )
+                    return response
+                    
+                except BinanceAPIException as e:
+                    duration = (time.time() - start_time) * 1000
+                    log_data.update({
+                        'response_data': {
+                            'error_code': e.code,
+                            'error_message': e.message
+                        },
+                        'duration': duration
+                    })
+                    
+                    if e.code == -1021 and attempt < self.max_timestamp_attempts - 1:
+                        self._sync_server_time()
+                        kwargs['timestamp'] = self._get_timestamp()
+                        continue
+                        
+                    self.api_logger.error(
+                        "API Call failed",
+                        extra=log_data
+                    )
+                    raise
+                    
+        except Exception as e:
+            duration = (time.time() - start_time) * 1000
+            log_data.update({
+                'response_data': {
+                    'error_type': type(e).__name__,
+                    'error_message': str(e)
+                },
+                'duration': duration
+            })
+            self.api_logger.error(
+                "API Call failed with unexpected error",
+                extra=log_data
+            )
+            raise
+
+    def _sanitize_response(self, response):
+        """Sanitize response data for logging"""
+        if isinstance(response, dict):
+            return {
+                k: v for k, v in response.items()
+                if not any(sensitive in k.lower() for sensitive in ['key', 'secret', 'token', 'password'])
+            }
+        return response
 
     async def get_cached_price(self, symbol):
         """Get cached price or fetch new one"""
@@ -668,13 +700,35 @@ class BinanceBot:
                 await self._save_trades_atomic()
 
     def get_historical_data(self, symbol, interval, start_str):
-        klines = self.client.get_historical_klines(
-            symbol,
-            interval,
-            start_str
-        )
-        df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_av', 'trades', 'tb_base_av', 'tb_quote_av', 'ignore'])
-        return df
+        """Get historical data with error handling"""
+        try:
+            klines = self.client.get_historical_klines(
+                symbol,
+                interval,
+                start_str
+            )
+            
+            if not klines:
+                return None
+                
+            df = pd.DataFrame(
+                klines,
+                columns=[
+                    'timestamp', 'open', 'high', 'low', 'close',
+                    'volume', 'close_time', 'quote_av', 'trades',
+                    'tb_base_av', 'tb_quote_av', 'ignore'
+                ]
+            )
+            
+            # Convert string values to float
+            for col in ['open', 'high', 'low', 'close']:
+                df[col] = df[col].astype(float)
+                
+            return df
+            
+        except Exception as e:
+            self.logger.error(f"Error fetching historical data for {symbol}: {str(e)}")
+            return None
 
     def get_daily_open_price(self, symbol):
         df = self.get_historical_data(symbol, Client.KLINE_INTERVAL_1DAY, "1 day ago UTC")
@@ -1146,7 +1200,7 @@ class BinanceBot:
                     'type': 'bot'
                 },
                 'order_metadata': {
-                    'order_id': order['orderId'],
+                    'order_id': order['OrderId'],
                     'placed_time': order_time.isoformat(),
                     'cancel_time': cancel_time.isoformat(),
                     'last_check': order_time.isoformat()
@@ -1265,32 +1319,54 @@ class BinanceBot:
                 self.logger.error(f"Error sending Telegram message: {e}")
 
     def get_reference_prices(self, symbol):
+        """Get reference prices with improved error handling"""
         references = {}
         
         try:
-            if self.timeframe_config['daily']['enabled']:
-                daily_data = self.get_historical_data(symbol, Client.KLINE_INTERVAL_1DAY, "2 days ago UTC")
-                references['daily'] = {
-                    'open': float(daily_data['open'].iloc[-1]),
-                    'high': float(daily_data['high'].iloc[-1]),
-                    'low': float(daily_data['low'].iloc[-1])
-                }
-            
-            if self.timeframe_config['weekly']['enabled']:
-                weekly_data = self.get_historical_data(symbol, Client.KLINE_INTERVAL_1WEEK, "2 weeks ago UTC")
-                references['weekly'] = {
-                    'open': float(weekly_data['open'].iloc[-1]),
-                    'high': float(weekly_data['high'].iloc[-1]),
-                    'low': float(weekly_data['low'].iloc[-1])
-                }
-                monthly_data = self.get_historical_data(symbol, Client.KLINE_INTERVAL_1MONTH, "2 months ago UTC")
-                references['monthly'] = {
-                    'open': float(monthly_data['open'].iloc[-1]),
-                    'high': float(monthly_data['high'].iloc[-1]),
-                    'low': float(monthly_data['low'].iloc[-1])
-                }
+            # For each timeframe, safely get historical data
+            for timeframe in ['daily', 'weekly', 'monthly']:
+                if not self.timeframe_config.get(timeframe, {}).get('enabled', False):
+                    continue
+                    
+                try:
+                    if timeframe == 'daily':
+                        interval = Client.KLINE_INTERVAL_1DAY
+                        lookback = "2 days ago UTC"
+                    elif timeframe == 'weekly':
+                        interval = Client.KLINE_INTERVAL_1WEEK
+                        lookback = "2 weeks ago UTC"
+                    else:  # monthly
+                        interval = Client.KLINE_INTERVAL_1MONTH
+                        lookback = "2 months ago UTC"
+
+                    # Get historical data
+                    df = self.get_historical_data(symbol, interval, lookback)
+                    
+                    # Verify we have data
+                    if df is not None and not df.empty:
+                        references[timeframe] = {
+                            'open': float(df['open'].iloc[-1]),
+                            'high': float(df['high'].iloc[-1]),
+                            'low': float(df['low'].iloc[-1])
+                        }
+                    else:
+                        self.logger.warning(f"No historical data found for {symbol} {timeframe}")
+                        references[timeframe] = {
+                            'open': None,
+                            'high': None,
+                            'low': None
+                        }
+                        
+                except Exception as e:
+                    self.logger.error(f"Error getting {timeframe} data for {symbol}: {str(e)}")
+                    references[timeframe] = {
+                        'open': None,
+                        'high': None,
+                        'low': None
+                    }
+                    
         except Exception as e:
-            self.logger.error(f"Error getting reference prices for {symbol}: {e}")
+            self.logger.error(f"Error getting reference prices for {symbol}: {str(e)}")
             
         return references
 
@@ -1318,19 +1394,6 @@ class BinanceBot:
             print(f"{Fore.GREEN}Starting WebSocket connection...")
             await self.ws_manager.start()
 
-            # Start dashboard if enabled
-            if self.dashboard:
-                try:
-                    import threading
-                    dashboard_thread = threading.Thread(
-                        target=self.dashboard.run,
-                        daemon=True
-                    )
-                    dashboard_thread.start()
-                    self.logger.info(f"Dashboard started at http://{self.dashboard.host}:{self.dashboard.port}")
-                except Exception as e:
-                    self.logger.error(f"Failed to start dashboard: {e}")
-
             while True:
                 try:
                     # Check for resets
@@ -1354,38 +1417,73 @@ class BinanceBot:
                 await self.telegram_handler.shutdown()
 
     def run(self):
-        """Run the bot with improved error handling"""
+        """Run the bot with improved event loop management"""
         try:
-            if not asyncio.get_event_loop().is_running():
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-            else:
-                loop = asyncio.get_event_loop()
+            # Handle different Python versions and platforms
+            if sys.version_info >= (3, 10):
+                # Python 3.10+ - use new loop policy
+                if sys.platform.startswith('win'):
+                    # Windows-specific event loop policy
+                    policy = asyncio.WindowsSelectorEventLoopPolicy()
+                    asyncio.set_event_loop_policy(policy)
+                else:
+                    # Unix-like platforms can use the default policy
+                    asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
+            
+            # Create and set event loop
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            # Add SSL cleanup handler
+            def cleanup_ssl():
+                import ssl
+                ssl.SSLSocket._client_ctx = None
+                ssl.SSLSocket._server_ctx = None
+            
+            loop.call_later(0, cleanup_ssl)
             
             try:
+                # Run main loop with proper error handling
                 loop.run_until_complete(self.main_loop())
             except KeyboardInterrupt:
                 print(f"{Fore.YELLOW}\nShutdown requested by user...")
+                loop.run_until_complete(self.shutdown())
             except Exception as e:
                 print(f"{Fore.RED}\nError in main loop: {str(e)}")
                 self.logger.error(f"Error in main loop: {str(e)}")
             finally:
                 # Ensure proper cleanup
-                cleanup_tasks = []
-                if self.ws_manager:
-                    cleanup_tasks.append(self.ws_manager.stop())
-                if self.telegram_handler:
-                    cleanup_tasks.append(self.telegram_handler.shutdown())
-                
-                if cleanup_tasks:
-                    # Run cleanup tasks
-                    try:
-                        loop.run_until_complete(asyncio.gather(*cleanup_tasks))
-                    except Exception as e:
-                        self.logger.error(f"Error during cleanup: {e}")
-                
-                # Close the loop
-                loop.close()
+                try:
+                    cleanup_tasks = []
+                    if self.ws_manager:
+                        cleanup_tasks.append(self.ws_manager.stop())
+                    if self.telegram_handler:
+                        cleanup_tasks.append(self.telegram_handler.shutdown())
+                    
+                    if cleanup_tasks:
+                        # Run cleanup tasks with timeout
+                        loop.run_until_complete(
+                            asyncio.wait_for(
+                                asyncio.gather(*cleanup_tasks),
+                                timeout=30
+                            )
+                        )
+                    
+                    # Cancel all remaining tasks
+                    pending = asyncio.all_tasks(loop)
+                    for task in pending:
+                        task.cancel()
+                        try:
+                            loop.run_until_complete(task)
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                    
+                    # Shutdown asyncgens and close loop
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                    loop.close()
+                    
+                except Exception as e:
+                    self.logger.error(f"Error during cleanup: {e}")
                     
         except Exception as e:
             print(f"{Fore.RED}Fatal error: {str(e)}")
@@ -1673,12 +1771,39 @@ class BinanceBot:
             print(f"{Fore.RED}Error updating invalid symbols file: {e}")
             self.logger.error(f"Error updating invalid symbols file: {e}")
 
+# Update the main entry point
 if __name__ == "__main__":
     try:
-        config = ConfigHandler.load_config(use_env=os.environ.get('DOCKER', '').lower() == 'true')
-        bot = BinanceBot(config)
-        bot.test_connection()
-        bot.run()
+        # Initialize color support for Windows
+        if sys.platform.startswith('win'):
+            os.system('color')
+            # Set event loop policy for Windows
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        
+        # Create new event loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        try:
+            # Load config and create bot instance
+            config = ConfigHandler.load_config(use_env=os.environ.get('DOCKER', '').lower() == 'true')
+            bot = BinanceBot(config)
+            
+            # Test connection before starting
+            if bot.test_connection():
+                bot.run()
+            else:
+                print(f"{Fore.RED}Connection test failed. Bot will not start.")
+                
+        finally:
+            # Ensure proper event loop cleanup
+            try:
+                if not loop.is_closed():
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                    loop.close()
+            except Exception:
+                pass
+            
     except KeyboardInterrupt:
         print("\nBot shutdown requested by user.")
     except Exception as e:

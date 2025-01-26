@@ -75,22 +75,60 @@ def setup_logger(name='BinanceBot'):
     # Prevent logs from being sent to root logger
     logger.propagate = False
 
-    # Add API request logger
+    # Add specialized API request logger with detailed formatting
+    api_formatter = logging.Formatter(
+        '%(asctime)s - [%(levelname)s] - %(message)s\n'
+        'Request: %(request_data)s\n'
+        'Response: %(response_data)s\n'
+        'Duration: %(duration).3fms\n'
+        '----------------------------------------',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        defaults={
+            'request_data': 'N/A',
+            'response_data': 'N/A',
+            'duration': 0.0
+        }
+    )
+    
     api_handler = RotatingFileHandler(
         'logs/api_requests.log',
-        maxBytes=10*1024*1024,  # 10MB
+        maxBytes=10*1024*1024,
         backupCount=5,
         encoding='utf-8'
     )
     api_handler.setLevel(logging.DEBUG)
-    api_handler.setFormatter(
-        logging.Formatter('%(asctime)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+    api_handler.setFormatter(api_formatter)
+
+    # Create WebSocket formatter
+    ws_formatter = logging.Formatter(
+        '%(asctime)s - [%(levelname)s] - %(message)s\n'
+        '%(details)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        defaults={
+            'details': ''
+        }
     )
+
+    # Create separate WebSocket logger
+    ws_handler = RotatingFileHandler(
+        'logs/websocket.log',
+        maxBytes=10*1024*1024,
+        backupCount=5,
+        encoding='utf-8'
+    )
+    ws_handler.setLevel(logging.DEBUG)
+    ws_handler.setFormatter(ws_formatter)
 
     # Create API logger
     api_logger = logging.getLogger('API_Requests')
     api_logger.setLevel(logging.DEBUG)
     api_logger.addHandler(api_handler)
     api_logger.propagate = False
+
+    # Create WebSocket logger
+    ws_logger = logging.getLogger('WebSocket')
+    ws_logger.setLevel(logging.DEBUG)
+    ws_logger.addHandler(ws_handler)
+    ws_logger.propagate = False
     
-    return logger, api_logger
+    return logger, api_logger, ws_logger

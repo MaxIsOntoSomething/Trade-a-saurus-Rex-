@@ -65,6 +65,7 @@ class WebSocketManager:
             'last_pong': time.time(),
             'last_sync': 0
         }
+        self.ws_logger = logging.getLogger('WebSocket')
 
     def _ensure_time_sync(self):
         """Ensure time is synced with Binance server"""
@@ -128,7 +129,7 @@ class WebSocketManager:
         return func(*args, **kwargs)
 
     async def start(self):
-        """Start WebSocket connection with improved state management"""
+        """Start WebSocket connection with improved state management and logging"""
         while True:
             try:
                 # Ensure time sync before connection
@@ -141,13 +142,17 @@ class WebSocketManager:
                     self.logger.info(f"Reconnecting in {delay:.1f}s using {endpoint}")
                     await asyncio.sleep(delay)
 
+                # Log connection attempt
+                self.logger.info(f"Connecting to WebSocket endpoint: {endpoint}")
+
                 # Create WebSocket connection with shorter timeouts
                 websocket = await websockets.connect(
                     endpoint,
-                    ping_interval=20,  # Reduce ping interval
-                    ping_timeout=10,    # Shorter ping timeout
-                    close_timeout=10,   # Shorter close timeout
-                    compression=None
+                    ping_interval=20,
+                    ping_timeout=10,
+                    close_timeout=10,
+                    compression=None,
+                    ssl=True  # Explicitly enable SSL
                 )
 
                 # Update connection state
@@ -156,6 +161,8 @@ class WebSocketManager:
                     'is_connected': True,
                     'last_pong': time.time()
                 })
+                
+                self.logger.info("WebSocket connection established successfully")
                 
                 # Update class-level ws reference
                 self.ws = websocket
@@ -172,22 +179,28 @@ class WebSocketManager:
                 # Initial prices update
                 await self._send_initial_prices()
                 
+                # Main message loop
                 try:
-                    # Main message loop
                     while True:
                         try:
                             message = await asyncio.wait_for(
                                 websocket.recv(),
-                                timeout=30  # 30 second timeout for messages
+                                timeout=30
                             )
                             self.connection_state['last_pong'] = time.time()
+                            
+                            # Log successful message receipt
+                            self.ws_logger.debug(
+                                "WebSocket message received",
+                                extra={'duration': 0, 'message_type': 'recv'}
+                            )
+                            
                             await self._handle_socket_message(json.loads(message))
                             
                         except asyncio.TimeoutError:
-                            # Send ping on timeout
+                            self.logger.debug("WebSocket message timeout, sending ping")
                             try:
                                 await websocket.ping()
-                                self.logger.debug("Ping sent")
                                 continue
                             except:
                                 break
@@ -196,7 +209,6 @@ class WebSocketManager:
                             break
                             
                 finally:
-                    # Cleanup tasks on loop exit
                     if self.keepalive_task and not self.keepalive_task.done():
                         self.keepalive_task.cancel()
                     
@@ -204,16 +216,14 @@ class WebSocketManager:
                 self.connection_state['is_connected'] = False
                 self.logger.error(f"WebSocket error: {e}")
                 
-                # Reset WebSocket references
                 self.ws = None
                 self.connection_state['ws'] = None
                 
-                # Increment connection attempts
                 self.connection_attempts += 1
                 
                 if self.connection_attempts >= self.max_reconnect_attempts:
                     self.logger.error("Max reconnection attempts reached")
-                    await asyncio.sleep(300)  # 5 minute cooldown
+                    await asyncio.sleep(300)
                     self.connection_attempts = 0
 
     async def _heartbeat_loop(self):
@@ -245,7 +255,65 @@ class WebSocketManager:
             self.logger.error(f"Error getting initial prices: {e}")
 
     async def _handle_socket_message(self, msg):
-        """Handle incoming WebSocket messages"""
+        """Handle incoming WebSocket messages with enhanced logging"""
+        try:
+            start_time = time.time()
+            
+            # Log incoming message with simplified format
+            self.ws_logger.debug(
+                "WebSocket message received",
+                extra={
+                    'details': f"Message: {self._sanitize_ws_message(msg)}"
+                }
+            )
+            
+            if 'e' not in msg:
+                return
+                
+            # Process message and log duration
+            try:
+                await self._process_socket_message(msg)
+                duration = (time.time() - start_time) * 1000
+                self.ws_logger.debug(
+                    "WebSocket message processed",
+                    extra={
+                        'details': (
+                            f"Event: {msg.get('e')}\n"
+                            f"Symbol: {msg.get('s')}\n"
+                            f"Duration: {duration:.2f}ms"
+                        )
+                    }
+                )
+                
+            except Exception as e:
+                duration = (time.time() - start_time) * 1000
+                self.ws_logger.error(
+                    "WebSocket message processing failed",
+                    extra={
+                        'details': (
+                            f"Error: {type(e).__name__}: {str(e)}\n"
+                            f"Event: {msg.get('e')}\n"
+                            f"Symbol: {msg.get('s')}\n"
+                            f"Duration: {duration:.2f}ms"
+                        )
+                    }
+                )
+                raise
+                
+        except Exception as e:
+            self.logger.error(f"Error in message handler: {e}")
+
+    def _sanitize_ws_message(self, msg):
+        """Sanitize WebSocket message for logging"""
+        if isinstance(msg, dict):
+            return {
+                k: v for k, v in msg.items()
+                if not any(sensitive in k.lower() for sensitive in ['key', 'secret', 'token', 'password'])
+            }
+        return msg
+
+    async def _process_socket_message(self, msg):
+        """Process WebSocket message"""
         try:
             if 'e' not in msg:  # Handle initial connection message
                 return
@@ -385,7 +453,7 @@ class WebSocketManager:
             self.connection_state['is_connected'] = False
             self.is_connected = False
 
-            # Cancel keepalive task with proper cleanup
+            # Cancel keepalive task
             if self.keepalive_task and not self.keepalive_task.done():
                 self.keepalive_task.cancel()
                 try:
@@ -393,23 +461,24 @@ class WebSocketManager:
                 except asyncio.CancelledError:
                     pass
 
-            # Close WebSocket connection with proper state handling
+            # Close WebSocket connection
             if self.connection_state['ws']:
                 ws = self.connection_state['ws']
                 try:
-                    if not ws.closed and not ws._closed:
+                    if not ws.closed:
                         await ws.close()
                 except Exception as e:
                     self.logger.warning(f"Error closing WebSocket: {e}")
                 finally:
                     self.connection_state['ws'] = None
+                    self.ws = None
 
-            # Clear other tasks and state
+            # Clear state
             self.callbacks = []
             self.last_prices = {}
             self.initial_prices_sent = False
             
-            self.logger.info("WebSocket connection closed")
+            self.logger.info("WebSocket connection closed and cleaned up")
 
         except Exception as e:
             self.logger.error(f"Error stopping WebSocket: {e}")
