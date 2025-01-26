@@ -148,10 +148,6 @@ class BinanceBot:
         # Fix the strategy initialization
         self.strategy = PriceDropStrategy(self.timeframe_config)
 
-        # Add GraphGenerator
-        from utils.graph_generator import GraphGenerator
-        self.graph_generator = GraphGenerator()
-
         self.last_order_time = {}
         self.orders_placed_today = {}
         self.total_bought = {}

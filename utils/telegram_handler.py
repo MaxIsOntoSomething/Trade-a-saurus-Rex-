@@ -244,15 +244,20 @@ class TelegramHandler:
     def register_handlers(self):
         """Register simplified command handlers"""
         try:
-            # Essential commands only
+            # Essential commands only - Updated list
             handlers = {
                 "start": self.handle_start,
                 "status": self.handle_status,      
-                "trades": self.handle_trades,      
+                "orders": self.handle_orders,
+                "balance": self.handle_balance,
+                "trades": self.handle_trades_list,  # Changed from handle_trades
+                "trade": self.handle_trade,        # Added for single trade lookup
                 "add": self.handle_addtrade,       
                 "stop": self.handle_emergency_stop,
-                "help": self.handle_help,
-                "thresholds": self.handle_thresholds  # Add new command
+                "summary": self.handle_portfolio_summary,  # Added
+                "symbol": self.handle_symbol_stats,  # Added
+                "thresholds": self.handle_thresholds,
+                "help": self.handle_help
             }
             
             # Register handlers
@@ -376,13 +381,22 @@ class TelegramHandler:
             await self.send_message(f"❌ Error getting status: {e}")
 
     async def handle_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show available commands"""
+        """Show updated available commands"""
         help_text = (
             "Available Commands:\n\n"
+            "Core Commands:\n"
             "/status - Show current prices and balance\n"
-            "/trades - List active trades\n"
-            "/add - Start manual trade entry\n"
-            "/thresholds - Show threshold status\n"
+            "/orders - Show open limit orders\n"
+            "/balance - Show current balance\n\n"
+            "Trading Commands:\n"
+            "/trades - List all trades\n"
+            "/trade <ID> - Show specific trade details\n"
+            "/add - Add manual trade\n"
+            "/symbol <PAIR> - Show detailed stats for pair\n"
+            "/summary - Show portfolio summary\n\n"
+            "Analysis:\n"
+            "/thresholds - Show threshold status\n\n"
+            "System:\n"
             "/stop - Emergency stop\n"
             "/help - Show this help message"
         )
@@ -1141,34 +1155,31 @@ class TelegramHandler:
             )
 
     def _get_startup_message(self):
-        """Generate startup message"""
+        """Generate startup message with updated commands"""
         startup_msg = (
             "🤖 Binance Trading Bot Started!\n\n"
             "📈 Trading Configuration:\n"
             f"• Mode: {'Testnet' if self.bot.client.API_URL == 'https://testnet.binance.vision/api' else 'Live'}\n"
             f"• Order Type: {self.bot.order_type.capitalize()}\n"
-            f"• Trading Pairs: {', '.join(self.bot.valid_symbols)}\n"
+            f"• Trading Pairs: {', '.join([pair for pair in self.bot.valid_symbols])}\n"
             f"• USDT Reserve: {self.bot.reserve_balance_usdt}\n"
             f"• Tax Rate: 28%\n\n"
             "📊 Available Commands:\n\n"
-            "Market Analysis:\n"
-            "/positions - Show current prices and opportunities\n"
-            "/orders - Show open limit orders\n\n"
-            "Portfolio Management:\n"
-            "/balance - Show current balance\n"
-            "/trades - List all trades with P/L\n"
-            "/addtrade - Add manual trade\n"
-            "/symbol <SYMBOL> - Show detailed stats\n"
+            "Core Commands:\n"
+            "/status - Show current prices and balance\n"
+            "/orders - Show open limit orders\n"
+            "/balance - Show current balance\n\n"
+            "Trading Commands:\n"
+            "/trades - List all trades\n"
+            "/trade <ID> - Show specific trade details\n"
+            "/add - Add manual trade\n"
+            "/symbol <PAIR> - Show detailed stats for pair\n"
             "/summary - Show portfolio summary\n\n"
-            "Analytics:\n"
-            "/profits - Show current profits\n"
-            "/distribution - Show entry distribution\n"
-            "/stacking - Show position building\n"
-            "/buytimes - Show trade timing\n"
-            "/portfolio - Show value evolution\n"
-            "/allocation - Show asset allocation\n\n"
+            "Analysis:\n"
+            "/thresholds - Show threshold status\n\n"
             "System:\n"
-            "/stats - Show system information\n\n"
+            "/stop - Emergency stop\n"
+            "/help - Show this help message\n\n"
             "🟢 Bot is actively monitoring markets!"
         )
         return startup_msg
