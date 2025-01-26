@@ -39,6 +39,7 @@ class TelegramHandler:
         self.message_processor_task = None
         self.command_workers = []  # Add this to track workers
         self.startup_sent = False  # Add flag to track startup message
+        self.command_processor_task = None  # Add this line
 
         self.logger.setLevel(logging.DEBUG)  # Set to DEBUG for more detailed logs
         
@@ -144,9 +145,12 @@ class TelegramHandler:
                 # Set initialized flag
                 self.initialized = True
                 
-                # Start message processor
+                # Start message and command processors
                 self.message_processor_task = asyncio.create_task(
                     self._process_message_queue()
+                )
+                self.command_processor_task = asyncio.create_task(  # Add this
+                    self._process_commands()
                 )
 
                 # Send startup message with visible feedback
@@ -505,9 +509,15 @@ class TelegramHandler:
                 await asyncio.sleep(1)
 
     async def send_message(self, text, parse_mode=None, reply_markup=None, priority=False, **kwargs):
-        """Enhanced message sending with logging"""
+        """Enhanced message sending with HTML escaping"""
         if not text or not self.initialized:
             return None
+
+        # Escape HTML characters to prevent parsing errors
+        if parse_mode == 'HTML':
+            text = (text.replace('<', '&lt;')
+                      .replace('>', '&gt;')
+                      .replace('&', '&amp;'))
 
         message_data = {
             'text': text,
@@ -1090,21 +1100,14 @@ class TelegramHandler:
             self.logger.info("Shutting down Telegram bot...")
             
             try:
-                # Cancel polling task first
-                if self.poll_task:
-                    self.poll_task.cancel()
-                    try:
-                        await self.poll_task
-                    except asyncio.CancelledError:
-                        pass
-
-                # Cancel message processor
-                if self.message_processor_task:
-                    self.message_processor_task.cancel()
-                    try:
-                        await self.message_processor_task
-                    except asyncio.CancelledError:
-                        pass
+                # Cancel all tasks
+                for task in [self.poll_task, self.message_processor_task, self.command_processor_task]:
+                    if task:
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
 
                 # Stop the application
                 if self.app.running:
