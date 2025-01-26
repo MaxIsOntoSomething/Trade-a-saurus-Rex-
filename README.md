@@ -64,13 +64,64 @@ docker-compose down
 
 ## Future Plans
 
-- Take-profit functionality
-- Enhanced risk management
-- Advanced analytics
-- Performance optimizations
-- More Exchanges
-- Leverage Perp Optional 
-- SQL Database integration using SQLLite
+### API Integration
+- [x] Basic Spot Trading
+- [x] Basic Futures Trading
+- [ ] WebSocket support for real-time price updates
+- [ ] Futures-specific order types (stop-loss, take-profit)
+- [ ] OCO (One-Cancels-Other) orders
+- [ ] Trailing stops for both spot and futures
+
+### Risk Management
+- [ ] Position sizing based on account risk percentage
+- [ ] Dynamic leverage adjustment based on volatility
+- [ ] Auto-hedging in futures mode
+- [ ] Liquidation price monitoring
+- [ ] Multi-level stop losses
+
+### Trading Features
+- [ ] Grid trading support
+- [ ] DCA (Dollar Cost Averaging) strategies
+- [ ] Combined spot-futures arbitrage
+- [ ] Cross-exchange arbitrage
+- [ ] Multi-timeframe trading strategies
+
+### Market Analysis
+- [ ] Technical indicators (RSI, MACD, etc.)
+- [ ] Order book depth analysis
+- [ ] Volume profile analysis
+- [ ] Funding rate monitoring for futures
+- [ ] Sentiment analysis integration
+
+### Portfolio Management
+- [ ] Auto-rebalancing
+- [ ] Cross-margin collateral management
+- [ ] PnL tracking per strategy
+- [ ] Risk-adjusted performance metrics
+- [ ] Tax-efficient trading strategies
+
+### System Improvements
+- [ ] Multi-account support
+- [ ] API failover and load balancing
+- [ ] Enhanced error recovery
+- [ ] Performance optimization
+- [ ] Distributed system support
+- [x] SQLite Database integration
+
+### User Interface
+- [ ] Web dashboard
+- [x] Telegram integration
+- [ ] Mobile notifications
+- [ ] Real-time performance graphs
+- [ ] Position builder interface
+- [ ] Strategy backtesting UI
+
+### Advanced Features
+- [ ] Machine learning predictions
+- [ ] Custom strategy builder
+- [ ] Social trading integration
+- [ ] API marketplace
+- [ ] Automated strategy optimization
 
 ## Contact
 

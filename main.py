@@ -20,7 +20,7 @@ from telegram.ext import Application  # Update import
 
 from strategies.price_drop import PriceDropStrategy
 from utils.logger import setup_logger
-from utils.api_handler import APIHandler  # Replace WebSocketManager import
+from utils.Binance_API import BinanceAPI  # Replace APIHandler import
 from utils.rate_limiter import RateLimiter
 from utils.telegram_handler import TelegramHandler
 from utils.file_handler import AsyncFileHandler  # Add import
@@ -176,8 +176,10 @@ class BinanceBot:
             } for symbol in TRADING_SYMBOLS
         }
 
-        # Replace WebSocket manager with API handler
-        self.api_handler = None  # Initialize as None
+        # Replace APIHandler initialization with BinanceAPI
+        self.api = BinanceAPI(config, self.logger)
+        self.api_handler = None  # Keep for compatibility during transition
+
         self.last_price_updates = {}
 
         # Add rate limiting
@@ -530,89 +532,43 @@ class BinanceBot:
             raise
 
     async def execute_trade(self, symbol, price):
-        """Execute trade with improved feedback"""
+        """Execute trade with proper initialization check"""
         try:
+            # Check balance first
             if not await self.check_balance_status():
                 return False
 
-            print(f"\n🎯 Trade opportunity detected for {symbol}")
-            
-            # Get available balance
-            available_usdt = await self.get_available_usdt()
-            if available_usdt < self.trade_amount:
-                print(f"\n⚠️ Insufficient balance: {available_usdt:.2f} USDT")
-                return False
-
             # Calculate trade amount
-            trade_amount = (
-                available_usdt * self.trade_amount 
-                if self.use_percentage 
-                else min(self.trade_amount, available_usdt)
+            available_usdt = await self.get_available_usdt()
+            trade_amount = self._calculate_trade_amount(available_usdt)
+
+            # Get formatted amounts
+            symbol_info = await self.api.get_symbol_info(symbol)
+            formatted_price, formatted_quantity = await self.api._format_order_amounts(
+                symbol_info, price, trade_amount
             )
 
-            print(f"💰 Trade amount: {trade_amount:.2f} USDT")
-
-            # Get symbol info from API handler
-            symbol_info = await self.api_handler.get_symbol_info(symbol)
-            if not symbol_info:
-                raise ValueError(f"Symbol info not found for {symbol}")
-
             # Create and execute order
-            order = await self._create_order(symbol, price, trade_amount, symbol_info)
+            order = await self.api.create_order(
+                symbol=symbol,
+                side='BUY',
+                quantity=formatted_quantity,
+                price=formatted_price if self.order_type == 'limit' else None
+            )
+
             if not order:
                 return False
 
-            # Log successful order
-            print(f"\n✅ Order placed successfully for {symbol}")
-            print(f"   Price: {order['price']}")
-            print(f"   Quantity: {order['origQty']}")
-            print(f"   Total: {float(order['price']) * float(order['origQty']):.2f} USDT")
-
+            # Create trade record
+            trade_id = self.generate_order_id(symbol)
+            await self._create_trade_record(trade_id, symbol, order)
+            
             return True
 
         except Exception as e:
             self.logger.error(f"Trade execution failed for {symbol}: {e}")
-            print(f"\r❌ Trade failed for {symbol}: {e}")
+            print(f"\r❌ Trade failed: {e}")
             return False
-
-    async def _create_order(self, symbol, price, amount, symbol_info):
-        """Create order with proper formatting"""
-        try:
-            # Format price and quantity
-            formatted_price, formatted_quantity = await self.api_handler._format_order_amounts(
-                symbol_info, price, amount
-            )
-
-            # Create order parameters
-            order_params = {
-                'symbol': symbol,
-                'side': SIDE_BUY,
-                'recvWindow': self.recv_window
-            }
-
-            if self.order_type == "limit":
-                order_params.update({
-                    'type': ORDER_TYPE_LIMIT,
-                    'timeInForce': TIME_IN_FORCE_GTC,
-                    'price': formatted_price,
-                    'quantity': formatted_quantity
-                })
-            else:
-                order_params.update({
-                    'type': ORDER_TYPE_MARKET,
-                    'quoteOrderQty': f"{amount:.2f}"
-                })
-
-            # Add timestamp and execute order
-            order_params['timestamp'] = self._get_timestamp()
-            return await self._make_api_call(
-                self.client.create_order,
-                **order_params
-            )
-
-        except Exception as e:
-            self.logger.error(f"Order creation failed: {e}")
-            raise
 
     async def monitor_order(self, trade_id):
         """Monitor order with new structure"""
@@ -1238,17 +1194,19 @@ class BinanceBot:
             self.logger.error(f"Error handling price update for {symbol}: {e}")
 
     async def check_prices(self):
-        """Check prices for all symbols"""
+        """Check prices using new BinanceAPI"""
         try:
             for symbol in self.valid_symbols:
-                ticker = await self._make_api_call(
-                    self.client.get_symbol_ticker,
-                    symbol=symbol,
-                    _no_timestamp=True
-                )
+                # Get price and 24h stats
+                ticker = await self.api.get_symbol_ticker(symbol)
+                stats = await self.api.get_24h_stats(symbol)
+                
                 price = float(ticker['price'])
-                await self.handle_price_update(symbol, price)
-                await asyncio.sleep(0.5)  # Add small delay between symbols
+                change = float(stats['priceChangePercent'])
+
+                # Process price update
+                await self.handle_price_update(symbol, price, change)
+                await asyncio.sleep(0.5)
                 
         except Exception as e:
             self.logger.error(f"Error checking prices: {e}")
@@ -1774,6 +1732,21 @@ class BinanceBot:
             self.logger.error(f"Error getting reference prices for {symbol}: {str(e)}")
             
         return references
+
+    async def initialize(self):
+        """Initialize bot with exchange info"""
+        try:
+            # Initialize API first
+            if not await self.api.initialize_exchange_info():
+                raise Exception("Failed to initialize exchange info")
+
+            # Start price monitoring
+            await self.start_price_monitoring()
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Bot initialization failed: {e}")
+            return False
 
 # Update main entry point
 if __name__ == "__main__":

@@ -1,23 +1,41 @@
 {
-    "BINANCE_API_KEY": "YOUR_BINANCE_API_KEY",
-    "BINANCE_API_SECRET": "YOUR_BINANCE_API_SECRET",
-    "TESTNET_API_KEY": "YOUR_TESTNET_API_KEY",
-    "TESTNET_API_SECRET": "YOUR_TESTNET_API_SECRET",
-    "USE_TESTNET": true,
-    "TRADING_SYMBOLS": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+    "BINANCE_API_KEY": "your_api_key",
+    "BINANCE_API_SECRET": "your_api_secret",
+    "TESTNET_API_KEY": "your_testnet_key",
+    "TESTNET_API_SECRET": "your_testnet_secret",
+    "FUTURES_TESTNET_API_KEY": "your_futures_testnet_key",
+    "FUTURES_TESTNET_API_SECRET": "your_futures_testnet_secret",
     
+    "TRADING_SETTINGS": {
+        "MODE": "spot",
+        "USE_TESTNET": true,
+        "ORDER_TYPE": "limit",
+        "TRADE_AMOUNT": 10,
+        "USE_PERCENTAGE": false,
+        "RESERVE_BALANCE": 2000
+    },
+
+    "FUTURES_SETTINGS": {
+        "LEVERAGE": 5,
+        "MARGIN_TYPE": "isolated",
+        "POSITION_MODE": "one-way",
+        "AUTO_HEDGE": false,
+        "MAX_POSITION_SIZE": 1000
+    },
+
     "TELEGRAM_SETTINGS": {
         "USE_TELEGRAM": false,
         "TELEGRAM_TOKEN": "",
         "TELEGRAM_CHAT_ID": ""
     },
-    
-    "TRADING_SETTINGS": {
-        "ORDER_TYPE": "limit",
-        "USE_PERCENTAGE": false,
-        "TRADE_AMOUNT": 10,
-        "RESERVE_BALANCE": 2000
-    },
+
+    "TRADING_SYMBOLS": [
+        "BTCUSDT",
+        "ETHUSDT",
+        "SOLUSDT",
+        "BNBUSDT",
+        "ADAUSDT"
+    ],
 
     "TIMEFRAMES": {
         "daily": {
@@ -26,11 +44,19 @@
         },
         "weekly": {
             "enabled": true,
-            "thresholds": [0.03, 0.05, 0.07]
+            "thresholds": [0.03, 0.06, 0.10]
         },
         "monthly": {
             "enabled": true,
-            "thresholds": [0.05, 0.08, 0.12]
+            "thresholds": [0.05, 0.10]
         }
+    },
+
+    "RISK_SETTINGS": {
+        "MAX_POSITIONS": 10,
+        "PER_TRADE_RISK": 1.0,
+        "DAILY_LOSS_LIMIT": 5.0,
+        "STOP_LOSS": 5.0,
+        "TAKE_PROFIT": 3.0
     }
 }

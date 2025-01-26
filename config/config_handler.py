@@ -42,6 +42,25 @@ class ConfigHandler:
         config['TELEGRAM_TOKEN'] = telegram_token
         config['TELEGRAM_CHAT_ID'] = telegram_chat_id
 
+        # Validate trading settings
+        trading_settings = config.get('TRADING_SETTINGS', {})
+        if trading_settings.get('MODE') not in ['spot', 'futures']:
+            raise ValueError("Trading mode must be either 'spot' or 'futures'")
+            
+        # Validate futures settings if needed
+        if trading_settings.get('MODE') == 'futures':
+            futures_settings = config.get('FUTURES_SETTINGS', {})
+            leverage = futures_settings.get('LEVERAGE', 1)
+            
+            if not isinstance(leverage, int) or leverage < 1 or leverage > 125:
+                raise ValueError("Leverage must be between 1 and 125")
+                
+            if futures_settings.get('MARGIN_TYPE') not in ['isolated', 'cross']:
+                raise ValueError("Margin type must be either 'isolated' or 'cross'")
+                
+            if futures_settings.get('POSITION_MODE') not in ['one-way', 'hedge']:
+                raise ValueError("Position mode must be either 'one-way' or 'hedge'")
+
     @staticmethod
     def load_config(use_env: bool = False) -> Dict[str, Any]:
         """Load configuration based on environment"""

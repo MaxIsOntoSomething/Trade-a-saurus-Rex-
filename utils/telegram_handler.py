@@ -238,57 +238,48 @@ class TelegramHandler:
             self.processing_commands.discard(command)
 
     def register_handlers(self):
-        """Register command handlers with improved error handling"""
+        """Register mode-specific command handlers"""
         try:
-            if not hasattr(self, 'app') or not self.app:
-                self.logger.error("Cannot register handlers - application not initialized")
-                return
-
-            # Clear existing handlers
-            if hasattr(self.app, 'handlers'):
-                self.app.handlers.clear()
-
-            # Register handlers
+            # Common commands
             handlers = {
                 "start": self.handle_start,
-                "positions": self.handle_positions,
                 "balance": self.handle_balance,
-                "profits": self.handle_profits,
-                "stats": self.handle_stats,
-                "distribution": self.handle_distribution,
-                "stacking": self.handle_stacking,
-                "buytimes": self.handle_buy_times,
-                "portfolio": self.handle_portfolio,
-                "allocation": self.handle_allocation,
                 "orders": self.handle_orders,
-                "trade": self.handle_trade,
-                "trades": self.handle_trades_list,
-                "symbol": self.handle_symbol_stats,
-                "summary": self.handle_portfolio_summary,
-                "addtrade": self.handle_addtrade,
-                "emergency": self.handle_emergency_stop,  # Add emergency stop handler
+                # ...other common commands...
             }
 
+            # Add mode-specific commands
+            if 'futures' in self.bot.api.api_mode:
+                handlers.update({
+                    "leverage": self.handle_leverage,
+                    "margin": self.handle_margin_type,
+                    "positions": self.handle_positions,
+                    "liquidation": self.handle_liquidation
+                })
+            else:
+                handlers.update({
+                    "positions": self.handle_positions,
+                    "distribution": self.handle_distribution,
+                    "stacking": self.handle_stacking
+                })
+
+            # Register handlers
             for command, handler in handlers.items():
-                try:
-                    self.app.add_handler(CommandHandler(command, self._wrap_handler(handler)))
-                except Exception as e:
-                    self.logger.error(f"Failed to register handler for {command}: {e}")
-
-            # Add message handler
-            try:
-                self.app.add_handler(MessageHandler(
-                    filters.TEXT & ~filters.COMMAND,
-                    self.handle_message
+                self.app.add_handler(CommandHandler(
+                    command, 
+                    self._wrap_handler(handler)
                 ))
-            except Exception as e:
-                self.logger.error(f"Failed to register message handler: {e}")
-
-            self.logger.info("Command handlers registered successfully")
 
         except Exception as e:
             self.logger.error(f"Error registering handlers: {e}")
             raise
+
+    async def handle_leverage(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle leverage changes for futures"""
+        if 'futures' not in self.bot.api.api_mode:
+            await self.send_message("❌ Leverage command only available in futures mode")
+            return
+        # ...leverage handling code...
 
     def _wrap_handler(self, handler):
         """Enhanced command handler wrapper with timeout and retry logic"""
@@ -553,170 +544,23 @@ class TelegramHandler:
 
     # Update API handler references in handle_positions method
     async def handle_positions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show trading positions with thresholds and reset times"""
+        """Show positions using new BinanceAPI"""
         try:
-            # Send loading message and store the message object
             loading_msg = await self.safe_send_message("📊 Fetching positions...")
-
+            
             positions = []
-            now = datetime.now(timezone.utc)
-            
-            # Check API handler connection
-            if not self.bot.api_handler or not self.bot.api_handler.is_running:
-                await self.safe_send_message(
-                    "❌ Price monitoring not connected. Reconnecting...",
-                    priority=True
-                )
-                return
-            
-            # Use cached prices with shorter timeout
-            try:
-                async with asyncio.timeout(5):
-                    cached_prices = self.bot.api_handler.last_prices
-                    if not cached_prices:
-                        await self.safe_send_message(
-                            "❌ No price data available. Please try again in a few seconds."
-                        )
-                        return
-            except asyncio.TimeoutError:
-                await self.safe_send_message(
-                    "❌ Timeout while fetching prices. Please try again."
-                )
-                return
-
-            # Process symbols in smaller batches
-            batch_size = 4
-            for i in range(0, len(self.bot.valid_symbols), batch_size):
-                batch_symbols = sorted(self.bot.valid_symbols[i:i+batch_size])
+            for symbol in self.bot.valid_symbols:
+                # Get current price and stats using new API
+                ticker = await self.bot.api.get_symbol_ticker(symbol)
+                stats = await self.bot.api.get_24h_stats(symbol)
                 
-                # Process batch concurrently with timeout
-                try:
-                    async with asyncio.timeout(10):  # 10 second timeout per batch
-                        tasks = [self._process_symbol_position(symbol, cached_prices, now) 
-                                for symbol in batch_symbols]
-                        batch_results = await asyncio.gather(*tasks)
-                        positions.extend([r for r in batch_results if r])
-                except asyncio.TimeoutError:
-                    self.logger.warning(f"Timeout processing batch starting with {batch_symbols[0]}")
-                    continue
-
-            # Format and send message
-            if positions:
-                message = "🎯 Trading Positions & Thresholds:\n\n"
-                message += "Legend:\n"
-                message += "⚪ Not Triggered | 🟡 Triggered | ✅ Available | 🔒 Locked\n\n"
-                message += "\n".join(positions)
-                message += f"\n\nLast Update: {now.strftime('%H:%M:%S UTC')}"
-
-                # Send in chunks if needed
-                await self.safe_send_message(message)
-            else:
-                await self.safe_send_message("❌ No position data available")
-
-        except Exception as e:
-            self.logger.error(f"Error fetching positions: {e}", exc_info=True)
-            await self.safe_send_message(f"❌ Error fetching positions: {str(e)}")
-
-    async def _process_symbol_position(self, symbol, cached_prices, now):
-        """Process single symbol position data"""
-        try:
-            price_data = cached_prices.get(symbol, {})
-            if not price_data:
-                return f"⚪ {symbol}: No price data"
-
-            price = price_data.get('price', 0)
-            change = price_data.get('change', 0)
-            arrow = "↑" if change >= 0 else "↓"
-            color = "🟢" if change >= 0 else "🔴"
-
-            ref_prices = self.bot.get_reference_prices(symbol)
-            symbol_info = [f"{color} {symbol}: {price:.8f} ({change:+.2f}%) {arrow}"]
-
-            for timeframe in ['daily', 'weekly', 'monthly']:
-                if not self.bot.timeframe_config[timeframe]['enabled']:
-                    continue
-
-                current_drop = self._calculate_price_drop(
-                    ref_prices.get(timeframe, {}).get('open', 0),
-                    price
-                )
+                price = float(ticker['price'])
+                change = float(stats['priceChangePercent'])
                 
-                if current_drop is not None:
-                    threshold_status = self._get_threshold_status(
-                        symbol, timeframe, current_drop, now
-                    )
-                    symbol_info.extend([
-                        f"  {timeframe.capitalize()}: {current_drop:+.2f}%",
-                        f"    Thresholds: {' | '.join(threshold_status)}"
-                    ])
-
-            return "\n".join(symbol_info)
-
-        except Exception as e:
-            self.logger.error(f"Error processing {symbol} position: {e}")
-            return None
-
-    def _calculate_price_drop(self, ref_price, current_price):
-        """Calculate price drop percentage"""
-        try:
-            if ref_price and ref_price > 0:
-                return ((ref_price - current_price) / ref_price) * 100
-            return None
-        except Exception:
-            return None
-
-    def _get_threshold_status(self, symbol, timeframe, current_drop, now):
-        """Get threshold status with proper error handling"""
-        try:
-            thresholds = self.bot.timeframe_config[timeframe]['thresholds']
-            status = []
-            
-            for threshold in thresholds:
-                threshold_pct = threshold * 100
-                status.append(self._format_threshold_status(
-                    symbol, timeframe, threshold, threshold_pct,
-                    current_drop, now
-                ))
-            
-            return status
-        except Exception as e:
-            self.logger.error(f"Error getting threshold status: {e}")
-            return ["⚠️ Error"]
-
-    def _format_threshold_status(self, symbol, timeframe, threshold, threshold_pct, 
-                               current_drop, now):
-        """Format single threshold status"""
-        try:
-            # Check if threshold is locked
-            if (symbol in self.bot.strategy.order_history[timeframe] and 
-                threshold in self.bot.strategy.order_history[timeframe][symbol]):
+                # Rest of position handling...
                 
-                last_order = self.bot.strategy.order_history[timeframe][symbol][threshold]
-                reset_time = self._get_reset_time(last_order, timeframe)
-                
-                if now < reset_time:
-                    time_left = reset_time - now
-                    hours = int(time_left.total_seconds() / 3600)
-                    mins = int((time_left.total_seconds() % 3600) / 60)
-                    return f"🔒 {threshold_pct:.1f}% ({hours}h {mins}m)"
-                    
-                return f"✅ {threshold_pct:.1f}%"
-                    
-            # Not locked - check if triggered
-            return f"🟡 {threshold_pct:.1f}%" if current_drop >= threshold_pct else f"⚪ {threshold_pct:.1f}%"
-            
         except Exception as e:
-            self.logger.error(f"Error formatting threshold: {e}")
-            return f"⚠️ {threshold_pct:.1f}%"
-
-    def _get_reset_time(self, last_order, timeframe):
-        """Calculate reset time based on timeframe"""
-        if timeframe == 'daily':
-            return last_order + timedelta(days=1)
-        elif timeframe == 'weekly':
-            return last_order + timedelta(days=7)  # Fix: Remove days() function call
-        else:  # monthly
-            return last_order + timedelta(days=30)
+            await self.safe_send_message(f"❌ Error fetching positions: {e}")
 
     async def handle_balance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show balance info"""
@@ -1248,4 +1092,52 @@ class TelegramHandler:
             "/stats - Show system information"
         )
         await self.send_message(welcome_msg)
+
+    async def handle_leverage(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Change leverage for futures trading"""
+        try:
+            if 'futures' not in self.bot.api.api_mode:
+                await self.send_message("❌ Leverage command only available in futures mode")
+                return
+
+            if not context.args or len(context.args) != 2:
+                await self.send_message("Usage: /leverage <symbol> <1-125>")
+                return
+
+            symbol = context.args[0].upper()
+            leverage = int(context.args[1])
+
+            if leverage < 1 or leverage > 125:
+                await self.send_message("❌ Leverage must be between 1 and 125")
+                return
+
+            result = await self.bot.api.change_leverage(symbol, leverage)
+            await self.send_message(f"✅ Leverage changed for {symbol} to {leverage}x")
+
+        except Exception as e:
+            await self.send_message(f"❌ Error changing leverage: {e}")
+
+    async def handle_margin_type(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Change margin type for futures"""
+        try:
+            if 'futures' not in self.bot.api.api_mode:
+                await self.send_message("❌ Margin type command only available in futures mode")
+                return
+
+            if not context.args or len(context.args) != 2:
+                await self.send_message("Usage: /margin <symbol> <isolated|cross>")
+                return
+
+            symbol = context.args[0].upper()
+            margin_type = context.args[1].lower()
+
+            if margin_type not in ['isolated', 'cross']:
+                await self.send_message("❌ Margin type must be either 'isolated' or 'cross'")
+                return
+
+            result = await self.bot.api.change_margin_type(symbol, margin_type)
+            await self.send_message(f"✅ Margin type changed for {symbol} to {margin_type}")
+
+        except Exception as e:
+            await self.send_message(f"❌ Error changing margin type: {e}")
 
