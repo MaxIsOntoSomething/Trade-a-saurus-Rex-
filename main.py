@@ -523,25 +523,25 @@ class BinanceBot:
             # Use cached price instead of fetching new one
             current_price = await self.get_cached_price(symbol)
             
-            # Format price with exact decimal places based on symbol info
+            # Get exchange info without timestamp
             try:
-                # Get exchange info without timestamp
                 if not hasattr(self, 'symbol_info_cache'):
                     self.symbol_info_cache = {}
+                    # Remove timestamp parameter from get_exchange_info call
                     exchange_info = await self._make_api_call(
                         self.client.get_exchange_info,
-                        _no_timestamp=True  # Add this flag
+                        _no_timestamp=True  # Add this flag to skip timestamp
                     )
                     for info in exchange_info['symbols']:
                         self.symbol_info_cache[info['symbol']] = info
 
                 symbol_info = self.symbol_info_cache.get(symbol)
                 if not symbol_info:
-                    # If not in cache, try to get specific symbol info
+                    # Get specific symbol info without timestamp
                     symbol_info = await self._make_api_call(
                         self.client.get_symbol_info,
                         symbol=symbol,
-                        _no_timestamp=True
+                        _no_timestamp=True  # Add this flag to skip timestamp
                     )
                     if not symbol_info:
                         raise ValueError(f"Symbol info not found for {symbol}")
@@ -1431,26 +1431,29 @@ class BinanceBot:
     async def main_loop(self):
         """Main bot loop with enhanced Telegram initialization"""
         try:
-            # Initialize Telegram with retry
+            # Initialize Telegram with enhanced error handling
             if self.telegram_handler:
                 print(f"{Fore.CYAN}Initializing Telegram...")
-                for attempt in range(3):  # Try 3 times
+                telegram_success = False
+                
+                for attempt in range(3):
                     try:
                         telegram_success = await self.telegram_handler.initialize()
                         if telegram_success:
                             print(f"{Fore.GREEN}Telegram bot initialized successfully")
                             break
                         else:
-                            if attempt < 2:  # Don't wait on last attempt
+                            if attempt < 2:
                                 print(f"{Fore.YELLOW}Telegram initialization failed, retrying in 5s...")
                                 await asyncio.sleep(5)
                     except Exception as e:
+                        self.logger.error(f"Telegram initialization attempt {attempt + 1} failed: {e}")
                         if attempt < 2:
-                            print(f"{Fore.YELLOW}Telegram error: {e}, retrying in 5s...")
                             await asyncio.sleep(5)
-                        else:
-                            print(f"{Fore.YELLOW}Failed to initialize Telegram, continuing without it...")
-                            self.telegram_handler = None
+                
+                if not telegram_success:
+                    print(f"{Fore.RED}Failed to initialize Telegram after 3 attempts")
+                    self.telegram_handler = None
 
             # Perform startup checks
             if not await self.startup_checks():

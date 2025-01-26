@@ -22,7 +22,7 @@ class APIHandler:
         self.time_offset = 0
         self.last_sync = 0
 
-        # Update no_timestamp_methods to include more endpoints
+        # Update no_timestamp_methods to include all read-only endpoints
         self.no_timestamp_methods = {
             'get_symbol_ticker',
             'get_exchange_info',
@@ -30,8 +30,9 @@ class APIHandler:
             'get_server_time',
             'get_historical_klines',
             'get_ticker',
-            'get_symbol_ticker',
-            'get_klines'
+            'get_klines',
+            'get_depth',
+            'get_aggregate_trades'
         }
 
     def add_callback(self, callback):
@@ -66,8 +67,8 @@ class APIHandler:
         start_time = time.time()
         
         try:
-            # Remove timestamp for specific endpoints
-            if func.__name__ in self.no_timestamp_methods:
+            # Remove timestamp for read-only endpoints
+            if func.__name__ in self.no_timestamp_methods or _no_timestamp:
                 kwargs.pop('timestamp', None)
                 _no_timestamp = True
 

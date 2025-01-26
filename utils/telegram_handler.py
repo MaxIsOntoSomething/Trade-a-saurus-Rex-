@@ -83,42 +83,23 @@ class TelegramHandler:
         self.logger.info(f"Emergency stop code generated: {self.emergency_stop_code}")
 
     async def send_startup_notification(self):
-        """Send comprehensive startup notification"""
-        try:
-            startup_msg = (
-                "🤖 Binance Trading Bot Started!\n\n"
-                "📈 Trading Configuration:\n"
-                f"• Mode: {'Testnet' if self.bot.client.API_URL == 'https://testnet.binance.vision/api' else 'Live'}\n"
-                f"• Order Type: {self.bot.order_type.capitalize()}\n"
-                f"• Trading Pairs: {', '.join(self.bot.valid_symbols)}\n"
-                f"• USDT Reserve: {self.bot.reserve_balance_usdt}\n"
-                f"• Tax Rate: 28%\n\n"
-                "📊 Available Commands:\n\n"
-                "Market Analysis:\n"
-                "/positions - Show current prices and opportunities\n"
-                "/orders - Show open limit orders\n\n"
-                "Portfolio Management:\n"
-                "/balance - Show current balance\n"
-                "/trades - List all trades with P/L\n"
-                "/addtrade - Add manual trade\n"
-                "/symbol <SYMBOL> - Show detailed stats\n"
-                "/summary - Show portfolio summary\n\n"
-                "Analytics:\n"
-                "/profits - Show current profits\n"
-                "/distribution - Show entry distribution\n"
-                "/stacking - Show position building\n"
-                "/buytimes - Show trade timing\n"
-                "/portfolio - Show value evolution\n"
-                "/allocation - Show asset allocation\n\n"
-                "System:\n"
-                "/stats - Show system information\n\n"
-                "🟢 Bot is actively monitoring markets!"
-            )
-            
-            await self.send_message(startup_msg)
-            
-        except Exception as e:
-            self.logger.error(f"Error sending startup notification: {e}")
+        """Send comprehensive startup notification with retry"""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                startup_msg = self._get_startup_message()
+                await self.safe_send_message(
+                    startup_msg,
+                    parse_mode='HTML',
+                    priority=True
+                )
+                self.startup_sent = True
+                print(f"{Fore.GREEN}Startup notification sent successfully")
+                return
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    self.logger.error(f"Failed to send startup notification: {e}")
+                await asyncio.sleep(2)
 
     async def initialize(self):
         """Initialize Telegram bot with improved error handling"""
@@ -127,70 +108,47 @@ class TelegramHandler:
                 return True
 
             self.logger.info("Initializing Telegram bot...")
+            print(f"{Fore.GREEN}Emergency stop code generated: {self.emergency_stop_code}")
             
-            # Build and test application
             try:
-                # Add print statement for emergency code
-                print(f"{Fore.GREEN}Emergency stop code generated: {self.emergency_stop_code}")
-                
+                # Build and start application first
                 self.app = Application.builder().token(self.token).build()
-                
-                # Initialize application without starting updater yet
                 await self.app.initialize()
                 
-                # Test connection with timeout
-                test_response = await asyncio.wait_for(
-                    self.app.bot.get_me(),
-                    timeout=10
+                # Register handlers before starting
+                self.register_handlers()
+                
+                # Start polling with proper error handling
+                await self.app.start()
+                await self.app.updater.start_polling(
+                    allowed_updates=Update.ALL_TYPES,
+                    drop_pending_updates=True
                 )
                 
+                # Test connection
+                test_response = await self.app.bot.get_me()
                 if not test_response:
-                    self.logger.error("Failed to connect to Telegram")
-                    return False
+                    raise Exception("Failed to get bot info")
                     
+                # Set initialized flag
+                self.initialized = True
+                self.logger.info(f"Telegram bot initialized: {test_response.username}")
+                
+                # Start message processor
+                self.message_processor_task = asyncio.create_task(self._process_message_queue())
+                
+                # Send startup notification after everything is ready
+                print(f"{Fore.CYAN}Sending startup notification...")
+                await self.send_startup_notification()
+                
+                return True
+                
             except Exception as e:
-                self.logger.error(f"Failed to initialize Telegram application: {e}")
+                self.logger.error(f"Failed to initialize Telegram: {e}")
                 return False
-
-            # Register handlers
-            self.register_handlers()
-            
-            # Start application
-            try:
-                await self.app.start()
-            except Exception as e:
-                self.logger.error(f"Failed to start Telegram application: {e}")
-                return False
-
-            # Start message processor task
-            self.message_processor_task = asyncio.create_task(self._process_message_queue())
-            
-            # Send startup notification immediately with retry logic
-            startup_message = self._get_startup_message()  # Get startup message
-            retry_count = 3
-            for attempt in range(retry_count):
-                try:
-                    await self.app.bot.send_message(
-                        chat_id=self.chat_id,
-                        text=startup_message,
-                        parse_mode='HTML'
-                    )
-                    self.startup_sent = True
-                    break
-                except Exception as e:
-                    if attempt == retry_count - 1:
-                        self.logger.error(f"Failed to send startup message after {retry_count} attempts: {e}")
-                    await asyncio.sleep(1)
-
-            # Set initialized flag
-            self.initialized = True
-            self.logger.info(f"Telegram bot initialized: {test_response.username}")
-            
-            return True
-
+                
         except Exception as e:
             self.logger.exception(f"Fatal error during Telegram initialization: {e}")
-            self.initialized = False
             return False
 
     async def _process_commands(self):
