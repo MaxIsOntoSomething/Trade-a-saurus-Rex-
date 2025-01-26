@@ -1211,36 +1211,71 @@ class BinanceBot:
             self.logger.error(f"Error in price checking loop: {e}")
 
     async def main_loop(self):
-        """Main bot loop with regular API calls"""
+        """Main bot loop with real-time status display"""
         try:
             # Perform startup checks
             if not await self.startup_checks():
                 raise Exception("Startup checks failed")
-
-            # Initialize API
-            if not await self.api.initialize_exchange_info():
-                raise Exception("Failed to initialize exchange info")
 
             print(f"{Fore.GREEN}Starting price monitoring...")
             self.logger.info("Starting price monitoring loop")
 
             while True:
                 try:
-                    # Check for resets
+                    # Clear screen
+                    os.system('cls' if os.name == 'nt' else 'clear')
+                    
+                    # Print header with enhanced info
+                    print(f"{Fore.CYAN}=== Binance Trading Bot Status ==={Fore.RESET}")
+                    print(f"Mode: {Fore.YELLOW}{'Testnet' if self.use_testnet else 'Live'}{Fore.RESET}")
+                    print(f"Exchange: {Fore.YELLOW}Binance{Fore.RESET}")
+                    print(f"Market: {Fore.YELLOW}{'Futures' if self.api.trading_mode == 'futures' else 'Spot'}{Fore.RESET}")
+                    print(f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC\n")
+
+                    # Print timeframe status
+                    print(f"{Fore.YELLOW}Timeframe Status:")
+                    now = datetime.now(timezone.utc)
+                    for timeframe, reset_time in self.next_reset_times.items():
+                        time_to_reset = reset_time - now
+                        hours, remainder = divmod(time_to_reset.seconds, 3600)
+                        minutes, _ = divmod(remainder, 60)
+                        
+                        # Get configured thresholds for this timeframe
+                        config = self.timeframe_config.get(timeframe, {})
+                        if config.get('enabled', False):
+                            thresholds = [f"{t*100:.1f}%" for t in config.get('thresholds', [])]
+                            threshold_str = f"Thresholds: {', '.join(thresholds)}"
+                        else:
+                            threshold_str = "Disabled"
+                        
+                        print(f"{timeframe.capitalize()}: Reset in {time_to_reset.days}d {hours}h {minutes}m - {threshold_str}")
+
+                    # Print current prices
+                    print(f"\n{Fore.CYAN}Current Prices:")
+                    for symbol in self.valid_symbols:
+                        ticker = await self.api.get_symbol_ticker(symbol)
+                        stats = await self.api.get_24h_stats(symbol)
+                        if ticker and stats:
+                            price = float(ticker['price'])
+                            change = float(stats['priceChangePercent'])
+                            arrow = "↑" if change >= 0 else "↓"
+                            color = Fore.GREEN if change >= 0 else Fore.RED
+                            print(f"{color}{symbol}: {price:.8f} USDT ({change:+.2f}% {arrow})")
+
+                    # Check prices and handle signals in background
+                    await self.check_prices()
                     await self.check_and_handle_resets()
                     
-                    # Check prices every 2 seconds
-                    await self.check_prices()
-                    
+                    # Update every 2 seconds
                     await asyncio.sleep(2)
-                    
+                        
                 except asyncio.CancelledError:
                     print(f"{Fore.YELLOW}Price monitoring stopped")
                     break
                 except Exception as e:
                     self.logger.error(f"Error in main loop: {e}")
                     await asyncio.sleep(5)
-                    
+                        
         except Exception as e:
             self.logger.error(f"Fatal error in main loop: {e}")
             raise
