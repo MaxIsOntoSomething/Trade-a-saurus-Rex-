@@ -205,5 +205,57 @@ class BinanceAPI:
                 return None
         return None
 
+    async def get_symbol_ticker(self, symbol):
+        """Get current price for a symbol"""
+        try:
+            if self.trading_mode == 'futures':
+                return await self._make_api_call(
+                    self.client.futures_symbol_ticker,
+                    symbol=symbol
+                )
+            else:
+                return await self._make_api_call(
+                    self.client.get_symbol_ticker,
+                    symbol=symbol
+                )
+        except Exception as e:
+            self.logger.error(f"Error getting ticker for {symbol}: {e}")
+            return None
+
+    async def get_24h_stats(self, symbol):
+        """Get 24-hour stats for a symbol"""
+        try:
+            await self.rate_limiter.acquire()
+            if self.trading_mode == 'futures':
+                stats = self.client.futures_ticker(symbol=symbol)
+            else:
+                stats = self.client.get_ticker(symbol=symbol)
+            return stats
+        except Exception as e:
+            self.logger.error(f"Error getting 24h stats for {symbol}: {e}")
+            return None
+
+    async def get_symbol_info(self, symbol):
+        """Get symbol information"""
+        try:
+            # Update cache if needed
+            current_time = time.time()
+            if current_time - self.last_info_update > self.info_update_interval:
+                await self.initialize_exchange_info()
+
+            return self.symbol_info_cache.get(symbol)
+        except Exception as e:
+            self.logger.error(f"Error getting symbol info for {symbol}: {e}")
+            return None
+
+    async def _make_api_call(self, func, *args, **kwargs):
+        """Make API call with rate limiting"""
+        await self.rate_limiter.acquire()
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            self.logger.error(f"API call failed: {e}")
+            raise
+
     # Add other necessary methods like get_balance, cancel_order, etc.
     # ...existing code...

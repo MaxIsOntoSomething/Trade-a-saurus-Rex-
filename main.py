@@ -1193,16 +1193,22 @@ class BinanceBot:
         """Check prices using BinanceAPI"""
         try:
             for symbol in self.valid_symbols:
-                # Get price and 24h stats using BinanceAPI
-                ticker = await self.api.get_symbol_ticker(symbol)
-                if ticker:
-                    price = float(ticker['price'])
-                    # Process price update
-                    await self.handle_price_update(symbol, price)
-                await asyncio.sleep(0.5)  # Rate limiting
+                try:
+                    # Get price using BinanceAPI
+                    ticker = await self.api.get_symbol_ticker(symbol)
+                    if ticker and 'price' in ticker:
+                        price = float(ticker['price'])
+                        # Process price update
+                        await self.handle_price_update(symbol, price)
+                    else:
+                        self.logger.warning(f"Invalid ticker data for {symbol}")
+                    await asyncio.sleep(0.5)  # Rate limiting
+                except Exception as e:
+                    self.logger.error(f"Error checking price for {symbol}: {e}")
+                    continue
                 
         except Exception as e:
-            self.logger.error(f"Error checking prices: {e}")
+            self.logger.error(f"Error in price checking loop: {e}")
 
     async def main_loop(self):
         """Main bot loop with regular API calls"""

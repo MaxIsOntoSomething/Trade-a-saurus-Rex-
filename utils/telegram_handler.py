@@ -238,30 +238,17 @@ class TelegramHandler:
             self.processing_commands.discard(command)
 
     def register_handlers(self):
-        """Register mode-specific command handlers"""
+        """Register simplified command handlers"""
         try:
-            # Common commands
+            # Essential commands only
             handlers = {
                 "start": self.handle_start,
-                "balance": self.handle_balance,
-                "orders": self.handle_orders,
-                # ...other common commands...
+                "status": self.handle_status,      # New combined status command
+                "trades": self.handle_trades,      # Simplified trades view
+                "add": self.handle_addtrade,       # Manual trade entry
+                "stop": self.handle_emergency_stop,# Emergency stop
+                "help": self.handle_help          # Help command
             }
-
-            # Add mode-specific commands
-            if 'futures' in self.bot.api.api_mode:
-                handlers.update({
-                    "leverage": self.handle_leverage,
-                    "margin": self.handle_margin_type,
-                    "positions": self.handle_positions,
-                    "liquidation": self.handle_liquidation
-                })
-            else:
-                handlers.update({
-                    "positions": self.handle_positions,
-                    "distribution": self.handle_distribution,
-                    "stacking": self.handle_stacking
-                })
 
             # Register handlers
             for command, handler in handlers.items():
@@ -274,12 +261,52 @@ class TelegramHandler:
             self.logger.error(f"Error registering handlers: {e}")
             raise
 
-    async def handle_leverage(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle leverage changes for futures"""
-        if 'futures' not in self.bot.api.api_mode:
-            await self.send_message("❌ Leverage command only available in futures mode")
-            return
-        # ...leverage handling code...
+    async def handle_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Combined status command showing prices, positions, and balance"""
+        try:
+            message = "📊 Current Status\n\n"
+            
+            # Get current prices and 24h changes
+            for symbol in self.bot.valid_symbols:
+                ticker = await self.bot.api.get_symbol_ticker(symbol)
+                stats = await self.bot.api.get_24h_stats(symbol)
+                
+                if ticker and stats:
+                    price = float(ticker['price'])
+                    change = float(stats['priceChangePercent'])
+                    arrow = "↑" if change >= 0 else "↓"
+                    
+                    message += (
+                        f"{symbol}: {price:.8f} USDT\n"
+                        f"24h Change: {change:+.2f}% {arrow}\n\n"
+                    )
+
+            # Add balance information
+            balance = self.bot.get_balance()
+            if balance:
+                message += "💰 Balance:\n"
+                if 'USDT' in balance:
+                    message += f"USDT: {balance['USDT']['free']:.2f}\n"
+                for asset, details in balance.items():
+                    if asset != 'USDT' and details['total'] > 0:
+                        message += f"{asset}: {details['total']:.8f}\n"
+                        
+            await self.send_message(message)
+            
+        except Exception as e:
+            await self.send_message(f"❌ Error getting status: {e}")
+
+    async def handle_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show available commands"""
+        help_text = (
+            "Available Commands:\n\n"
+            "/status - Show current prices and balance\n"
+            "/trades - List active trades\n"
+            "/add - Start manual trade entry\n"
+            "/stop - Emergency stop\n"
+            "/help - Show this help message"
+        )
+        await self.send_message(help_text)
 
     def _wrap_handler(self, handler):
         """Enhanced command handler wrapper with timeout and retry logic"""
