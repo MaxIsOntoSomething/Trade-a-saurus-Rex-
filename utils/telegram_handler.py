@@ -81,23 +81,26 @@ class TelegramHandler:
         # Generate random emergency stop code
         self.emergency_stop_code = ''.join(random.choices('0123456789', k=6))
         self.logger.info(f"Emergency stop code generated: {self.emergency_stop_code}")
+        self.poll_task = None  # Add this line
 
     async def send_startup_notification(self):
-        """Send comprehensive startup notification with retry"""
+        """Send startup notification with retries and feedback"""
         max_retries = 3
         for attempt in range(max_retries):
             try:
+                print(f"\r{Fore.CYAN}Sending startup message (attempt {attempt + 1})...", end='')
                 startup_msg = self._get_startup_message()
                 await self.safe_send_message(
                     startup_msg,
                     parse_mode='HTML',
                     priority=True
                 )
+                print(f"\r{Fore.GREEN}Startup message sent successfully!{' '*20}")
                 self.startup_sent = True
-                print(f"{Fore.GREEN}Startup notification sent successfully")
                 return
             except Exception as e:
                 if attempt == max_retries - 1:
+                    print(f"\r{Fore.RED}Failed to send startup message: {e}{' '*20}")
                     self.logger.error(f"Failed to send startup notification: {e}")
                 await asyncio.sleep(2)
 
@@ -107,48 +110,60 @@ class TelegramHandler:
             if self.initialized:
                 return True
 
+            print(f"{Fore.CYAN}Starting Telegram initialization...")
             self.logger.info("Initializing Telegram bot...")
-            print(f"{Fore.GREEN}Emergency stop code generated: {self.emergency_stop_code}")
             
             try:
                 # Build and start application first
                 self.app = Application.builder().token(self.token).build()
-                await self.app.initialize()
                 
-                # Register handlers before starting
+                # Initialize and register handlers
+                await self.app.initialize()
                 self.register_handlers()
                 
-                # Start polling with proper error handling
+                # Start the application
                 await self.app.start()
-                await self.app.updater.start_polling(
+                
+                # Start polling with error handling
+                polling_task = self.app.updater.start_polling(
                     allowed_updates=Update.ALL_TYPES,
-                    drop_pending_updates=True
+                    drop_pending_updates=True,
+                    error_callback=self._polling_error_callback
                 )
+                
+                # Create polling task
+                self.poll_task = asyncio.create_task(polling_task)
                 
                 # Test connection
                 test_response = await self.app.bot.get_me()
                 if not test_response:
-                    raise Exception("Failed to get bot info")
+                    raise Exception("Failed to connect to Telegram")
                     
+                print(f"{Fore.GREEN}Telegram bot connected: @{test_response.username}")
+                
                 # Set initialized flag
                 self.initialized = True
-                self.logger.info(f"Telegram bot initialized: {test_response.username}")
                 
                 # Start message processor
-                self.message_processor_task = asyncio.create_task(self._process_message_queue())
-                
-                # Send startup notification after everything is ready
+                self.message_processor_task = asyncio.create_task(
+                    self._process_message_queue()
+                )
+
+                # Send startup message with visible feedback
                 print(f"{Fore.CYAN}Sending startup notification...")
                 await self.send_startup_notification()
+                print(f"{Fore.GREEN}Startup notification sent!")
                 
                 return True
                 
             except Exception as e:
                 self.logger.error(f"Failed to initialize Telegram: {e}")
+                print(f"{Fore.RED}Telegram initialization failed: {e}")
                 return False
                 
         except Exception as e:
-            self.logger.exception(f"Fatal error during Telegram initialization: {e}")
+            self.logger.error(f"Fatal error during Telegram initialization: {e}")
+            print(f"{Fore.RED}Fatal Telegram error: {e}")
             return False
 
     async def _process_commands(self):
@@ -1120,7 +1135,7 @@ class TelegramHandler:
             )
 
     async def shutdown(self):
-        """Enhanced Telegram shutdown with proper cleanup"""
+        """Enhanced shutdown with proper task cleanup"""
         try:
             if not self.initialized:
                 return
@@ -1128,7 +1143,15 @@ class TelegramHandler:
             self.logger.info("Shutting down Telegram bot...")
             
             try:
-                # Cancel message processor first
+                # Cancel polling task first
+                if self.poll_task:
+                    self.poll_task.cancel()
+                    try:
+                        await self.poll_task
+                    except asyncio.CancelledError:
+                        pass
+
+                # Cancel message processor
                 if self.message_processor_task:
                     self.message_processor_task.cancel()
                     try:
@@ -1136,11 +1159,7 @@ class TelegramHandler:
                     except asyncio.CancelledError:
                         pass
 
-                # Stop polling first
-                if hasattr(self.app, 'updater') and self.app.updater.running:
-                    await self.app.updater.stop()
-
-                # Then stop application
+                # Stop the application
                 if self.app.running:
                     await self.app.stop()
                     await self.app.shutdown()
@@ -1153,14 +1172,23 @@ class TelegramHandler:
                 
         except Exception as e:
             self.logger.error(f"Fatal error during shutdown: {e}")
-            
         finally:
-            # Ensure everything is marked as not running
             self.initialized = False
-            if hasattr(self, 'app'):
-                self.app.running = False
-                if hasattr(self.app, 'updater'):
-                    self.app.updater.running = False
+
+    async def _polling_error_callback(self, error):
+        """Handle polling errors"""
+        self.logger.error(f"Polling error: {error}")
+        
+        # Try to restart polling if it fails
+        if self.initialized and not self.poll_task.done():
+            self.poll_task.cancel()
+            self.poll_task = asyncio.create_task(
+                self.app.updater.start_polling(
+                    allowed_updates=Update.ALL_TYPES,
+                    drop_pending_updates=True,
+                    error_callback=self._polling_error_callback
+                )
+            )
 
     def _get_startup_message(self):
         """Generate startup message"""

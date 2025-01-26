@@ -84,6 +84,22 @@ class BinanceBot:
             self.telegram_chat_id != ''):
             
             self.logger.info("Initializing Telegram handler...")
+        self.use_percentage = config.get('USE_PERCENTAGE', False)
+        self.trade_amount = config.get('TRADE_AMOUNT', 10)
+        self.reserve_balance_usdt = config.get('RESERVE_BALANCE', 2000)
+        self.timeframe_config = config.get('TIMEFRAMES', {})
+        self.valid_symbols = []
+        self.invalid_symbols = []
+
+        # Initialize Telegram handler if enabled and properly configured
+        self.telegram_handler = None
+        if (self.use_telegram and 
+            self.telegram_token and 
+            self.telegram_chat_id and 
+            self.telegram_token != '' and 
+            self.telegram_chat_id != ''):
+            
+            self.logger.info("Initializing Telegram handler...")
             self.telegram_handler = TelegramHandler(
                 self.telegram_token,
                 self.telegram_chat_id,
@@ -523,29 +539,58 @@ class BinanceBot:
             # Use cached price instead of fetching new one
             current_price = await self.get_cached_price(symbol)
             
-            # Get exchange info without timestamp
+            # Get exchange info without timestamp for both Testnet and Live API
             try:
                 if not hasattr(self, 'symbol_info_cache'):
                     self.symbol_info_cache = {}
-                    # Remove timestamp parameter from get_exchange_info call
-                    exchange_info = await self._make_api_call(
-                        self.client.get_exchange_info,
-                        _no_timestamp=True  # Add this flag to skip timestamp
-                    )
-                    for info in exchange_info['symbols']:
-                        self.symbol_info_cache[info['symbol']] = info
+                    
+                    # Handle both Testnet and Live API differently
+                    try:
+                        if self.use_testnet:
+                            # Testnet requires simpler call
+                            exchange_info = self.client.get_exchange_info()
+                        else:
+                            # Live API can use the full call
+                            exchange_info = await self._make_api_call(
+                                self.client.get_exchange_info,
+                                _no_timestamp=True
+                            )
+                            
+                        # Cache all symbols
+                        for info in exchange_info['symbols']:
+                            self.symbol_info_cache[info['symbol']] = info
+                            
+                    except Exception as e:
+                        self.logger.error(f"Error getting exchange info: {e}")
+                        return False
 
+                # Get symbol info from cache or fetch directly
                 symbol_info = self.symbol_info_cache.get(symbol)
                 if not symbol_info:
-                    # Get specific symbol info without timestamp
-                    symbol_info = await self._make_api_call(
-                        self.client.get_symbol_info,
-                        symbol=symbol,
-                        _no_timestamp=True  # Add this flag to skip timestamp
-                    )
-                    if not symbol_info:
-                        raise ValueError(f"Symbol info not found for {symbol}")
-                    self.symbol_info_cache[symbol] = symbol_info
+                    try:
+                        if self.use_testnet:
+                            # For testnet, get full exchange info and find symbol
+                            exchange_info = self.client.get_exchange_info()
+                            symbol_info = next(
+                                (info for info in exchange_info['symbols'] if info['symbol'] == symbol),
+                                None
+                            )
+                        else:
+                            # For live API, get specific symbol info
+                            symbol_info = await self._make_api_call(
+                                self.client.get_symbol_info,
+                                symbol=symbol,
+                                _no_timestamp=True
+                            )
+                            
+                        if not symbol_info:
+                            raise ValueError(f"Symbol info not found for {symbol}")
+                            
+                        self.symbol_info_cache[symbol] = symbol_info
+                        
+                    except Exception as e:
+                        self.logger.error(f"Error getting symbol info for {symbol}: {e}")
+                        return False
 
             except Exception as e:
                 self.logger.error(f"Error getting symbol info for {symbol}: {e}")
@@ -1286,280 +1331,6 @@ class BinanceBot:
                 del self.trades[bot_order_id]
                 await self._save_trades_atomic()
             return False
-
-    def fetch_current_price(self, symbol):
-        try:
-            # Show clean loading animation
-            current_price = float(ticker['price'])
-            price_change = float(stats_24h['priceChangePercent'])
-            
-            # Determine trend direction and color based on price change
-            trend_arrow = "↑" if price_change >= 0 else "↓"
-            trend_color = Fore.GREEN if price_change >= 0 else Fore.RED
-            
-            # Print clean price info
-            print(f"\r{Fore.CYAN}[{datetime.now().strftime('%H:%M:%S')}] {symbol}:")
-            print(f"  Price: {trend_color}{current_price:.2f} USDT {trend_arrow}")
-            print(f"  24h Change: {trend_color}{price_change:+.2f}% {trend_arrow}")
-            
-            # Get and format reference prices
-            reference_prices = self.get_reference_prices(symbol)
-            print(f"{Fore.CYAN}Reference Prices for {symbol}:")
-            for timeframe, prices in reference_prices.items():
-                # Calculate percentage change from open
-                change_from_open = ((current_price - prices['open']) / prices['open']) * 100
-                
-                # If price is higher than open: GREEN, ↑, positive percentage
-                # If price is lower than open: RED, ↓, negative percentage
-                price_color = Fore.GREEN if change_from_open >= 0 else Fore.RED
-                price_arrow = "↑" if change_from_open >= 0 else "↓"
-                
-                print(f"  {timeframe.capitalize()}:")
-                print(f"    Open: {prices['open']:.2f} USDT")
-                print(f"    High: {prices['high']:.2f} USDT")
-                print(f"    Low: {prices['low']:.2f} USDT")
-                print(f"    Change: {price_color}{change_from_open:+.2f}% {price_arrow}")
-            
-            return current_price
-        except Exception as e:
-            print(f"\r{Fore.RED}Error fetching price for {symbol}: {str(e)}")
-            self.logger.error(f"Error fetching current price of {symbol}: {str(e)}")
-            return None
-
-    async def safe_telegram_send(self, chat_id, text, parse_mode=None, reply_markup=None):
-        """Safely send Telegram messages with retry logic"""
-        max_retries = 3
-        retry_delay = 2
-        
-        for attempt in range(max_retries):
-            try:
-                # Split message if too long
-                if len(text) > 4000:
-                    chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
-                    responses = []
-                    for chunk in chunks:
-                        response = await self.telegram_app.bot.send_message(
-                            chat_id=chat_id,
-                            text=chunk,
-                            parse_mode=parse_mode,
-                            reply_markup=reply_markup,
-                            read_timeout=30,
-                            connect_timeout=30,
-                            write_timeout=30,
-                            pool_timeout=30
-                        )
-                        responses.append(response)
-                    return responses[-1]  # Return last message
-                else:
-                    return await self.telegram_app.bot.send_message(
-                        chat_id=chat_id,
-                        text=text,
-                        parse_mode=parse_mode,
-                        reply_markup=reply_markup,
-                        read_timeout=30,
-                        connect_timeout=30,
-                        write_timeout=30,
-                        pool_timeout=30
-                    )
-            except Exception as e:
-                if attempt == max_retries - 1:  # Last attempt
-                    self.logger.error(f"Failed to send Telegram message after {max_retries} attempts: {e}")
-                    raise
-                await asyncio.sleep(retry_delay * (attempt + 1))  # Exponential backoff
-
-    async def send_telegram_message(self, message):
-        """Updated send_telegram_message method"""
-        if self.telegram_handler:
-            try:
-                await self.telegram_handler.send_message(message, parse_mode='HTML')
-            except Exception as e:
-                print(f"Error sending Telegram message: {e}")
-                self.logger.error(f"Error sending Telegram message: {e}")
-
-    def get_reference_prices(self, symbol):
-        """Get reference prices with improved error handling"""
-        references = {}
-        
-        try:
-            # For each timeframe, safely get historical data
-            for timeframe in ['daily', 'weekly', 'monthly']:
-                if not self.timeframe_config.get(timeframe, {}).get('enabled', False):
-                    continue
-                    
-                try:
-                    if timeframe == 'daily':
-                        interval = Client.KLINE_INTERVAL_1DAY
-                        lookback = "2 days ago UTC"
-                    elif timeframe == 'weekly':
-                        interval = Client.KLINE_INTERVAL_1WEEK
-                        lookback = "2 weeks ago UTC"
-                    else:  # monthly
-                        interval = Client.KLINE_INTERVAL_1MONTH
-                        lookback = "2 months ago UTC"
-
-                    # Get historical data
-                    df = self.get_historical_data(symbol, interval, lookback)
-                    
-                    # Verify we have data
-                    if df is not None and not df.empty:
-                        references[timeframe] = {
-                            'open': float(df['open'].iloc[-1]),
-                            'high': float(df['high'].iloc[-1]),
-                            'low': float(df['low'].iloc[-1])
-                        }
-                    else:
-                        self.logger.warning(f"No historical data found for {symbol} {timeframe}")
-                        references[timeframe] = {
-                            'open': None,
-                            'high': None,
-                            'low': None
-                        }
-                        
-                except Exception as e:
-                    self.logger.error(f"Error getting {timeframe} data for {symbol}: {str(e)}")
-                    references[timeframe] = {
-                        'open': None,
-                        'high': None,
-                        'low': None
-                    }
-                    
-        except Exception as e:
-            self.logger.error(f"Error getting reference prices for {symbol}: {str(e)}")
-            
-        return references
-
-    async def main_loop(self):
-        """Main bot loop with enhanced Telegram initialization"""
-        try:
-            # Initialize Telegram with enhanced error handling
-            if self.telegram_handler:
-                print(f"{Fore.CYAN}Initializing Telegram...")
-                telegram_success = False
-                
-                for attempt in range(3):
-                    try:
-                        telegram_success = await self.telegram_handler.initialize()
-                        if telegram_success:
-                            print(f"{Fore.GREEN}Telegram bot initialized successfully")
-                            break
-                        else:
-                            if attempt < 2:
-                                print(f"{Fore.YELLOW}Telegram initialization failed, retrying in 5s...")
-                                await asyncio.sleep(5)
-                    except Exception as e:
-                        self.logger.error(f"Telegram initialization attempt {attempt + 1} failed: {e}")
-                        if attempt < 2:
-                            await asyncio.sleep(5)
-                
-                if not telegram_success:
-                    print(f"{Fore.RED}Failed to initialize Telegram after 3 attempts")
-                    self.telegram_handler = None
-
-            # Perform startup checks
-            if not await self.startup_checks():
-                raise Exception("Startup checks failed")
-
-            # Initialize API handler instead of WebSocket
-            self.api_handler = APIHandler(self.client, self.valid_symbols, self.logger)
-            self.api_handler.add_callback(self.handle_price_update)
-
-            print(f"{Fore.GREEN}Starting price monitoring...")
-            await self.api_handler.start()
-
-            while True:
-                try:
-                    # Check for resets
-                    await self.check_and_handle_resets()
-                    await asyncio.sleep(1)
-                except asyncio.CancelledError:
-                    self.logger.info("Main loop cancelled, shutting down...")
-                    break
-                except Exception as e:
-                    self.logger.error(f"Error in main loop: {e}")
-                    await asyncio.sleep(5)
-
-        except Exception as e:
-            self.logger.error(f"Fatal error in main loop: {e}")
-            raise
-        finally:
-            # Proper cleanup sequence
-            if self.api_handler:
-                await self.api_handler.stop()
-            if self.telegram_handler:
-                await self.telegram_handler.shutdown()
-
-    def run(self):
-        """Run the bot with improved event loop management"""
-        try:
-            # Handle different Python versions and platforms
-            if sys.version_info >= (3, 10):
-                # Python 3.10+ - use new loop policy
-                if sys.platform.startswith('win'):
-                    # Windows-specific event loop policy
-                    policy = asyncio.WindowsSelectorEventLoopPolicy()
-                    asyncio.set_event_loop_policy(policy)
-                else:
-                    # Unix-like platforms can use the default policy
-                    asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
-            
-            # Create and set event loop
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-            # Add SSL cleanup handler
-            def cleanup_ssl():
-                import ssl
-                ssl.SSLSocket._client_ctx = None
-                ssl.SSLSocket._server_ctx = None
-            
-            loop.call_later(0, cleanup_ssl)
-            
-            try:
-                # Run main loop with proper error handling
-                loop.run_until_complete(self.main_loop())
-            except KeyboardInterrupt:
-                print(f"{Fore.YELLOW}\nClean shutdown requested. Preserving open orders...")
-                loop.run_until_complete(self.shutdown())
-            except Exception as e:
-                print(f"{Fore.RED}\nError in main loop: {str(e)}")
-                self.logger.error(f"Error in main loop: {str(e)}")
-            finally:
-                # Ensure proper cleanup
-                try:
-                    cleanup_tasks = []
-                    if self.api_handler:
-                        cleanup_tasks.append(self.api_handler.stop())
-                    if self.telegram_handler:
-                        cleanup_tasks.append(self.telegram_handler.shutdown())
-                    
-                    if cleanup_tasks:
-                        # Run cleanup tasks with timeout
-                        loop.run_until_complete(
-                            asyncio.wait_for(
-                                asyncio.gather(*cleanup_tasks),
-                                timeout=30
-                            )
-                        )
-                    
-                    # Cancel all remaining tasks
-                    pending = asyncio.all_tasks(loop)
-                    for task in pending:
-                        task.cancel()
-                        try:
-                            loop.run_until_complete(task)
-                        except (asyncio.CancelledError, Exception):
-                            pass
-                    
-                    # Shutdown asyncgens and close loop
-                    loop.run_until_complete(loop.shutdown_asyncgens())
-                    loop.close()
-                    
-                except Exception as e:
-                    self.logger.error(f"Error during cleanup: {e}")
-                    
-        except Exception as e:
-            print(f"{Fore.RED}Fatal error: {str(e)}")
-            self.logger.error(f"Fatal error: {str(e)}")
 
     async def handle_price_update(self, symbol, price):
         """Handle price updates with direct API calls"""

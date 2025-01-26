@@ -25,7 +25,7 @@ class APIHandler:
         # Update no_timestamp_methods to include all read-only endpoints
         self.no_timestamp_methods = {
             'get_symbol_ticker',
-            'get_exchange_info',
+            'get_exchange_info',  # This needs to always be no timestamp
             'get_symbol_info',
             'get_server_time',
             'get_historical_klines',
@@ -62,44 +62,36 @@ class APIHandler:
         
         # Get endpoint name from function
         endpoint = func.__name__.replace('get_', '').replace('_', ' ').title()
-        print(f"\r📡 Calling {endpoint}...", end='', flush=True)
-        
-        start_time = time.time()
         
         try:
-            # Remove timestamp for read-only endpoints
+            # Special handling for Testnet endpoints
+            is_testnet = hasattr(self.client, 'API_URL') and 'testnet' in self.client.API_URL
+            
+            # Remove timestamp for certain endpoints
             if func.__name__ in self.no_timestamp_methods or _no_timestamp:
                 kwargs.pop('timestamp', None)
-                _no_timestamp = True
-
-            if not _no_timestamp:
-                kwargs['timestamp'] = int(time.time() * 1000 + self.time_offset)
+                
+            # Special handling for exchange info in Testnet
+            if is_testnet and func.__name__ in ['get_exchange_info', 'get_symbol_info']:
+                try:
+                    if func.__name__ == 'get_exchange_info':
+                        return self.client.get_exchange_info()
+                    elif func.__name__ == 'get_symbol_info':
+                        exchange_info = self.client.get_exchange_info()
+                        symbol = kwargs.get('symbol')
+                        return next((s for s in exchange_info['symbols'] if s['symbol'] == symbol), None)
+                except Exception as e:
+                    print(f"\r❌ {endpoint} failed in Testnet: {str(e)}", end='', flush=True)
+                    raise
             
-            # Clean up output with carriage return
-            print(f"\r⏳ Processing {endpoint}..." + " " * 50, end='', flush=True)
-            
+            print(f"\r📡 {endpoint}: Calling API...", end='', flush=True)
             response = func(*args, **kwargs)
-            duration = (time.time() - start_time) * 1000
-
-            print(f"\r✅ {endpoint} completed in {duration:.0f}ms" + " " * 50)
+            print(f"\r✅ {endpoint}: Success", end='', flush=True)
+            
             return response
             
         except Exception as e:
-            duration = (time.time() - start_time) * 1000
-            print(f"\r❌ {endpoint} failed after {duration:.0f}ms: {str(e)}" + " " * 50)
-            self.logger.error(
-                'API Call failed',
-                extra={
-                    'api_type': 'API_CALL',
-                    'request_data': {
-                        'function': func.__name__,
-                        'args': args,
-                        'kwargs': {k: v for k, v in kwargs.items() if 'key' not in k.lower()}
-                    },
-                    'response_data': {'error': str(e)},
-                    'duration': time.time() - start_time if 'start_time' in locals() else 0
-                }
-            )
+            print(f"\r❌ {endpoint}: Failed - {str(e)}", end='', flush=True)
             raise
 
     async def _price_update_loop(self):
