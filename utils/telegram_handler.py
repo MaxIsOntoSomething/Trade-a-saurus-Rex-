@@ -18,7 +18,7 @@ class TelegramHandler:
         self.bot = bot_instance  # Reference to main bot for accessing data
         self.app = Application.builder().token(token).build()
         self.commands_setup = False
-        self.logger = logging.getLogger(__name__)
+        self.logger = logging.getLogger('Telegram')
         self.trade_conv_state = {}  # Add this to track conversation states
         self.command_lock = asyncio.Lock()  # Add lock for commands
         self.command_timeout = 30  # Timeout for commands in seconds
@@ -40,16 +40,8 @@ class TelegramHandler:
         self.command_workers = []  # Add this to track workers
         self.startup_sent = False  # Add flag to track startup message
 
-        self.logger = logging.getLogger('TelegramHandler')
         self.logger.setLevel(logging.DEBUG)  # Set to DEBUG for more detailed logs
         
-        # Add file handler for Telegram-specific logs
-        telegram_handler = logging.FileHandler('logs/telegram_bot.log')
-        telegram_handler.setFormatter(
-            logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        )
-        self.logger.addHandler(telegram_handler)
-
         # Add retry parameters
         self.max_retries = 3
         self.base_retry_delay = 1
@@ -129,50 +121,71 @@ class TelegramHandler:
             self.logger.error(f"Error sending startup notification: {e}")
 
     async def initialize(self):
-        """Initialize Telegram bot with immediate functionality"""
+        """Initialize Telegram bot with improved error handling"""
         try:
             if self.initialized:
                 return True
 
             self.logger.info("Initializing Telegram bot...")
             
-            # Initialize application and test connection first
-            self.app = Application.builder().token(self.token).build()
-            await self.app.initialize()
-            test_response = await self.app.bot.get_me()
-            if not test_response:
-                self.logger.error("Failed to connect to Telegram")
+            # Build and test application
+            try:
+                # Add print statement for emergency code
+                print(f"{Fore.GREEN}Emergency stop code generated: {self.emergency_stop_code}")
+                
+                self.app = Application.builder().token(self.token).build()
+                
+                # Initialize application without starting updater yet
+                await self.app.initialize()
+                
+                # Test connection with timeout
+                test_response = await asyncio.wait_for(
+                    self.app.bot.get_me(),
+                    timeout=10
+                )
+                
+                if not test_response:
+                    self.logger.error("Failed to connect to Telegram")
+                    return False
+                    
+            except Exception as e:
+                self.logger.error(f"Failed to initialize Telegram application: {e}")
                 return False
-            
-            # Start message processor task
-            self.message_processor_task = asyncio.create_task(self._process_message_queue())
-            
-            # Register handlers before starting
+
+            # Register handlers
             self.register_handlers()
             
             # Start application
-            await self.app.start()
+            try:
+                await self.app.start()
+            except Exception as e:
+                self.logger.error(f"Failed to start Telegram application: {e}")
+                return False
+
+            # Start message processor task
+            self.message_processor_task = asyncio.create_task(self._process_message_queue())
             
-            # Start polling in background
-            self.polling_task = asyncio.create_task(
-                self.app.updater.start_polling(
-                    allowed_updates=Update.ALL_TYPES,
-                    drop_pending_updates=True
-                )
-            )
+            # Send startup notification immediately with retry logic
+            startup_message = self._get_startup_message()  # Get startup message
+            retry_count = 3
+            for attempt in range(retry_count):
+                try:
+                    await self.app.bot.send_message(
+                        chat_id=self.chat_id,
+                        text=startup_message,
+                        parse_mode='HTML'
+                    )
+                    self.startup_sent = True
+                    break
+                except Exception as e:
+                    if attempt == retry_count - 1:
+                        self.logger.error(f"Failed to send startup message after {retry_count} attempts: {e}")
+                    await asyncio.sleep(1)
 
             # Set initialized flag
             self.initialized = True
-            self.logger.info(f"Connected as {test_response.username}")
-
-            # Send startup message
-            if not self.startup_sent:
-                await self.send_message(
-                    "🤖 Bot connected and ready!",
-                    priority=True
-                )
-                self.startup_sent = True
-
+            self.logger.info(f"Telegram bot initialized: {test_response.username}")
+            
             return True
 
         except Exception as e:
@@ -252,40 +265,57 @@ class TelegramHandler:
             self.processing_commands.discard(command)
 
     def register_handlers(self):
-        """Register command handlers with emergency stop"""
-        handlers = {
-            "start": self.handle_start,
-            "positions": self.handle_positions,
-            "balance": self.handle_balance,
-            "profits": self.handle_profits,
-            "stats": self.handle_stats,
-            "distribution": self.handle_distribution,
-            "stacking": self.handle_stacking,
-            "buytimes": self.handle_buy_times,
-            "portfolio": self.handle_portfolio,
-            "allocation": self.handle_allocation,
-            "orders": self.handle_orders,
-            "trade": self.handle_trade,
-            "trades": self.handle_trades_list,
-            "symbol": self.handle_symbol_stats,
-            "summary": self.handle_portfolio_summary,
-            "addtrade": self.handle_addtrade,
-            "emergency": self.handle_emergency_stop,  # Add emergency stop handler
-        }
+        """Register command handlers with improved error handling"""
+        try:
+            if not hasattr(self, 'app') or not self.app:
+                self.logger.error("Cannot register handlers - application not initialized")
+                return
 
-        # Clear existing handlers
-        if hasattr(self.app, 'handlers'):
-            self.app.handlers.clear()
+            # Clear existing handlers
+            if hasattr(self.app, 'handlers'):
+                self.app.handlers.clear()
 
-        # Register handlers directly without wrapper
-        for command, handler in handlers.items():
-            self.app.add_handler(CommandHandler(command, self._wrap_handler(handler)))
+            # Register handlers
+            handlers = {
+                "start": self.handle_start,
+                "positions": self.handle_positions,
+                "balance": self.handle_balance,
+                "profits": self.handle_profits,
+                "stats": self.handle_stats,
+                "distribution": self.handle_distribution,
+                "stacking": self.handle_stacking,
+                "buytimes": self.handle_buy_times,
+                "portfolio": self.handle_portfolio,
+                "allocation": self.handle_allocation,
+                "orders": self.handle_orders,
+                "trade": self.handle_trade,
+                "trades": self.handle_trades_list,
+                "symbol": self.handle_symbol_stats,
+                "summary": self.handle_portfolio_summary,
+                "addtrade": self.handle_addtrade,
+                "emergency": self.handle_emergency_stop,  # Add emergency stop handler
+            }
 
-        # Add message handler directly
-        self.app.add_handler(MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            self.handle_message
-        ))
+            for command, handler in handlers.items():
+                try:
+                    self.app.add_handler(CommandHandler(command, self._wrap_handler(handler)))
+                except Exception as e:
+                    self.logger.error(f"Failed to register handler for {command}: {e}")
+
+            # Add message handler
+            try:
+                self.app.add_handler(MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    self.handle_message
+                ))
+            except Exception as e:
+                self.logger.error(f"Failed to register message handler: {e}")
+
+            self.logger.info("Command handlers registered successfully")
+
+        except Exception as e:
+            self.logger.error(f"Error registering handlers: {e}")
+            raise
 
     def _wrap_handler(self, handler):
         """Enhanced command handler wrapper with timeout and retry logic"""
@@ -408,7 +438,7 @@ class TelegramHandler:
                 await asyncio.sleep(1)
 
     async def send_message(self, text, parse_mode=None, reply_markup=None, priority=False, **kwargs):
-        """Enhanced message sending with priority queue"""
+        """Enhanced message sending with logging"""
         if not text or not self.initialized:
             return None
 
@@ -421,14 +451,32 @@ class TelegramHandler:
         }
 
         try:
+            self.logger.debug(
+                "Sending Telegram message",
+                extra={
+                    'details': f"Priority: {priority}\nMessage: {text[:200]}..."
+                }
+            )
+
             if priority:
-                # Priority 1 for emergency/critical messages
                 await self.priority_queue.put((1, message_data))
             else:
-                # Priority 2 for normal messages
                 await self.normal_queue.put(message_data)
+                
+            self.logger.debug(
+                "Message queued successfully",
+                extra={
+                    'details': f"Queue size: {self.normal_queue.qsize()}"
+                }
+            )
+                
         except Exception as e:
-            self.logger.error(f"Error queuing message: {e}")
+            self.logger.error(
+                "Error queuing message",
+                extra={
+                    'details': f"Error: {str(e)}\nMessage: {text[:200]}..."
+                }
+            )
 
     async def _send_with_retry(self, text, parse_mode=None, reply_markup=None):
         """Send message with retries and proper error handling"""
@@ -530,150 +578,180 @@ class TelegramHandler:
             
         return True
 
-    async def handle_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /start command"""
-        welcome_msg = (
-            "🤖 Binance Trading Bot\n\n"
-            "Available Commands:\n\n"
-            "📊 Market Analysis:\n"
-            "/positions - Show current prices and trading opportunities\n"
-            "/orders - Show open limit orders with cancel times\n\n"
-            "💰 Portfolio & Trading:\n"
-            "/balance - Show current balance for all assets\n"
-            "/trades - List all trades with P/L after tax\n"
-            "/addtrade - Add a manual trade to track\n"
-            "/symbol <SYMBOL> - Show detailed symbol stats with tax\n"
-            "/summary - Show complete portfolio summary with tax\n"
-            "/profits - Show current profits for all positions\n"
-            "/portfolio - Show portfolio value evolution\n"
-            "/allocation - Show current asset distribution\n\n"
-            "📈 Analytics:\n"
-            "/distribution - Show entry price distribution\n"
-            "/stacking - Show position building patterns\n"
-            "/buytimes - Show time between purchases\n\n"
-            "ℹ️ System:\n"
-            "/stats - Show system stats and bot information\n\n"
-            "🔄 Trading Status:\n"
-            f"Mode: {'Testnet' if self.bot.client.API_URL == 'https://testnet.binance.vision/api' else 'Live'}\n"
-            f"Order Type: {self.bot.order_type.capitalize()}\n"
-            f"USDT Reserve: {self.bot.reserve_balance_usdt}\n"
-            "Tax Rate: 28%\n"
-            "Bot is actively monitoring markets! 🚀"
-        )
-        await self.send_message(welcome_msg)
-
+    # Update API handler references in handle_positions method
     async def handle_positions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show trading positions with thresholds and reset times"""
         try:
             # Send loading message and store the message object
-            processing_msg = await self.app.bot.send_message(
-                chat_id=self.chat_id,
-                text="📊 Fetching positions..."
-            )
+            loading_msg = await self.safe_send_message("📊 Fetching positions...")
 
             positions = []
-            cached_prices = self.bot.ws_manager.last_prices
             now = datetime.now(timezone.utc)
+            
+            # Check API handler connection
+            if not self.bot.api_handler or not self.bot.api_handler.is_running:
+                await self.safe_send_message(
+                    "❌ Price monitoring not connected. Reconnecting...",
+                    priority=True
+                )
+                return
+            
+            # Use cached prices with shorter timeout
+            try:
+                async with asyncio.timeout(5):
+                    cached_prices = self.bot.api_handler.last_prices
+                    if not cached_prices:
+                        await self.safe_send_message(
+                            "❌ No price data available. Please try again in a few seconds."
+                        )
+                        return
+            except asyncio.TimeoutError:
+                await self.safe_send_message(
+                    "❌ Timeout while fetching prices. Please try again."
+                )
+                return
 
-            # Process each trading symbol
-            for symbol in sorted(self.bot.valid_symbols):
-                price_data = cached_prices.get(symbol, {})
-                if not price_data:
-                    positions.append(f"⚪ {symbol}: No price data")
+            # Process symbols in smaller batches
+            batch_size = 4
+            for i in range(0, len(self.bot.valid_symbols), batch_size):
+                batch_symbols = sorted(self.bot.valid_symbols[i:i+batch_size])
+                
+                # Process batch concurrently with timeout
+                try:
+                    async with asyncio.timeout(10):  # 10 second timeout per batch
+                        tasks = [self._process_symbol_position(symbol, cached_prices, now) 
+                                for symbol in batch_symbols]
+                        batch_results = await asyncio.gather(*tasks)
+                        positions.extend([r for r in batch_results if r])
+                except asyncio.TimeoutError:
+                    self.logger.warning(f"Timeout processing batch starting with {batch_symbols[0]}")
                     continue
 
-                price = price_data.get('price', 0)
-                change = price_data.get('change', 0)
-                arrow = "↑" if change >= 0 else "↓"
-                color = "🟢" if change >= 0 else "🔴"
+            # Format and send message
+            if positions:
+                message = "🎯 Trading Positions & Thresholds:\n\n"
+                message += "Legend:\n"
+                message += "⚪ Not Triggered | 🟡 Triggered | ✅ Available | 🔒 Locked\n\n"
+                message += "\n".join(positions)
+                message += f"\n\nLast Update: {now.strftime('%H:%M:%S UTC')}"
 
-                # Get reference prices for drop calculations
-                ref_prices = self.bot.get_reference_prices(symbol)
-                
-                symbol_info = [f"{color} {symbol}: {price:.8f} ({change:+.2f}%) {arrow}"]
-                
-                # Add timeframe information
-                for timeframe in ['daily', 'weekly', 'monthly']:
-                    if not self.bot.timeframe_config[timeframe]['enabled']:
-                        continue
-
-                    # Get reference price for timeframe
-                    ref_price = ref_prices.get(timeframe, {}).get('open', 0)
-                    if ref_price:
-                        current_drop = ((ref_price - price) / ref_price) * 100
-                        
-                        # Get thresholds and their status
-                        thresholds = self.bot.timeframe_config[timeframe]['thresholds']
-                        threshold_status = []
-                        
-                        for threshold in thresholds:
-                            threshold_pct = threshold * 100
-                            if symbol in self.bot.strategy.order_history[timeframe] and \
-                               threshold in self.bot.strategy.order_history[timeframe][symbol]:
-                                # Calculate time until reset
-                                last_order = self.bot.strategy.order_history[timeframe][symbol][threshold]
-                                
-                                # Calculate reset time based on timeframe
-                                if timeframe == 'daily':
-                                    reset_time = last_order + timedelta(days=1)
-                                elif timeframe == 'weekly':
-                                    reset_time = last_order + timedelta(days=7)
-                                else:  # monthly
-                                    reset_time = last_order + timedelta(days=30)
-                                
-                                if now < reset_time:
-                                    time_left = reset_time - now
-                                    hours = int(time_left.total_seconds() / 3600)
-                                    mins = int((time_left.total_seconds() % 3600) / 60)
-                                    threshold_status.append(f"🔒 {threshold_pct:.1f}% ({hours}h {mins}m)")
-                                else:
-                                    threshold_status.append(f"✅ {threshold_pct:.1f}%")
-                            else:
-                                if current_drop >= threshold_pct:
-                                    threshold_status.append(f"🟡 {threshold_pct:.1f}%")
-                                else:
-                                    threshold_status.append(f"⚪ {threshold_pct:.1f}%")
-                        
-                        symbol_info.append(f"  {timeframe.capitalize()}: {current_drop:+.2f}%")
-                        symbol_info.append(f"    Thresholds: {' | '.join(threshold_status)}")
-
-                positions.extend(symbol_info)
-                positions.append("")  # Add blank line between symbols
-
-            # Format message
-            message = "🎯 Trading Positions & Thresholds:\n\n"
-            message += "Legend:\n"
-            message += "⚪ Not Triggered | 🟡 Triggered | ✅ Available | 🔒 Locked (time till reset)\n\n"
-            message += "\n".join(positions)
-            message += f"\n\nLast Update: {now.strftime('%H:%M:%S UTC')}"
-
-            # Update the processing message with the full data
-            try:
-                await self.app.bot.edit_message_text(
-                    chat_id=self.chat_id,
-                    message_id=processing_msg.message_id,
-                    text=message
-                )
-            except telegram.error.BadRequest as e:
-                # If message is too long, send as new message
-                if "message is too long" in str(e):
-                    await self.app.bot.delete_message(
-                        chat_id=self.chat_id,
-                        message_id=processing_msg.message_id
-                    )
-                    # Split message if needed
-                    chunks = [message[i:i+4000] for i in range(0, len(message), 4000)]
-                    for chunk in chunks:
-                        await self.app.bot.send_message(
-                            chat_id=self.chat_id,
-                            text=chunk
-                        )
-                else:
-                    raise
+                # Send in chunks if needed
+                await self.safe_send_message(message)
+            else:
+                await self.safe_send_message("❌ No position data available")
 
         except Exception as e:
-            self.logger.error(f"Error fetching positions: {e}")
-            await self.send_message(f"❌ Error fetching positions: {e}")
+            self.logger.error(f"Error fetching positions: {e}", exc_info=True)
+            await self.safe_send_message(f"❌ Error fetching positions: {str(e)}")
+
+    async def _process_symbol_position(self, symbol, cached_prices, now):
+        """Process single symbol position data"""
+        try:
+            price_data = cached_prices.get(symbol, {})
+            if not price_data:
+                return f"⚪ {symbol}: No price data"
+
+            price = price_data.get('price', 0)
+            change = price_data.get('change', 0)
+            arrow = "↑" if change >= 0 else "↓"
+            color = "🟢" if change >= 0 else "🔴"
+
+            ref_prices = self.bot.get_reference_prices(symbol)
+            symbol_info = [f"{color} {symbol}: {price:.8f} ({change:+.2f}%) {arrow}"]
+
+            for timeframe in ['daily', 'weekly', 'monthly']:
+                if not self.bot.timeframe_config[timeframe]['enabled']:
+                    continue
+
+                current_drop = self._calculate_price_drop(
+                    ref_prices.get(timeframe, {}).get('open', 0),
+                    price
+                )
+                
+                if current_drop is not None:
+                    threshold_status = self._get_threshold_status(
+                        symbol, timeframe, current_drop, now
+                    )
+                    symbol_info.extend([
+                        f"  {timeframe.capitalize()}: {current_drop:+.2f}%",
+                        f"    Thresholds: {' | '.join(threshold_status)}"
+                    ])
+
+            return "\n".join(symbol_info)
+
+        except Exception as e:
+            self.logger.error(f"Error processing {symbol} position: {e}")
+            return None
+
+    def _calculate_price_drop(self, ref_price, current_price):
+        """Calculate price drop percentage"""
+        try:
+            if ref_price and ref_price > 0:
+                return ((ref_price - current_price) / ref_price) * 100
+            return None
+        except Exception:
+            return None
+
+    def _get_threshold_status(self, symbol, timeframe, current_drop, now):
+        """Get threshold status with proper error handling"""
+        try:
+            thresholds = self.bot.timeframe_config[timeframe]['thresholds']
+            status = []
+            
+            for threshold in thresholds:
+                threshold_pct = threshold * 100
+                status.append(self._format_threshold_status(
+                    symbol, timeframe, threshold, threshold_pct,
+                    current_drop, now
+                ))
+            
+            return status
+        except Exception as e:
+            self.logger.error(f"Error getting threshold status: {e}")
+            return ["⚠️ Error"]
+
+    def _format_threshold_status(self, symbol, timeframe, threshold, threshold_pct, 
+                               current_drop, now):
+        """Format single threshold status"""
+        try:
+            # Check if threshold is locked
+            if (symbol in self.bot.strategy.order_history[timeframe] and 
+                threshold in self.bot.strategy.order_history[timeframe][symbol]):
+                
+    def _format_threshold_status(self, symbol, timeframe, threshold, threshold_pct, 
+                               current_drop, now):
+        """Format single threshold status"""
+        try:
+            # Check if threshold is locked
+            if (symbol in self.bot.strategy.order_history[timeframe] and 
+                threshold in self.bot.strategy.order_history[timeframe][symbol]):
+                
+                last_order = self.bot.strategy.order_history[timeframe][symbol][threshold]
+                reset_time = self._get_reset_time(last_order, timeframe)
+                
+                if now < reset_time:
+                    time_left = reset_time - now
+                    hours = int(time_left.total_seconds() / 3600)
+                    mins = int((time_left.total_seconds() % 3600) / 60)
+                    return f"🔒 {threshold_pct:.1f}% ({hours}h {mins}m)"
+                    
+                return f"✅ {threshold_pct:.1f}%"
+                    
+            # Not locked - check if triggered
+            return f"🟡 {threshold_pct:.1f}%" if current_drop >= threshold_pct else f"⚪ {threshold_pct:.1f}%"
+            
+        except Exception as e:
+            self.logger.error(f"Error formatting threshold: {e}")
+            return f"⚠️ {threshold_pct:.1f}%"
+
+    def _get_reset_time(self, last_order, timeframe):
+        """Calculate reset time based on timeframe"""
+        if timeframe == 'daily':
+            return last_order + timedelta(days=1)
+        elif timeframe == 'weekly':
+            return last_order + timedelta(days=7)  # Fix: Remove days() function call
+        else:  # monthly
+            return last_order + timedelta(days=30)
 
     async def handle_balance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show balance info"""

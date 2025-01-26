@@ -20,22 +20,27 @@ class ConfigHandler:
     @staticmethod
     def validate_config(config: Dict[str, Any]) -> None:
         """Validate critical configuration settings"""
-        telegram_token = config.get('TELEGRAM_TOKEN', '')
-        telegram_chat_id = config.get('TELEGRAM_CHAT_ID', '')
+        telegram_settings = config.get('TELEGRAM_SETTINGS', {})
+        telegram_token = telegram_settings.get('TELEGRAM_TOKEN', '')
+        telegram_chat_id = telegram_settings.get('TELEGRAM_CHAT_ID', '')
         
         telegram_enabled = False
         
-        if telegram_token and telegram_chat_id and \
-           telegram_token not in ['YOUR_TELEGRAM_BOT_TOKEN', 'your_telegram_token'] and \
-           telegram_chat_id not in ['YOUR_TELEGRAM_CHAT_ID', 'your_chat_id']:
-            
+        if telegram_token and telegram_chat_id:
             if ConfigHandler.is_valid_token(telegram_token) and str(telegram_chat_id).lstrip('-').isdigit():
                 telegram_enabled = True
                 print("Telegram configuration validated successfully")
             else:
                 print("Warning: Invalid Telegram configuration")
         
+        # Update telegram settings in config
+        telegram_settings['USE_TELEGRAM'] = telegram_enabled
+        config['TELEGRAM_SETTINGS'] = telegram_settings
+
+        # For backward compatibility
         config['USE_TELEGRAM'] = telegram_enabled
+        config['TELEGRAM_TOKEN'] = telegram_token
+        config['TELEGRAM_CHAT_ID'] = telegram_chat_id
 
     @staticmethod
     def load_config(use_env: bool = False) -> Dict[str, Any]:
@@ -94,8 +99,10 @@ class ConfigHandler:
                 'BINANCE_API_SECRET': os.getenv('BINANCE_API_SECRET'),
                 'TESTNET_API_KEY': os.getenv('TESTNET_API_KEY'),
                 'TESTNET_API_SECRET': os.getenv('TESTNET_API_SECRET'),
-                'TELEGRAM_TOKEN': os.getenv('TELEGRAM_TOKEN'),
-                'TELEGRAM_CHAT_ID': os.getenv('TELEGRAM_CHAT_ID'),
+                'TELEGRAM_SETTINGS': {
+                    'TELEGRAM_TOKEN': os.getenv('TELEGRAM_TOKEN'),
+                    'TELEGRAM_CHAT_ID': os.getenv('TELEGRAM_CHAT_ID')
+                },
                 'TRADING_SYMBOLS': trading_symbols,
                 'USE_TESTNET': os.getenv('USE_TESTNET', 'true').lower() == 'true',
                 'USE_TELEGRAM': os.getenv('USE_TELEGRAM', 'true').lower() == 'true',

@@ -20,7 +20,7 @@ from telegram.ext import Application  # Update import
 
 from strategies.price_drop import PriceDropStrategy
 from utils.logger import setup_logger
-from utils.websocket_manager import WebSocketManager
+from utils.api_handler import APIHandler  # Replace WebSocketManager import
 from utils.rate_limiter import RateLimiter
 from utils.telegram_handler import TelegramHandler
 from utils.file_handler import AsyncFileHandler  # Add import
@@ -53,16 +53,20 @@ USE_TELEGRAM = config.get('USE_TELEGRAM', False)
 
 class BinanceBot:
     def __init__(self, config):
-        # Update logger initialization
-        self.logger, self.api_logger, self.ws_logger = setup_logger()
+        # Update logger initialization to include telegram logger
+        self.logger, self.api_logger, self.ws_logger, self.telegram_logger = setup_logger()
         self.logger.info("Initializing BinanceBot...")
 
         # Store config and required settings
         self.config = config
         self.use_testnet = config.get('USE_TESTNET', True)
-        self.use_telegram = config.get('USE_TELEGRAM', False)
-        self.telegram_token = config.get('TELEGRAM_TOKEN', '')
-        self.telegram_chat_id = config.get('TELEGRAM_CHAT_ID', '')
+        
+        # Update Telegram settings initialization
+        telegram_settings = config.get('TELEGRAM_SETTINGS', {})
+        self.use_telegram = telegram_settings.get('USE_TELEGRAM', False)
+        self.telegram_token = telegram_settings.get('TELEGRAM_TOKEN', '')
+        self.telegram_chat_id = telegram_settings.get('TELEGRAM_CHAT_ID', '')
+        
         self.order_type = config.get('ORDER_TYPE', 'limit')
         self.use_percentage = config.get('USE_PERCENTAGE', False)
         self.trade_amount = config.get('TRADE_AMOUNT', 10)
@@ -71,14 +75,23 @@ class BinanceBot:
         self.valid_symbols = []
         self.invalid_symbols = []
 
-        # Initialize Telegram handler if enabled
+        # Initialize Telegram handler if enabled and properly configured
         self.telegram_handler = None
-        if self.use_telegram and self.telegram_token and self.telegram_chat_id:
+        if (self.use_telegram and 
+            self.telegram_token and 
+            self.telegram_chat_id and 
+            self.telegram_token != '' and 
+            self.telegram_chat_id != ''):
+            
+            self.logger.info("Initializing Telegram handler...")
             self.telegram_handler = TelegramHandler(
                 self.telegram_token,
                 self.telegram_chat_id,
                 self
             )
+            # Pass telegram logger to handler
+            self.telegram_handler.logger = self.telegram_logger
+            self.logger.info("Telegram handler initialized")
 
         # Initialize client based on testnet setting
         if self.use_testnet:
@@ -147,8 +160,8 @@ class BinanceBot:
             } for symbol in TRADING_SYMBOLS
         }
 
-        # Add WebSocket manager
-        self.ws_manager = None
+        # Replace WebSocket manager with API handler
+        self.api_handler = None  # Initialize as None
         self.last_price_updates = {}
 
         # Add rate limiting
@@ -183,39 +196,56 @@ class BinanceBot:
         self.trades = self.load_trades()
 
     async def shutdown(self):
-        """Enhanced graceful shutdown sequence"""
+        """Enhanced graceful shutdown sequence with error recovery"""
         if self.is_shutting_down:
             return
             
         self.is_shutting_down = True
         self.logger.info("Initiating clean shutdown sequence...")
         
+        cleanup_errors = []
+        
         try:
-            # Note: Removed cancel_all_orders for clean shutdown
             cleanup_tasks = []
 
-            # Stop WebSocket connection
-            if self.ws_manager:
-                cleanup_tasks.append(self.ws_manager.stop())
+            # Stop API handler first
+            if self.api_handler:
+                cleanup_tasks.append(self.api_handler.stop())
 
-            # Save current state
-            cleanup_tasks.append(self._save_trades_atomic())
+            # Try to save current state
+            try:
+                await self._save_trades_atomic()
+            except Exception as e:
+                cleanup_errors.append(f"Failed to save trades: {e}")
+                # Try alternate save location
+                try:
+                    alt_path = os.path.join(os.path.expanduser('~'), 'binance_bot_backup.json')
+                    await self.file_handler.save_json_atomic(alt_path, self.trades)
+                    self.logger.info(f"Trades saved to alternate location: {alt_path}")
+                except Exception as alt_e:
+                    cleanup_errors.append(f"Failed to save backup: {alt_e}")
 
             # Stop Telegram bot
             if self.telegram_handler:
                 cleanup_tasks.append(self.telegram_handler.shutdown())
 
-            # Wait for all cleanup tasks with timeout
+            # Wait for cleanup tasks with timeout
             if cleanup_tasks:
                 try:
-                    await asyncio.wait_for(asyncio.gather(*cleanup_tasks), timeout=15)
+                    await asyncio.wait_for(
+                        asyncio.gather(*cleanup_tasks, return_exceptions=True),
+                        timeout=15
+                    )
                 except asyncio.TimeoutError:
-                    self.logger.warning("Cleanup tasks took too long")
+                    cleanup_errors.append("Cleanup tasks timed out")
                     
         except Exception as e:
-            self.logger.error(f"Error during shutdown: {e}")
+            cleanup_errors.append(f"Error during shutdown: {e}")
         finally:
-            self.logger.info("Shutdown sequence completed. Orders preserved.")
+            if cleanup_errors:
+                self.logger.error("Shutdown completed with errors:\n" + "\n".join(cleanup_errors))
+            else:
+                self.logger.info("Shutdown sequence completed successfully. Orders preserved.")
 
     def _sync_server_time(self):
         """Synchronize local time with Binance server time"""
@@ -250,13 +280,9 @@ class BinanceBot:
         if time.time() - self.last_time_sync > self.sync_interval:
             self._sync_server_time()
 
-    async def _make_api_call(self, func, *args, **kwargs):
-        """Enhanced API call wrapper with detailed logging"""
+    async def _make_api_call(self, func, *args, _no_timestamp=False, **kwargs):
+        """Enhanced API call wrapper with timestamp control"""
         await self.rate_limiter.acquire()
-        
-        self._check_time_sync()
-        if 'timestamp' not in kwargs:
-            kwargs['timestamp'] = self._get_timestamp()
         
         start_time = time.time()
         log_data = {
@@ -270,45 +296,26 @@ class BinanceBot:
         }
         
         try:
-            for attempt in range(self.max_timestamp_attempts):
-                try:
-                    response = func(*args, **kwargs)
-                    duration = (time.time() - start_time) * 1000  # Convert to milliseconds
-                    
-                    # Safe copy of response for logging
-                    safe_response = self._sanitize_response(response)
-                    log_data.update({
-                        'response_data': safe_response,
-                        'duration': duration
-                    })
-                    
-                    self.api_logger.debug(
-                        "API Call completed successfully",
-                        extra=log_data
-                    )
-                    return response
-                    
-                except BinanceAPIException as e:
-                    duration = (time.time() - start_time) * 1000
-                    log_data.update({
-                        'response_data': {
-                            'error_code': e.code,
-                            'error_message': e.message
-                        },
-                        'duration': duration
-                    })
-                    
-                    if e.code == -1021 and attempt < self.max_timestamp_attempts - 1:
-                        self._sync_server_time()
-                        kwargs['timestamp'] = self._get_timestamp()
-                        continue
-                        
-                    self.api_logger.error(
-                        "API Call failed",
-                        extra=log_data
-                    )
-                    raise
-                    
+            # Only add timestamp if _no_timestamp is False
+            if not _no_timestamp:
+                self._check_time_sync()
+                kwargs['timestamp'] = self._get_timestamp()
+            
+            response = func(*args, **kwargs)
+            duration = (time.time() - start_time) * 1000
+            
+            log_data.update({
+                'response_data': self._sanitize_response(response),
+                'duration': duration
+            })
+            
+            self.api_logger.debug(
+                "API Call completed successfully",
+                extra=log_data
+            )
+            
+            return response
+            
         except Exception as e:
             duration = (time.time() - start_time) * 1000
             log_data.update({
@@ -341,10 +348,11 @@ class BinanceBot:
             current_time - self.price_cache[symbol]['timestamp'] < self.cache_duration):
             return self.price_cache[symbol]['price']
         
-        # If no cache or expired, fetch new price - Remove timestamp from this call
+        # Get price without timestamp
         ticker = await self._make_api_call(
             self.client.get_symbol_ticker,
-            symbol=symbol  # Remove timestamp parameter
+            symbol=symbol,
+            _no_timestamp=True  # Add flag to skip timestamp
         )
         price = float(ticker['price'])
         
@@ -506,7 +514,7 @@ class BinanceBot:
             raise
 
     async def execute_trade(self, symbol, price):
-        """Execute trade with proper order tracking and logging"""
+        """Execute trade with proper order tracking"""
         try:
             # Check balance status first
             if not await self.check_balance_status():
@@ -516,15 +524,32 @@ class BinanceBot:
             current_price = await self.get_cached_price(symbol)
             
             # Format price with exact decimal places based on symbol info
-            if not hasattr(self, 'symbol_info_cache'):
-                self.symbol_info_cache = {}
-                exchange_info = await self._make_api_call(self.client.get_exchange_info)
-                for info in exchange_info['symbols']:
-                    self.symbol_info_cache[info['symbol']] = info
+            try:
+                # Get exchange info without timestamp
+                if not hasattr(self, 'symbol_info_cache'):
+                    self.symbol_info_cache = {}
+                    exchange_info = await self._make_api_call(
+                        self.client.get_exchange_info,
+                        _no_timestamp=True  # Add this flag
+                    )
+                    for info in exchange_info['symbols']:
+                        self.symbol_info_cache[info['symbol']] = info
 
-            symbol_info = self.symbol_info_cache.get(symbol)
-            if not symbol_info:
-                raise ValueError(f"Symbol info not found for {symbol}")
+                symbol_info = self.symbol_info_cache.get(symbol)
+                if not symbol_info:
+                    # If not in cache, try to get specific symbol info
+                    symbol_info = await self._make_api_call(
+                        self.client.get_symbol_info,
+                        symbol=symbol,
+                        _no_timestamp=True
+                    )
+                    if not symbol_info:
+                        raise ValueError(f"Symbol info not found for {symbol}")
+                    self.symbol_info_cache[symbol] = symbol_info
+
+            except Exception as e:
+                self.logger.error(f"Error getting symbol info for {symbol}: {e}")
+                return False
 
             # Get price filter for precision
             price_filter = next((f for f in symbol_info['filters'] if f['filterType'] == 'PRICE_FILTER'), None)
@@ -622,6 +647,8 @@ class BinanceBot:
             order_time = datetime.now(timezone.utc)
             cancel_time = order_time + self.limit_order_timeout
             
+            bot_order_id = self.generate_order_id(symbol)  # Add this line to generate order ID
+            
             self.trades[bot_order_id] = {
                 'trade_info': {
                     'symbol': symbol,
@@ -635,7 +662,7 @@ class BinanceBot:
                     'type': 'bot'
                 },
                 'order_metadata': {
-                    'order_id': order['orderId'],
+                    'order_id': order['orderId'],  # Fix: orderId instead of OrderId
                     'placed_time': order_time.isoformat(),
                     'cancel_time': cancel_time.isoformat(),
                     'last_check': order_time.isoformat()
@@ -1216,6 +1243,8 @@ class BinanceBot:
             order_time = datetime.now(timezone.utc)
             cancel_time = order_time + self.limit_order_timeout
             
+            bot_order_id = self.generate_order_id(symbol)  # Add this line to generate order ID
+            
             self.trades[bot_order_id] = {
                 'trade_info': {
                     'symbol': symbol,
@@ -1229,7 +1258,7 @@ class BinanceBot:
                     'type': 'bot'
                 },
                 'order_metadata': {
-                    'order_id': order['OrderId'],
+                    'order_id': order['orderId'],  # Fix: orderId instead of OrderId
                     'placed_time': order_time.isoformat(),
                     'cancel_time': cancel_time.isoformat(),
                     'last_check': order_time.isoformat()
@@ -1400,28 +1429,39 @@ class BinanceBot:
         return references
 
     async def main_loop(self):
-        """Main bot loop with improved Telegram handling"""
+        """Main bot loop with enhanced Telegram initialization"""
         try:
-            # Initialize Telegram first if enabled
+            # Initialize Telegram with retry
             if self.telegram_handler:
                 print(f"{Fore.CYAN}Initializing Telegram...")
-                telegram_success = await self.telegram_handler.initialize()
-                if not telegram_success:
-                    print(f"{Fore.YELLOW}Failed to initialize Telegram, continuing without it...")
-                    self.telegram_handler = None
-                else:
-                    print(f"{Fore.GREEN}Telegram bot initialized successfully")
+                for attempt in range(3):  # Try 3 times
+                    try:
+                        telegram_success = await self.telegram_handler.initialize()
+                        if telegram_success:
+                            print(f"{Fore.GREEN}Telegram bot initialized successfully")
+                            break
+                        else:
+                            if attempt < 2:  # Don't wait on last attempt
+                                print(f"{Fore.YELLOW}Telegram initialization failed, retrying in 5s...")
+                                await asyncio.sleep(5)
+                    except Exception as e:
+                        if attempt < 2:
+                            print(f"{Fore.YELLOW}Telegram error: {e}, retrying in 5s...")
+                            await asyncio.sleep(5)
+                        else:
+                            print(f"{Fore.YELLOW}Failed to initialize Telegram, continuing without it...")
+                            self.telegram_handler = None
 
             # Perform startup checks
             if not await self.startup_checks():
                 raise Exception("Startup checks failed")
 
-            # Initialize WebSocket manager
-            self.ws_manager = WebSocketManager(self.client, self.valid_symbols, self.logger)
-            self.ws_manager.add_callback(self.handle_price_update)
+            # Initialize API handler instead of WebSocket
+            self.api_handler = APIHandler(self.client, self.valid_symbols, self.logger)
+            self.api_handler.add_callback(self.handle_price_update)
 
-            print(f"{Fore.GREEN}Starting WebSocket connection...")
-            await self.ws_manager.start()
+            print(f"{Fore.GREEN}Starting price monitoring...")
+            await self.api_handler.start()
 
             while True:
                 try:
@@ -1440,8 +1480,8 @@ class BinanceBot:
             raise
         finally:
             # Proper cleanup sequence
-            if self.ws_manager:
-                await self.ws_manager.stop()
+            if self.api_handler:
+                await self.api_handler.stop()
             if self.telegram_handler:
                 await self.telegram_handler.shutdown()
 
@@ -1484,8 +1524,8 @@ class BinanceBot:
                 # Ensure proper cleanup
                 try:
                     cleanup_tasks = []
-                    if self.ws_manager:
-                        cleanup_tasks.append(self.ws_manager.stop())
+                    if self.api_handler:
+                        cleanup_tasks.append(self.api_handler.stop())
                     if self.telegram_handler:
                         cleanup_tasks.append(self.telegram_handler.shutdown())
                     
@@ -1519,6 +1559,83 @@ class BinanceBot:
             self.logger.error(f"Fatal error: {str(e)}")
 
     async def handle_price_update(self, symbol, price):
+        """Handle price updates with direct API calls"""
+        try:
+            # Get reference prices
+            ref_prices = self.get_reference_prices(symbol)
+            
+            # Create DataFrame for strategy
+            df = pd.DataFrame({
+                'symbol': [symbol],
+                'close': [price]
+            })
+            
+            # Generate signals
+            signals = self.strategy.generate_signals(
+                df,
+                ref_prices,
+                datetime.now(timezone.utc)
+            )
+            
+            # Execute trades for valid signals
+            for timeframe, threshold, signal_price in signals:
+                if await self.check_balance_status():
+                    await self.execute_trade(symbol, price)
+                    
+        except Exception as e:
+            self.logger.error(f"Error handling price update for {symbol}: {e}")
+
+    async def check_prices(self):
+        """Check prices for all symbols"""
+        try:
+            for symbol in self.valid_symbols:
+                ticker = await self._make_api_call(
+                    self.client.get_symbol_ticker,
+                    symbol=symbol,
+                    _no_timestamp=True
+                )
+                price = float(ticker['price'])
+                await self.handle_price_update(symbol, price)
+                await asyncio.sleep(0.5)  # Add small delay between symbols
+                
+        except Exception as e:
+            self.logger.error(f"Error checking prices: {e}")
+
+    async def main_loop(self):
+        """Main bot loop with regular API calls"""
+        try:
+            # Perform startup checks
+            if not await self.startup_checks():
+                raise Exception("Startup checks failed")
+
+            # Initialize price checking
+            self.api_handler = APIHandler(self.client, self.valid_symbols, self.logger)
+            await self.api_handler.start()
+
+            while True:
+                try:
+                    # Check for resets
+                    await self.check_and_handle_resets()
+                    
+                    # Check prices every 2 seconds
+                    await self.check_prices()
+                    
+                    await asyncio.sleep(2)
+                    
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    self.logger.error(f"Error in main loop: {e}")
+                    await asyncio.sleep(5)
+                    
+        except Exception as e:
+            self.logger.error(f"Fatal error in main loop: {e}")
+            raise
+        finally:
+            if self.api_handler:
+                await self.api_handler.stop()
+
+    async def handle_price_update(self, symbol, price):
         """Handle real-time price updates"""
         try:
             # Price is already a float, no need to convert
@@ -1545,7 +1662,6 @@ class BinanceBot:
 
         except Exception as e:
             self.logger.error(f"Error handling price update for {symbol}: {e}")
-            print(f"{Fore.RED}Error handling price update for {symbol}: {e}")
 
     async def startup_checks(self):
         """Perform startup checks and verifications"""
@@ -1897,12 +2013,6 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         logging.error(f"Unexpected error: {str(e)}")
-
-
-
-
-
-
 
 
 

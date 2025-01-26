@@ -7,6 +7,7 @@ from datetime import datetime
 import shutil
 import portalocker  # Cross-platform file locking
 import platform
+import stat
 
 class FileConnectionPool:
     def __init__(self, max_connections=5):
@@ -86,47 +87,67 @@ class AsyncFileHandler:
             raise e
 
     async def save_json_atomic(self, filepath, data):
-        """Save JSON data atomically with cross-platform file locking"""
+        """Save JSON data atomically with permission handling"""
         temp_file = f"{filepath}.tmp"
         backup_file = f"{filepath}.bak"
         
         try:
-            # Ensure directory exists
-            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            # Ensure directory exists with proper permissions
+            directory = os.path.dirname(filepath)
+            if not os.path.exists(directory):
+                os.makedirs(directory, mode=0o755, exist_ok=True)
+            
+            # Check file permissions and fix if needed
+            self._ensure_file_permissions(filepath)
+            self._ensure_file_permissions(temp_file)
+            self._ensure_file_permissions(backup_file)
 
             # First write to temporary file
             async with aiofiles.open(temp_file, 'w') as f:
-                # Use cross-platform file locking
                 with portalocker.Lock(temp_file, 'w'):
                     await f.write(json.dumps(data, indent=4))
                     await f.flush()
                     os.fsync(f.fileno())
 
-            # Platform-specific atomic file operations
+            # Platform-specific atomic file operations with permission handling
             try:
                 if os.path.exists(filepath):
                     shutil.copy2(filepath, backup_file)
+                    os.chmod(backup_file, 0o644)
                 os.replace(temp_file, filepath)
-            except OSError:
-                # Fallback for platforms that don't support atomic replace
-                if os.path.exists(filepath):
-                    os.remove(filepath)
-                shutil.move(temp_file, filepath)
-
-            # Create timestamped backup
-            self._create_backup(filepath)
+                os.chmod(filepath, 0o644)
+            except OSError as e:
+                if e.errno == 13:  # Permission denied
+                    # Try with elevated permissions
+                    if os.path.exists(filepath):
+                        os.chmod(filepath, 0o644)
+                    os.replace(temp_file, filepath)
+                    os.chmod(filepath, 0o644)
+                else:
+                    raise
 
         except Exception as e:
-            # Restore from backup if something went wrong
+            self.logger.error(f"Error saving file {filepath}: {e}")
+            # Try backup recovery
             if os.path.exists(backup_file):
                 try:
-                    os.replace(backup_file, filepath)
-                except OSError:
                     shutil.copy2(backup_file, filepath)
-            raise e
+                    os.chmod(filepath, 0o644)
+                except Exception as recovery_error:
+                    self.logger.error(f"Backup recovery failed: {recovery_error}")
+            raise
         finally:
-            # Cleanup
             self._cleanup_files(temp_file, backup_file)
+
+    def _ensure_file_permissions(self, filepath):
+        """Ensure file has correct permissions"""
+        try:
+            if os.path.exists(filepath):
+                current_mode = stat.S_IMODE(os.stat(filepath).st_mode)
+                if not current_mode & stat.S_IWRITE:
+                    os.chmod(filepath, 0o644)
+        except Exception as e:
+            self.logger.warning(f"Could not check/fix permissions for {filepath}: {e}")
 
     def _cleanup_files(self, *files):
         """Safely remove files"""

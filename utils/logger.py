@@ -75,23 +75,28 @@ def setup_logger(name='BinanceBot'):
     # Prevent logs from being sent to root logger
     logger.propagate = False
 
-    # Add specialized API request logger with detailed formatting
+    # Create unified API logger with comprehensive formatting
     api_formatter = logging.Formatter(
         '%(asctime)s - [%(levelname)s] - %(message)s\n'
+        'Type: %(api_type)s\n'
         'Request: %(request_data)s\n'
         'Response: %(response_data)s\n'
         'Duration: %(duration).3fms\n'
+        'Details: %(details)s\n'
         '----------------------------------------',
         datefmt='%Y-%m-%d %H:%M:%S',
         defaults={
+            'api_type': 'API_CALL',
             'request_data': 'N/A',
             'response_data': 'N/A',
-            'duration': 0.0
+            'duration': 0.0,
+            'details': ''
         }
     )
     
+    # Single API log handler
     api_handler = RotatingFileHandler(
-        'logs/api_requests.log',
+        'logs/api.log',
         maxBytes=10*1024*1024,
         backupCount=5,
         encoding='utf-8'
@@ -99,36 +104,35 @@ def setup_logger(name='BinanceBot'):
     api_handler.setLevel(logging.DEBUG)
     api_handler.setFormatter(api_formatter)
 
-    # Create WebSocket formatter
-    ws_formatter = logging.Formatter(
+    # Create unified API logger
+    api_logger = logging.getLogger('API')
+    api_logger.setLevel(logging.DEBUG)
+    api_logger.addHandler(api_handler)
+    api_logger.propagate = False
+
+    # Add telegram-specific formatter and handler
+    telegram_formatter = logging.Formatter(
         '%(asctime)s - [%(levelname)s] - %(message)s\n'
-        '%(details)s',
+        'Details: %(details)s',
         datefmt='%Y-%m-%d %H:%M:%S',
         defaults={
             'details': ''
         }
     )
-
-    # Create separate WebSocket logger
-    ws_handler = RotatingFileHandler(
-        'logs/websocket.log',
-        maxBytes=10*1024*1024,
+    
+    telegram_handler = RotatingFileHandler(
+        'logs/telegram.log',
+        maxBytes=10*1024*1024,  # 10MB
         backupCount=5,
         encoding='utf-8'
     )
-    ws_handler.setLevel(logging.DEBUG)
-    ws_handler.setFormatter(ws_formatter)
+    telegram_handler.setLevel(logging.DEBUG)
+    telegram_handler.setFormatter(telegram_formatter)
 
-    # Create API logger
-    api_logger = logging.getLogger('API_Requests')
-    api_logger.setLevel(logging.DEBUG)
-    api_logger.addHandler(api_handler)
-    api_logger.propagate = False
-
-    # Create WebSocket logger
-    ws_logger = logging.getLogger('WebSocket')
-    ws_logger.setLevel(logging.DEBUG)
-    ws_logger.addHandler(ws_handler)
-    ws_logger.propagate = False
+    # Create Telegram logger
+    telegram_logger = logging.getLogger('Telegram')
+    telegram_logger.setLevel(logging.DEBUG)
+    telegram_logger.addHandler(telegram_handler)
+    telegram_logger.propagate = False
     
-    return logger, api_logger, ws_logger
+    return logger, api_logger, api_logger, telegram_logger

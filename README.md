@@ -21,6 +21,11 @@ A Self Made Cryptocurrency Bot that buys for me to safe Money on the side , this
 - 🔍 Real-time order status monitoring
 - 💼 Complete portfolio management
 - 🧮 Automatic tax calculations (28%)
+- 🎯 Enhanced Visual Monitoring
+- ⚡ Real-time API Status Indicators
+- 🔄 Interactive Progress Spinners
+- ⏱️ Rate Limit Visualizations
+- 📊 Live Price Updates Display
 
 ## Portfolio Management Features
 
@@ -43,6 +48,29 @@ A Self Made Cryptocurrency Bot that buys for me to safe Money on the side , this
 - 📉 Price drop monitoring
 - 💰 Profit/loss tracking
 - 📊 Tax impact analysis
+
+## Real-time Monitoring Features
+
+### Visual Feedback System
+- Live spinner animations for active monitoring
+- API call status indicators with timing
+- Rate limit countdown displays
+- Price update progress indicators
+- Clear success/failure icons
+
+### Price Monitoring Display
+- Symbol-by-symbol price updates
+- Real-time percentage changes
+- Clean, organized output format
+- Color-coded trend indicators
+- Instant error notifications
+
+### Rate Limiting Visualization
+- Real-time rate limit tracking
+- Visual countdown timers
+- Dynamic spinner animations
+- Clear reset notifications
+- Queue position indicators
 
 ## Prerequisites
 
