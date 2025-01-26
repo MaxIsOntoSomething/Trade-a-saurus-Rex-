@@ -1223,3 +1223,29 @@ class TelegramHandler:
         )
         return startup_msg
 
+    async def handle_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /start command"""
+        welcome_msg = (
+            "👋 Welcome to the Binance Trading Bot!\n\n"
+            "Available commands:\n\n"
+            "Market Analysis:\n"
+            "/positions - Show current prices and opportunities\n"
+            "/orders - Show open limit orders\n\n"
+            "Portfolio Management:\n"
+            "/balance - Show current balance\n"
+            "/trades - List all trades with P/L\n"
+            "/addtrade - Add manual trade\n"
+            "/symbol <SYMBOL> - Show detailed stats\n"
+            "/summary - Show portfolio summary\n\n"
+            "Analytics:\n"
+            "/profits - Show current profits\n"
+            "/distribution - Show entry distribution\n"
+            "/stacking - Show position building\n"
+            "/buytimes - Show trade timing\n"
+            "/portfolio - Show value evolution\n"
+            "/allocation - Show asset allocation\n\n"
+            "System:\n"
+            "/stats - Show system information"
+        )
+        await self.send_message(welcome_msg)
+

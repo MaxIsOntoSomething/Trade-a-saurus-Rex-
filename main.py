@@ -1749,38 +1749,170 @@ class BinanceBot:
             self.logger.error(f"Error in cancel_all_orders: {e}")
             return False
 
-# Update the main entry point
+    async def run_async(self):
+        """Run the bot asynchronously"""
+        try:
+            # Initialize Telegram with visible feedback
+            if self.telegram_handler:
+                print(f"{Fore.CYAN}Initializing Telegram integration...")
+                telegram_success = False
+                
+                for attempt in range(3):
+                    try:
+                        print(f"{Fore.CYAN}Telegram attempt {attempt + 1}/3...")
+                        telegram_success = await self.telegram_handler.initialize()
+                        if telegram_success:
+                            print(f"{Fore.GREEN}✓ Telegram connected successfully!")
+                            await self.telegram_handler.send_message(
+                                "🤖 Bot connected and ready!"
+                            )
+                            break
+                    except Exception as e:
+                        print(f"{Fore.RED}Telegram attempt {attempt + 1} failed: {e}")
+                        if attempt < 2:
+                            print(f"{Fore.YELLOW}Retrying in 5s...")
+                            await asyncio.sleep(5)
+                
+                if not telegram_success:
+                    print(f"{Fore.RED}Failed to initialize Telegram - continuing without it")
+                    self.telegram_handler = None
+
+            # Start main loop
+            await self.main_loop()
+            
+        except Exception as e:
+            self.logger.error(f"Error in run_async: {e}")
+            raise
+
+    def run(self):
+        """Run the bot with proper event loop handling"""
+        try:
+            # Handle different Python versions and platforms
+            if sys.version_info >= (3, 10):
+                if sys.platform.startswith('win'):
+                    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+                else:
+                    asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
+            
+            # Create and set event loop
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            try:
+                # Run main loop with proper error handling
+                loop.run_until_complete(self.run_async())
+            except KeyboardInterrupt:
+                print(f"{Fore.YELLOW}\nClean shutdown requested. Preserving open orders...")
+                loop.run_until_complete(self.shutdown())
+            except Exception as e:
+                print(f"{Fore.RED}\nError in main loop: {str(e)}")
+                self.logger.error(f"Error in main loop: {str(e)}")
+            finally:
+                # Ensure proper cleanup
+                try:
+                    cleanup_tasks = []
+                    if self.api_handler:
+                        cleanup_tasks.append(self.api_handler.stop())
+                    if self.telegram_handler:
+                        cleanup_tasks.append(self.telegram_handler.shutdown())
+                    
+                    if cleanup_tasks:
+                        # Run cleanup tasks with timeout
+                        loop.run_until_complete(
+                            asyncio.wait_for(
+                                asyncio.gather(*cleanup_tasks),
+                                timeout=30
+                            )
+                        )
+                    
+                    # Cancel all remaining tasks
+                    pending = asyncio.all_tasks(loop)
+                    for task in pending:
+                        task.cancel()
+                        try:
+                            loop.run_until_complete(task)
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                    
+                    # Shutdown asyncgens and close loop
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                    loop.close()
+                    
+                except Exception as e:
+                    self.logger.error(f"Error during cleanup: {e}")
+                    
+        except Exception as e:
+            print(f"{Fore.RED}Fatal error: {str(e)}")
+            self.logger.error(f"Fatal error: {str(e)}")
+
+    def get_reference_prices(self, symbol):
+        """Get reference prices with improved error handling"""
+        references = {}
+        
+        try:
+            # For each timeframe, safely get historical data
+            for timeframe in ['daily', 'weekly', 'monthly']:
+                if not self.timeframe_config.get(timeframe, {}).get('enabled', False):
+                    continue
+                    
+                try:
+                    if timeframe == 'daily':
+                        interval = Client.KLINE_INTERVAL_1DAY
+                        lookback = "2 days ago UTC"
+                    elif timeframe == 'weekly':
+                        interval = Client.KLINE_INTERVAL_1WEEK
+                        lookback = "2 weeks ago UTC"
+                    else:  # monthly
+                        interval = Client.KLINE_INTERVAL_1MONTH
+                        lookback = "2 months ago UTC"
+
+                    # Get historical data
+                    df = self.get_historical_data(symbol, interval, lookback)
+                    
+                    # Verify we have data
+                    if df is not None and not df.empty:
+                        references[timeframe] = {
+                            'open': float(df['open'].iloc[-1]),
+                            'high': float(df['high'].iloc[-1]),
+                            'low': float(df['low'].iloc[-1])
+                        }
+                    else:
+                        self.logger.warning(f"No historical data found for {symbol} {timeframe}")
+                        references[timeframe] = {
+                            'open': None,
+                            'high': None,
+                            'low': None
+                        }
+                        
+                except Exception as e:
+                    self.logger.error(f"Error getting {timeframe} data for {symbol}: {str(e)}")
+                    references[timeframe] = {
+                        'open': None,
+                        'high': None,
+                        'low': None
+                    }
+                    
+        except Exception as e:
+            self.logger.error(f"Error getting reference prices for {symbol}: {str(e)}")
+            
+        return references
+
+# Update main entry point
 if __name__ == "__main__":
     try:
         # Initialize color support for Windows
         if sys.platform.startswith('win'):
             os.system('color')
-            # Set event loop policy for Windows
-            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         
-        # Create new event loop
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        # Load config and create bot instance
+        config = ConfigHandler.load_config(use_env=os.environ.get('DOCKER', '').lower() == 'true')
+        bot = BinanceBot(config)
         
-        try:
-            # Load config and create bot instance
-            config = ConfigHandler.load_config(use_env=os.environ.get('DOCKER', '').lower() == 'true')
-            bot = BinanceBot(config)
-            
-            # Test connection before starting
-            if bot.test_connection():
-                bot.run()
-            else:
-                print(f"{Fore.RED}Connection test failed. Bot will not start.")
-                
-        finally:
-            # Ensure proper event loop cleanup
-            try:
-                if not loop.is_closed():
-                    loop.run_until_complete(loop.shutdown_asyncgens())
-                    loop.close()
-            except Exception:
-                pass
+        # Test connection before starting
+        if bot.test_connection():
+            bot.run()  # This will now work with the added run method
+        else:
+            print(f"{Fore.RED}Connection test failed. Bot will not start.")
             
     except KeyboardInterrupt:
         print("\nBot shutdown requested by user.")
