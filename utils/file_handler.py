@@ -89,57 +89,99 @@ class AsyncFileHandler:
             raise e
 
     async def save_json_atomic(self, filepath, data):
-        """Save JSON data atomically with permission handling"""
+        """Save JSON data atomically with cross-platform support"""
         temp_file = f"{filepath}.tmp"
         backup_file = f"{filepath}.bak"
         
         try:
-            # Ensure directory exists with proper permissions
+            # Ensure directory exists with cross-platform permissions
             directory = os.path.dirname(filepath)
             if not os.path.exists(directory):
-                os.makedirs(directory, mode=0o755, exist_ok=True)
+                try:
+                    # Use more permissive mode for Linux
+                    os.makedirs(directory, mode=0o775, exist_ok=True)
+                except Exception as e:
+                    self.logger.error(f"Directory creation failed: {e}")
+                    # Fallback to basic creation
+                    os.makedirs(directory, exist_ok=True)
+                    
+            # Set file permissions based on platform
+            default_mode = 0o664 if os.name != 'nt' else 0o666
             
-            # Check file permissions and fix if needed
-            self._ensure_file_permissions(filepath)
-            self._ensure_file_permissions(temp_file)
-            self._ensure_file_permissions(backup_file)
-
-            # First write to temporary file
+            # Write to temporary file with proper permissions
             async with aiofiles.open(temp_file, 'w') as f:
-                with portalocker.Lock(temp_file, 'w'):
+                with portalocker.Lock(temp_file, 'w', flags=portalocker.LOCK_EX):
                     await f.write(json.dumps(data, indent=4))
                     await f.flush()
-                    os.fsync(f.fileno())
-
-            # Platform-specific atomic file operations with permission handling
+                    if hasattr(os, 'fsync'):
+                        os.fsync(f.fileno())
+            
             try:
-                if os.path.exists(filepath):
+                os.chmod(temp_file, default_mode)
+            except Exception as e:
+                self.logger.warning(f"Could not set temp file permissions: {e}")
+
+            # Create backup if original exists
+            if os.path.exists(filepath):
+                try:
                     shutil.copy2(filepath, backup_file)
-                    os.chmod(backup_file, 0o644)
-                os.replace(temp_file, filepath)
-                os.chmod(filepath, 0o644)
-            except OSError as e:
-                if e.errno == 13:  # Permission denied
-                    # Try with elevated permissions
+                    os.chmod(backup_file, default_mode)
+                except Exception as e:
+                    self.logger.warning(f"Backup creation failed: {e}")
+
+            # Perform atomic replace
+            try:
+                if os.name == 'nt':
+                    # Windows needs special handling
                     if os.path.exists(filepath):
-                        os.chmod(filepath, 0o644)
+                        os.replace(filepath, backup_file)
                     os.replace(temp_file, filepath)
-                    os.chmod(filepath, 0o644)
                 else:
-                    raise
+                    # Unix systems can do atomic rename
+                    os.rename(temp_file, filepath)
+                
+                # Set permissions on final file
+                os.chmod(filepath, default_mode)
+                
+            except Exception as e:
+                self.logger.error(f"Atomic replace failed: {e}")
+                # Fallback to non-atomic copy
+                shutil.copy2(temp_file, filepath)
+                os.chmod(filepath, default_mode)
 
         except Exception as e:
             self.logger.error(f"Error saving file {filepath}: {e}")
-            # Try backup recovery
+            # Try to restore from backup
             if os.path.exists(backup_file):
                 try:
                     shutil.copy2(backup_file, filepath)
-                    os.chmod(filepath, 0o644)
-                except Exception as recovery_error:
-                    self.logger.error(f"Backup recovery failed: {recovery_error}")
+                    os.chmod(filepath, default_mode)
+                except Exception as restore_error:
+                    self.logger.error(f"Backup restoration failed: {restore_error}")
             raise
         finally:
-            self._cleanup_files(temp_file, backup_file)
+            # Cleanup temporary files with error handling
+            for file_path in [temp_file, backup_file]:
+                try:
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                except Exception as e:
+                    self.logger.warning(f"Cleanup failed for {file_path}: {e}")
+
+    def _ensure_directory_permissions(self, directory):
+        """Set directory permissions with platform awareness"""
+        try:
+            if not os.path.exists(directory):
+                if os.name == 'nt':
+                    os.makedirs(directory, exist_ok=True)
+                else:
+                    # More restrictive permissions for Linux
+                    os.makedirs(directory, mode=0o775, exist_ok=True)
+            elif os.name != 'nt':
+                # Set proper group permissions on Linux
+                os.chmod(directory, 0o775)
+        except Exception as e:
+            self.logger.warning(f"Directory permission setup failed: {e}")
 
     def _ensure_file_permissions(self, filepath):
         """Ensure file has correct permissions"""
