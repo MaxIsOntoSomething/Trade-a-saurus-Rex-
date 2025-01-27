@@ -1623,6 +1623,30 @@ class BinanceBot:
     async def run_async(self):
         """Run the bot asynchronously"""
         try:
+            # Print startup banner
+            print(f"\n{Fore.CYAN}=== Binance Trading Bot ===")
+            print(f"Mode: {Fore.YELLOW}{'Testnet' if self.use_testnet else 'Live'}{Fore.RESET}")
+            print(f"Exchange: {Fore.YELLOW}Binance{Fore.RESET}")
+            print(f"Market: {Fore.YELLOW}{'Futures' if self.api.trading_mode == 'futures' else 'Spot'}{Fore.RESET}")
+            print(f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC\n")
+            
+            print(f"{Fore.CYAN}Available Commands:")
+            print(f"{Fore.YELLOW}Core Commands:")
+            print("/status    - Show current prices and balance")
+            print("/orders    - Show open limit orders")
+            print("/balance   - Show current balance")
+            print("\n{Fore.YELLOW}Trading Commands:")
+            print("/trades    - List all trades")
+            print("/trade ID  - Show specific trade details")
+            print("/add       - Add manual trade")
+            print("/symbol    - Show detailed stats for pair")
+            print("/summary   - Show portfolio summary")
+            print("\n{Fore.YELLOW}Analysis:")
+            print("/thresholds - Show threshold status")
+            print("\n{Fore.YELLOW}System:")
+            print("/stop      - Emergency stop")
+            print("/help      - Show this help message\n")
+
             # Initialize Telegram with visible feedback
             if self.telegram_handler:
                 print(f"{Fore.CYAN}Initializing Telegram integration...")
