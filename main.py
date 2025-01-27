@@ -979,16 +979,22 @@ class BinanceBot:
                 remaining_time = self.balance_check_cooldown - time_since_insufficient
                 hours, remainder = divmod(remaining_time.seconds, 3600)
                 minutes, seconds = divmod(remainder, 60)
-                pause_message = (
-                    f"{Fore.YELLOW}Trading paused: "
-                    f"{'Below reserve' if self.balance_pause_reason == 'reserve' else 'Insufficient balance'}. "
-                    f"Resuming in {hours}h {minutes}m {seconds}s"
-                )
-                print(pause_message)
+                
+                # Only print status message once per minute
+                if seconds == 0:
+                    pause_message = (
+                        f"\n{Fore.YELLOW}Trading paused: "
+                        f"{'Below reserve' if self.balance_pause_reason == 'reserve' else 'Insufficient balance'}. "
+                        f"Resuming in {hours:02d}h {minutes:02d}m"
+                    )
+                    print(f"\r{pause_message}", end='')
+                
                 return False
             else:
                 self.insufficient_balance_timestamp = None
                 self.balance_pause_reason = None
+                print(f"\n{Fore.GREEN}Trading resumed!")
+                
         return True
 
     def generate_order_id(self, symbol):
@@ -1159,10 +1165,8 @@ class BinanceBot:
             return False
 
     async def handle_price_update(self, symbol, price):
-        """Handle price updates with direct API calls"""
         try:
-            # Get reference prices
-            ref_prices = self.get_reference_prices(symbol)
+            print(f"\nProcessing {symbol} @ {price} USDT")
             
             # Create DataFrame for strategy
             df = pd.DataFrame({
@@ -1170,20 +1174,29 @@ class BinanceBot:
                 'close': [price]
             })
             
+            # Get reference prices with logging
+            reference_prices = self.get_reference_prices(symbol)
+            print(f"Reference prices obtained: {bool(reference_prices)}")
+            
+            if not reference_prices:
+                print(f"No reference prices available for {symbol}")
+                return
+                
             # Generate signals
             signals = self.strategy.generate_signals(
                 df,
-                ref_prices,
+                reference_prices,
                 datetime.now(timezone.utc)
             )
             
-            # Execute trades for valid signals
-            for timeframe, threshold, signal_price in signals:
-                if await self.check_balance_status():
+            if signals:
+                print(f"\n🎯 Got {len(signals)} signals for {symbol}")
+                for timeframe, threshold, signal_price in signals:
+                    print(f"Executing trade: {symbol} - {timeframe} - {threshold*100}% threshold")
                     await self.execute_trade(symbol, price)
-                    
+            
         except Exception as e:
-            self.logger.error(f"Error handling price update for {symbol}: {e}")
+            print(f"Error handling price update: {e}")
 
     async def check_prices(self):
         """Check prices using BinanceAPI"""
@@ -1207,7 +1220,7 @@ class BinanceBot:
             self.logger.error(f"Error in price checking loop: {e}")
 
     async def main_loop(self):
-        """Main bot loop with real-time status display"""
+        """Main bot loop with improved pause handling"""
         try:
             # Perform startup checks
             if not await self.startup_checks():
@@ -1216,8 +1229,17 @@ class BinanceBot:
             print(f"{Fore.GREEN}Starting price monitoring...")
             self.logger.info("Starting price monitoring loop")
 
+            # Add periodic Telegram check
+            last_telegram_check = 0
+            telegram_check_interval = 300  # Check every 5 minutes
+
             while True:
                 try:
+                    if not await self.check_balance_status():
+                        # Skip price checks while paused
+                        await asyncio.sleep(1)
+                        continue
+                        
                     # Clear screen
                     os.system('cls' if os.name == 'nt' else 'clear')
                     
@@ -1261,6 +1283,13 @@ class BinanceBot:
                     # Check prices and handle signals in background
                     await self.check_prices()
                     await self.check_and_handle_resets()
+
+                    # Check Telegram status periodically
+                    current_time = time.time()
+                    if current_time - last_telegram_check > telegram_check_interval:
+                        if self.telegram_handler:
+                            await self.check_telegram_status()
+                        last_telegram_check = current_time
                     
                     # Update every 2 seconds
                     await asyncio.sleep(2)
@@ -1623,75 +1652,29 @@ class BinanceBot:
     async def run_async(self):
         """Run the bot asynchronously"""
         try:
-            # Print minimal startup banner in terminal
+            # Print minimal startup banner
             print(f"\n{Fore.CYAN}=== Binance Trading Bot ===")
             print(f"Mode: {Fore.YELLOW}{'Testnet' if self.use_testnet else 'Live'}")
             print(f"Exchange: {Fore.YELLOW}Binance")
-            print(f"Market: {Fore.YELLOW}{'Futures' if self.api.trading_mode == 'futures' else 'Spot'}")
             print(f"Time: {Fore.YELLOW}{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC\n")
 
-            # Initialize Telegram with visible feedback
+            # Initialize Telegram first if enabled
             if self.telegram_handler:
-                print(f"{Fore.CYAN}Initializing Telegram integration...")
-                telegram_success = False
-                
-                for attempt in range(3):
-                    try:
-                        print(f"{Fore.CYAN}Telegram attempt {attempt + 1}/3...")
-                        telegram_success = await self.telegram_handler.initialize()
-                        if telegram_success:
-                            print(f"{Fore.GREEN}✓ Telegram connected successfully!")
-                            
-                            # Send welcome message with commands to Telegram only
-                            startup_msg = (
-                                "🤖 *Binance Trading Bot Started\\!*\n\n"
-                                "*Trading Configuration:*\n"
-                                f"• Mode: `{('Testnet' if self.use_testnet else 'Live')}`\n"
-                                f"• Market: `{('Futures' if self.api.trading_mode == 'futures' else 'Spot')}`\n"
-                                f"• Trading Pairs: `{', '.join(self.valid_symbols)}`\n"
-                                f"• USDT Reserve: `{self.reserve_balance_usdt}`\n\n"
-                                "*Available Commands:*\n\n"
-                                "*Core Commands:*\n"
-                                "• /status \\- Show current prices and balance\n"
-                                "• /orders \\- Show open limit orders\n"
-                                "• /balance \\- Show current balance\n\n"
-                                "*Trading Commands:*\n"
-                                "• /trades \\- List all trades\n"
-                                "• /trade \\<ID\\> \\- Show specific trade details\n"
-                                "• /add \\- Add manual trade\n"
-                                "• /symbol \\- Show detailed stats for pair\n"
-                                "• /summary \\- Show portfolio summary\n\n"
-                                "*Analysis:*\n"
-                                "• /thresholds \\- Show threshold status\n\n"
-                                "*System:*\n"
-                                "• /stop \\- Emergency stop\n"
-                                "• /help \\- Show this help message\n\n"
-                                "🟢 Bot is actively monitoring markets\\!"
-                            )
-                            
-                            await self.telegram_handler.send_message(
-                                startup_msg,
-                                parse_mode='MarkdownV2'  # Changed from 'Markdown' to 'MarkdownV2'
-                            )
-                            break
-                    except Exception as e:
-                        print(f"{Fore.RED}Telegram attempt {attempt + 1} failed: {e}")
-                        if attempt < 2:
-                            print(f"{Fore.YELLOW}Retrying in 5s...")
-                            await asyncio.sleep(5)
-                
+                print(f"{Fore.CYAN}Initializing Telegram...")
+                telegram_success = await self.telegram_handler.initialize()
                 if not telegram_success:
-                    print(f"{Fore.RED}Failed to initialize Telegram - continuing without it")
+                    print(f"{Fore.YELLOW}Failed to initialize Telegram, continuing without it...")
                     self.telegram_handler = None
+                else:
+                    print(f"{Fore.GREEN}Telegram bot initialized successfully")
 
-            # Initialize bot
+            # Initialize bot systems
             if not await self.initialize():
                 raise Exception("Failed to initialize bot")
 
-            # Start main loop
-            print(f"{Fore.GREEN}Bot initialization complete. Starting main loop...")
+            print(f"{Fore.GREEN}Starting price monitoring...")
             await self.main_loop()
-            
+
         except Exception as e:
             self.logger.error(f"Error in run_async: e")
             raise
@@ -1812,37 +1795,93 @@ class BinanceBot:
     async def initialize(self):
         """Initialize bot with exchange info"""
         try:
-            # Initialize API first
+            # Initialize exchange info first
+            exchange_info = await self._make_api_call(
+                self.client.get_exchange_info,
+                _no_timestamp=True  # Important: no timestamp for this call
+            )
+            
+            # Cache symbol info
+            self.symbol_info_cache = {
+                s['symbol']: s for s in exchange_info['symbols']
+                if s['symbol'] in self.valid_symbols  # Only cache valid symbols
+            }
+            
+            # Initialize API
             if not await self.api.initialize_exchange_info():
-                raise Exception("Failed to initialize exchange info")
+                raise Exception("Failed to initialize API exchange info")
+                
+            self.logger.info(f"Cached info for {len(self.symbol_info_cache)} symbols")
             return True
             
         except Exception as e:
             self.logger.error(f"Bot initialization failed: {e}")
             return False
 
+    async def check_telegram_status(self):
+        """Verify Telegram functionality"""
+        if not self.telegram_handler or not self.telegram_handler.initialized:
+            self.logger.warning("Telegram not initialized")
+            return False
+            
+        try:
+            # Test message processing
+            test_msg = "🔄 Bot status check"
+            await self.telegram_handler.send_message(test_msg)
+            
+            # Check tasks are running
+            tasks_ok = (
+                self.telegram_handler.message_processor_task and 
+                not self.telegram_handler.message_processor_task.done() and
+                self.telegram_handler.poll_task and 
+                not self.telegram_handler.poll_task.done()
+            )
+            
+            if not tasks_ok:
+                self.logger.error("Telegram tasks not running properly")
+                return False
+                
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Telegram status check failed: {e}")
+            return False
+
 # Update main entry point
 if __name__ == "__main__":
     try:
-        # Initialize color support for Windows
-        if sys.platform.startswith('win'):
-            os.system('color')
-        
+        # Check environment
+        IN_DOCKER = os.environ.get('DOCKER', '').lower() == 'true'
+        if IN_DOCKER:
+            print(f"{Fore.CYAN}Running in Docker environment")
+            if not all(os.getenv(var) for var in ['BINANCE_API_KEY', 'BINANCE_API_SECRET', 'TRADING_SYMBOLS']):
+                print(f"{Fore.RED}Error: Missing required environment variables")
+                sys.exit(1)
+        else:
+            print(f"{Fore.CYAN}Running in local environment")
+            if not os.path.exists('config/config.json'):
+                print(f"{Fore.RED}Error: config.json not found")
+                sys.exit(1)
+
         # Load config and create bot instance
-        config = ConfigHandler.load_config(use_env=os.environ.get('DOCKER', '').lower() == 'true')
-        bot = BinanceBot(config)
+        config = ConfigHandler.load_config(use_env=IN_DOCKER)
         
-        # Test connection before starting
+        # Log loaded configuration
+        print("\nConfiguration loaded successfully:")
+        print(f"Mode: {config['TRADING_SETTINGS']['MODE']}")
+        print(f"Symbols: {', '.join(config['TRADING_SYMBOLS'])}")
+        
+        # Create and run bot
+        bot = BinanceBot(config)
         if bot.test_connection():
-            bot.run()  # This will now work with the added run method
+            bot.run()
         else:
             print(f"{Fore.RED}Connection test failed. Bot will not start.")
             
-    except KeyboardInterrupt:
-        print("\nBot shutdown requested by user.")
     except Exception as e:
-        print(f"Unexpected error: {str(e)}")
-        logging.error(f"Unexpected error: {str(e)}")
+        print(f"{Fore.RED}Fatal error: {str(e)}")
+        logging.error(f"Fatal error: {str(e)}")
+        sys.exit(1)
 
 
 

@@ -46,6 +46,8 @@ class BinanceAPI:
         self.last_info_update = 0
         self.info_update_interval = 3600
         self.recv_window = 60000
+        self.last_server_time = 0
+        self.server_time_update_interval = 30  # Update every 30 seconds
 
         # Futures specific settings
         if self.trading_mode == 'futures':
@@ -248,14 +250,32 @@ class BinanceAPI:
             self.logger.error(f"Error getting symbol info for {symbol}: {e}")
             return None
 
-    async def _make_api_call(self, func, *args, **kwargs):
-        """Make API call with rate limiting"""
-        await self.rate_limiter.acquire()
+    async def _update_server_time(self):
+        """Update server time"""
         try:
-            return func(*args, **kwargs)
+            server_time = await self._make_api_call(
+                self.client.get_server_time,
+                _no_timestamp=True
+            )
+            self.last_server_time = server_time['serverTime']
+            return True
         except Exception as e:
-            self.logger.error(f"API call failed: {e}")
-            raise
+            self.logger.error(f"Error updating server time: {e}")
+            return False
+
+    async def _make_api_call(self, func, *args, _no_timestamp=False, **kwargs):
+        """Make API call with proper timestamp handling"""
+        current_time = time.time() * 1000
+        
+        # Update server time if needed
+        if current_time - self.last_server_time > self.server_time_update_interval * 1000:
+            await self._update_server_time()
+        
+        if not _no_timestamp:
+            kwargs['timestamp'] = int(self.last_server_time)
+            kwargs['recvWindow'] = 60000  # Use 60s window
+            
+        return await super()._make_api_call(func, *args, **kwargs)
 
     # Add other necessary methods like get_balance, cancel_order, etc.
     # ...existing code...

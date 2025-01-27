@@ -8,6 +8,7 @@ import shutil
 import portalocker  # Cross-platform file locking
 import platform
 import stat
+import logging
 
 class FileConnectionPool:
     def __init__(self, max_connections=5):
@@ -44,6 +45,7 @@ class AsyncFileHandler:
         self.backup_dir = os.path.join('data', 'backups')
         os.makedirs(self.backup_dir, exist_ok=True)
         self.is_windows = platform.system() == 'Windows'
+        self.logger = logging.getLogger('FileHandler')  # Add logger initialization
 
     async def save_json(self, filepath, data):
         file = None

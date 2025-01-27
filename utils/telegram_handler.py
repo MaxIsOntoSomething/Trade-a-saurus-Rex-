@@ -111,70 +111,151 @@ class TelegramHandler:
             if self.initialized:
                 return True
 
-            self.logger.info("Initializing Telegram bot...")
+            self.logger.info("Starting Telegram initialization...")
             
-            # Define commands for menu
-            commands = [
-                BotCommand('status', '📊 Show current prices and balance'),
-                BotCommand('orders', '📋 Show open limit orders'),
-                BotCommand('balance', '💰 Show current balance'),
-                BotCommand('trades', '📈 List all trades'),
-                BotCommand('trade', '🔍 Show specific trade details'),
-                BotCommand('add', '➕ Add manual trade'),
-                BotCommand('symbol', '💱 Show detailed stats for pair'),
-                BotCommand('summary', '📑 Show portfolio summary'),
-                BotCommand('thresholds', '⚡ Show threshold status'),
-                BotCommand('stop', '🚨 Emergency stop'),
-                BotCommand('help', '❓ Show this help message')
-            ]
-
-            # Initialize and register handlers
-            await self.app.initialize()
-            await self.app.bot.set_my_commands(commands)
+            # Register command handlers first
             self.register_handlers()
             
-            # Start the application and polling
+            # Initialize application
+            await self.app.initialize()
+            
+            # Start application
             await self.app.start()
+            
+            # Start polling in background with error handling
             self.poll_task = asyncio.create_task(
                 self.app.updater.start_polling(
                     allowed_updates=Update.ALL_TYPES,
-                    drop_pending_updates=True,
-                    error_callback=self._polling_error_callback
+                    drop_pending_updates=True
                 )
             )
-
-            # Start message processor
-            self.message_processor_task = asyncio.create_task(self._process_message_queue())
             
-            # Send startup message with proper escaping
-            startup_msg = (
-                "🤖 *Binance Trading Bot Started*\n\n"
-                "*Trading Configuration:*\n"
-                f"• Mode: `{'Testnet' if self.bot.use_testnet else 'Live'}`\n"
-                f"• Market: `{'Spot'}`\n"
-                f"• Trading Pairs: `{', '.join(self.bot.valid_symbols)}`\n"
-                f"• USDT Reserve: `{self.bot.reserve_balance_usdt}`\n\n"
-                "*Available Commands:*\n\n"
-                "📊 */status* \\- Show prices and balance\n"
-                "📋 */orders* \\- Show open orders\n"
-                "💰 */balance* \\- Show balance\n"
-                "📈 */trades* \\- List all trades\n"
-                "🔍 */trade* \\- Show trade details\n"
-                "➕ */add* \\- Add manual trade\n"
-                "💱 */symbol* \\- Show pair stats\n"
-                "📑 */summary* \\- Portfolio overview\n"
-                "⚡ */thresholds* \\- Price alerts\n"
-                "❓ */help* \\- Show commands\n\n"
-                "🟢 _Bot is actively monitoring markets_"
+            # Start message processor
+            self.message_processor_task = asyncio.create_task(
+                self._process_message_queue()
             )
-
-            await self.safe_send_message(startup_msg, parse_mode='MarkdownV2')
+            
+            # Send startup message
+            await self.send_startup_notification()
+            
             self.initialized = True
+            self.logger.info("Telegram bot initialized successfully")
             return True
 
         except Exception as e:
             self.logger.error(f"Failed to initialize Telegram: {e}")
             return False
+
+    def register_handlers(self):
+        """Register simplified command handlers"""
+        try:
+            # Essential commands only
+            handlers = {
+                "start": self.handle_start,
+                "status": self.handle_status,      
+                "orders": self.handle_orders,
+                "balance": self.handle_balance,
+                "trades": self.handle_trades_list,
+                "trade": self.handle_trade,
+                "add": self.handle_addtrade,
+                "stop": self.handle_emergency_stop,
+                "summary": self.handle_portfolio_summary,
+                "symbol": self.handle_symbol_stats,
+                "thresholds": self.handle_thresholds,
+                "help": self.handle_help
+            }
+            
+            # Register handlers with wrapper
+            for command, handler in handlers.items():
+                self.app.add_handler(
+                    CommandHandler(
+                        command, 
+                        lambda update, context, h=handler: self.handle_command_wrapper(h, update, context)
+                    )
+                )
+
+            # Add general message handler for conversations
+            self.app.add_handler(
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    self.handle_message
+                )
+            )
+
+        except Exception as e:
+            self.logger.error(f"Error registering handlers: {e}")
+            raise
+
+    async def handle_command_wrapper(self, handler, update, context):
+        """Handle commands with improved error handling"""
+        try:
+            command = update.message.text.split()[0][1:]
+            
+            if command in self.processing_commands:
+                await self.safe_send_message("⏳ Command already processing, please wait...")
+                return
+
+            self.logger.debug(f"Processing command: {command}")
+            self.processing_commands.add(command)
+            
+            try:
+                # Show typing indicator
+                await self.app.bot.send_chat_action(
+                    chat_id=update.effective_chat.id,
+                    action="typing"
+                )
+                
+                # Execute command with timeout
+                await asyncio.wait_for(
+                    handler(update, context),
+                    timeout=self.command_timeout
+                )
+                
+            except asyncio.TimeoutError:
+                await self.safe_send_message(f"❌ Command {command} timed out. Please try again.")
+            except Exception as e:
+                self.logger.error(f"Error executing {command}: {e}")
+                await self.safe_send_message("❌ Error processing command. Please try again.")
+            finally:
+                self.processing_commands.discard(command)
+                
+        except Exception as e:
+            self.logger.error(f"Error in command wrapper: {e}")
+            await self.safe_send_message("❌ An error occurred. Please try again.")
+
+    async def _send_startup_message(self):
+        """Send startup message with retries"""
+        for attempt in range(3):
+            try:
+                startup_msg = (
+                    "🤖 *Binance Trading Bot Started*\n\n"
+                    "*Trading Configuration:*\n"
+                    f"• Mode: `{'Testnet' if self.bot.use_testnet else 'Live'}`\n"
+                    f"• Market: `Spot`\n"
+                    f"• Trading Pairs: `{', '.join(self.bot.valid_symbols)}`\n"
+                    f"• USDT Reserve: `{self.bot.reserve_balance_usdt}`\n\n"
+                    "*Active Thresholds:*\n"
+                    "• Daily: `1%, 2%, 3%`\n"
+                    "• Weekly: `3%, 6%, 10%`\n"
+                    "• Monthly: `5%, 10%`\n\n"
+                    "*Commands Available:*\n"
+                    "📊 /status - Show prices & balance\n"
+                    "📋 /orders - Show open orders\n"
+                    "💰 /balance - Show balance\n"
+                    "📈 /trades - List all trades\n"
+                    "🔍 /trade - Show trade details\n"
+                    "➕ /add - Add manual trade\n"
+                    "💱 /symbol - Show pair stats\n"
+                    "📑 /summary - Portfolio overview\n\n"
+                    "🟢 _Bot is actively monitoring markets_"
+                )
+                
+                await self.send_message(startup_msg, parse_mode='MarkdownV2')
+                return True
+            except Exception as e:
+                self.logger.error(f"Startup message attempt {attempt+1} failed: {e}")
+                await asyncio.sleep(2)
+        return False
 
     async def _process_commands(self):
         """Process commands with high priority"""
@@ -835,14 +916,6 @@ class TelegramHandler:
         except Exception as e:
             await self.send_message(f"❌ Error fetching trades: {e}")
 
-    async def handle_symbol_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show symbol statistics including tax calculations"""
-        try:
-            if not context.args or len(context.args) != 1:
-                await self.send_message("❌ Please provide a symbol\nExample: /symbol BTCUSDT")
-                return
-
-            symbol = context.args[0].upper()
     async def handle_symbol_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show symbol statistics including tax calculations"""
         try:
