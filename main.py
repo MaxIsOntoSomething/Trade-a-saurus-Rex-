@@ -1623,29 +1623,12 @@ class BinanceBot:
     async def run_async(self):
         """Run the bot asynchronously"""
         try:
-            # Print startup banner
+            # Print minimal startup banner in terminal
             print(f"\n{Fore.CYAN}=== Binance Trading Bot ===")
-            print(f"Mode: {Fore.YELLOW}{'Testnet' if self.use_testnet else 'Live'}{Fore.RESET}")
-            print(f"Exchange: {Fore.YELLOW}Binance{Fore.RESET}")
-            print(f"Market: {Fore.YELLOW}{'Futures' if self.api.trading_mode == 'futures' else 'Spot'}{Fore.RESET}")
-            print(f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC\n")
-            
-            print(f"{Fore.CYAN}Available Commands:")
-            print(f"{Fore.YELLOW}Core Commands:")
-            print("/status    - Show current prices and balance")
-            print("/orders    - Show open limit orders")
-            print("/balance   - Show current balance")
-            print("\n{Fore.YELLOW}Trading Commands:")
-            print("/trades    - List all trades")
-            print("/trade ID  - Show specific trade details")
-            print("/add       - Add manual trade")
-            print("/symbol    - Show detailed stats for pair")
-            print("/summary   - Show portfolio summary")
-            print("\n{Fore.YELLOW}Analysis:")
-            print("/thresholds - Show threshold status")
-            print("\n{Fore.YELLOW}System:")
-            print("/stop      - Emergency stop")
-            print("/help      - Show this help message\n")
+            print(f"Mode: {Fore.YELLOW}{'Testnet' if self.use_testnet else 'Live'}")
+            print(f"Exchange: {Fore.YELLOW}Binance")
+            print(f"Market: {Fore.YELLOW}{'Futures' if self.api.trading_mode == 'futures' else 'Spot'}")
+            print(f"Time: {Fore.YELLOW}{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC\n")
 
             # Initialize Telegram with visible feedback
             if self.telegram_handler:
@@ -1658,8 +1641,37 @@ class BinanceBot:
                         telegram_success = await self.telegram_handler.initialize()
                         if telegram_success:
                             print(f"{Fore.GREEN}✓ Telegram connected successfully!")
+                            
+                            # Send welcome message with commands to Telegram only
+                            startup_msg = (
+                                "🤖 *Binance Trading Bot Started\\!*\n\n"
+                                "*Trading Configuration:*\n"
+                                f"• Mode: `{('Testnet' if self.use_testnet else 'Live')}`\n"
+                                f"• Market: `{('Futures' if self.api.trading_mode == 'futures' else 'Spot')}`\n"
+                                f"• Trading Pairs: `{', '.join(self.valid_symbols)}`\n"
+                                f"• USDT Reserve: `{self.reserve_balance_usdt}`\n\n"
+                                "*Available Commands:*\n\n"
+                                "*Core Commands:*\n"
+                                "• /status \\- Show current prices and balance\n"
+                                "• /orders \\- Show open limit orders\n"
+                                "• /balance \\- Show current balance\n\n"
+                                "*Trading Commands:*\n"
+                                "• /trades \\- List all trades\n"
+                                "• /trade \\<ID\\> \\- Show specific trade details\n"
+                                "• /add \\- Add manual trade\n"
+                                "• /symbol \\- Show detailed stats for pair\n"
+                                "• /summary \\- Show portfolio summary\n\n"
+                                "*Analysis:*\n"
+                                "• /thresholds \\- Show threshold status\n\n"
+                                "*System:*\n"
+                                "• /stop \\- Emergency stop\n"
+                                "• /help \\- Show this help message\n\n"
+                                "🟢 Bot is actively monitoring markets\\!"
+                            )
+                            
                             await self.telegram_handler.send_message(
-                                "🤖 Bot connected and ready!"
+                                startup_msg,
+                                parse_mode='MarkdownV2'  # Changed from 'Markdown' to 'MarkdownV2'
                             )
                             break
                     except Exception as e:
@@ -1681,7 +1693,7 @@ class BinanceBot:
             await self.main_loop()
             
         except Exception as e:
-            self.logger.error(f"Error in run_async: {e}")
+            self.logger.error(f"Error in run_async: e")
             raise
 
     def run(self):

@@ -106,68 +106,74 @@ class TelegramHandler:
                 await asyncio.sleep(2)
 
     async def initialize(self):
-        """Initialize Telegram bot with improved error handling"""
+        """Initialize Telegram bot with command registration"""
         try:
             if self.initialized:
                 return True
 
-            print(f"{Fore.CYAN}Starting Telegram initialization...")
             self.logger.info("Initializing Telegram bot...")
             
-            try:
-                # Build and start application first
-                self.app = Application.builder().token(self.token).build()
-                
-                # Initialize and register handlers
-                await self.app.initialize()
-                self.register_handlers()
-                
-                # Start the application
-                await self.app.start()
-                
-                # Start polling with error handling
-                polling_task = self.app.updater.start_polling(
+            # Define commands for menu
+            commands = [
+                BotCommand('status', '📊 Show current prices and balance'),
+                BotCommand('orders', '📋 Show open limit orders'),
+                BotCommand('balance', '💰 Show current balance'),
+                BotCommand('trades', '📈 List all trades'),
+                BotCommand('trade', '🔍 Show specific trade details'),
+                BotCommand('add', '➕ Add manual trade'),
+                BotCommand('symbol', '💱 Show detailed stats for pair'),
+                BotCommand('summary', '📑 Show portfolio summary'),
+                BotCommand('thresholds', '⚡ Show threshold status'),
+                BotCommand('stop', '🚨 Emergency stop'),
+                BotCommand('help', '❓ Show this help message')
+            ]
+
+            # Initialize and register handlers
+            await self.app.initialize()
+            await self.app.bot.set_my_commands(commands)
+            self.register_handlers()
+            
+            # Start the application and polling
+            await self.app.start()
+            self.poll_task = asyncio.create_task(
+                self.app.updater.start_polling(
                     allowed_updates=Update.ALL_TYPES,
                     drop_pending_updates=True,
                     error_callback=self._polling_error_callback
                 )
-                
-                # Create polling task
-                self.poll_task = asyncio.create_task(polling_task)
-                
-                # Test connection
-                test_response = await self.app.bot.get_me()
-                if not test_response:
-                    raise Exception("Failed to connect to Telegram")
-                    
-                print(f"{Fore.GREEN}Telegram bot connected: @{test_response.username}")
-                
-                # Set initialized flag
-                self.initialized = True
-                
-                # Start message and command processors
-                self.message_processor_task = asyncio.create_task(
-                    self._process_message_queue()
-                )
-                self.command_processor_task = asyncio.create_task(  # Add this
-                    self._process_commands()
-                )
+            )
 
-                # Send startup message with visible feedback
-                print(f"{Fore.CYAN}Sending startup notification...")
-                await self.send_startup_notification()
-                print(f"{Fore.GREEN}Startup notification sent!")
-                
-                return True
-                
-            except Exception as e:
-                self.logger.error(f"Failed to initialize Telegram: {e}")
-                print(f"{Fore.RED}Telegram initialization failed: {e}")
-                return False
-                
+            # Start message processor
+            self.message_processor_task = asyncio.create_task(self._process_message_queue())
+            
+            # Send startup message with proper escaping
+            startup_msg = (
+                "🤖 *Binance Trading Bot Started*\n\n"
+                "*Trading Configuration:*\n"
+                f"• Mode: `{'Testnet' if self.bot.use_testnet else 'Live'}`\n"
+                f"• Market: `{'Spot'}`\n"
+                f"• Trading Pairs: `{', '.join(self.bot.valid_symbols)}`\n"
+                f"• USDT Reserve: `{self.bot.reserve_balance_usdt}`\n\n"
+                "*Available Commands:*\n\n"
+                "📊 */status* \\- Show prices and balance\n"
+                "📋 */orders* \\- Show open orders\n"
+                "💰 */balance* \\- Show balance\n"
+                "📈 */trades* \\- List all trades\n"
+                "🔍 */trade* \\- Show trade details\n"
+                "➕ */add* \\- Add manual trade\n"
+                "💱 */symbol* \\- Show pair stats\n"
+                "📑 */summary* \\- Portfolio overview\n"
+                "⚡ */thresholds* \\- Price alerts\n"
+                "❓ */help* \\- Show commands\n\n"
+                "🟢 _Bot is actively monitoring markets_"
+            )
+
+            await self.safe_send_message(startup_msg, parse_mode='MarkdownV2')
+            self.initialized = True
+            return True
+
         except Exception as e:
-            self.logger.error(f"Fatal error during Telegram initialization: {e}")
-            print(f"{Fore.RED}Fatal Telegram error: {e}")
+            self.logger.error(f"Failed to initialize Telegram: {e}")
             return False
 
     async def _process_commands(self):
@@ -487,39 +493,27 @@ class TelegramHandler:
             self.logger.error(f"Error queuing message: {e}")
 
     async def _process_message_queue(self):
-        """Enhanced message queue processor with priority handling"""
+        """Process queued messages with rate limiting"""
         while True:
             try:
-                # Check priority queue first
-                if not self.priority_queue.empty():
-                    priority, msg_data = await self.priority_queue.get()
+                if not self.message_queue.empty():
+                    message = await self.message_queue.get()
                     try:
                         await self._send_with_retry(
-                            text=msg_data['text'],
-                            parse_mode=msg_data.get('parse_mode'),
-                            reply_markup=msg_data.get('reply_markup')
+                            text=message['text'],
+                            parse_mode=message.get('parse_mode'),
+                            reply_markup=message.get('reply_markup')
                         )
                     finally:
-                        self.priority_queue.task_done()
-                    continue
-
-                # Then check normal queue
-                try:
-                    msg_data = await asyncio.wait_for(
-                        self.normal_queue.get(),
-                        timeout=0.1
-                    )
-                    await self._send_with_retry(
-                        text=msg_data['text'],
-                        parse_mode=msg_data.get('parse_mode'),
-                        reply_markup=msg_data.get('reply_markup')
-                    )
-                    self.normal_queue.task_done()
-                except asyncio.TimeoutError:
+                        self.message_queue.task_done()
+                        # Add small delay between messages
+                        await asyncio.sleep(0.5)
+                else:
+                    # Don't burn CPU when queue is empty
                     await asyncio.sleep(0.1)
                     
             except Exception as e:
-                self.logger.error(f"Error in message processor: {e}")
+                self.logger.error(f"Error processing message queue: {e}")
                 await asyncio.sleep(1)
 
     async def send_message(self, text, parse_mode=None, reply_markup=None, priority=False, **kwargs):
@@ -570,28 +564,26 @@ class TelegramHandler:
             )
 
     async def _send_with_retry(self, text, parse_mode=None, reply_markup=None):
-        """Send message with retries and proper error handling"""
+        """Send message with retry and proper escaping"""
+        if parse_mode == 'MarkdownV2':
+            # Escape special characters
+            special_chars = '_*[]()~`>#+-=|{}.!'
+            for char in special_chars:
+                text = text.replace(char, f'\\{char}')
+
         for attempt in range(self.max_retries):
             try:
                 return await self.app.bot.send_message(
-                    chat_id=self.chat_id,  # Use instance chat_id instead of parameter
+                    chat_id=self.chat_id,
                     text=text,
                     parse_mode=parse_mode,
-                    reply_markup=reply_markup,
-                    read_timeout=10,
-                    write_timeout=10,
-                    connect_timeout=10,
-                    pool_timeout=10
+                    reply_markup=reply_markup
                 )
-            except telegram.error.NetworkError as e:
-                if attempt == self.max_retries - 1:
-                    raise
-                delay = (2 ** attempt) + random.uniform(0, 1)
-                await asyncio.sleep(delay)
             except telegram.error.RetryAfter as e:
                 await asyncio.sleep(e.retry_after)
             except Exception as e:
                 if attempt == self.max_retries - 1:
+                    self.logger.error(f"Failed to send message after {self.max_retries} attempts: {e}")
                     raise
                 await asyncio.sleep(1)
 
@@ -843,6 +835,14 @@ class TelegramHandler:
         except Exception as e:
             await self.send_message(f"❌ Error fetching trades: {e}")
 
+    async def handle_symbol_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show symbol statistics including tax calculations"""
+        try:
+            if not context.args or len(context.args) != 1:
+                await self.send_message("❌ Please provide a symbol\nExample: /symbol BTCUSDT")
+                return
+
+            symbol = context.args[0].upper()
     async def handle_symbol_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show symbol statistics including tax calculations"""
         try:
