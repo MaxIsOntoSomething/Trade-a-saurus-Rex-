@@ -25,6 +25,7 @@ from utils.rate_limiter import RateLimiter
 from utils.telegram_handler import TelegramHandler
 from utils.file_handler import AsyncFileHandler  # Add import
 import sys  # Add this at the top with other imports
+from utils.mongodb_handler import MongoDBHandler
 
 # Initialize colorama
 init(autoreset=True)
@@ -53,8 +54,8 @@ USE_TELEGRAM = config.get('USE_TELEGRAM', False)
 
 class BinanceBot:
     def __init__(self, config):
-        # Update logger initialization to include telegram logger
-        self.logger, self.api_logger, self.ws_logger, self.telegram_logger = setup_logger()
+        # Update logger initialization to include mongodb logger
+        self.logger, self.api_logger, self.ws_logger, self.telegram_logger, self.mongodb_logger = setup_logger()
         self.logger.info("Initializing BinanceBot...")
 
         # Store config and required settings
@@ -132,7 +133,6 @@ class BinanceBot:
         self.start_time = datetime.now()
         self.valid_symbols = []  # Add this to track valid symbols
         self.invalid_symbols = []  # Add this to track invalid symbols
-        self.invalid_symbols_file = str(ConfigHandler.get_data_dir() / 'invalid_symbols.txt')  # Update directory handling
         self.order_counter = 0  # Add counter for unique IDs
         self.tax_rate = 0.28  # Add 28% tax rate
         self.symbol_stats = {}  # Track per-symbol statistics
@@ -155,7 +155,6 @@ class BinanceBot:
         self.orders_placed = {}
         self.total_trades = 0  # Track the total number of trades
         self.max_trades_executed = False
-        self.trades_file = 'data/trades.json'
         self.trades = self.load_trades()
         self.executor = ThreadPoolExecutor(max_workers=10)  # For running async tasks
         self.limit_order_timeout = timedelta(hours=8)
@@ -185,8 +184,6 @@ class BinanceBot:
 
         self.order_check_interval = 60  # Check orders every 60 seconds
 
-        self.trades_file = 'data/trades.json'
-        self.trades = self.load_trades()
         self.file_handler = AsyncFileHandler()  # Add this line
 
         # Initialize pending orders from trades
@@ -197,17 +194,52 @@ class BinanceBot:
         }
         self.is_shutting_down = False
 
-        # Create data directory and trades file
-        self.trades_dir = Path('data')
-        self.trades_dir.mkdir(exist_ok=True)
-        self.trades_file = self.trades_dir / 'trades.json'
+        # Initialize MongoDB early
+        self.mongo = MongoDBHandler(
+            config['DATABASE_SETTINGS']['MONGODB_URI'],
+            config['DATABASE_SETTINGS']['DATABASE_NAME']
+        )
+        self.mongo.logger = self.mongodb_logger
+        self.trades = {}  # Keep in memory cache
+        self.pending_orders = {}  # Keep in memory cache
+        self.logger.info("MongoDB handler initialized with logging")
+
+        # Remove JSON file related attributes
+        self.data_dir = None
+        self.trades_dir = None
+        self.trades_file = None
+        self.orders_file = None
+        self.backup_dir = None
+
+        # Initialize data paths properly
+        self.data_dir = Path('data')
+        self.data_dir.mkdir(parents=True, exist_ok=True)
         
-        # Initialize trades file if it doesn't exist
-        if not self.trades_file.exists():
-            with open(self.trades_file, 'w') as f:
-                json.dump({}, f)
+        self.trades_dir = self.data_dir / 'trades'
+        self.trades_dir.mkdir(parents=True, exist_ok=True)
         
-        self.trades = self.load_trades()
+        # Set trades file path based on environment
+        trades_filename = 'trades_test.json' if self.use_testnet else 'trades_live.json'
+        self.trades_file = self.trades_dir / trades_filename
+        
+        # Set orders file path
+        orders_filename = 'orders_test.json' if self.use_testnet else 'orders_live.json'
+        self.orders_file = self.trades_dir / orders_filename
+        
+        # Set backup directory
+        self.backup_dir = self.data_dir / 'backups'
+        self.backup_dir.mkdir(parents=True, exist_ok=True)
+
+        # Initialize MongoDB handler
+        self.mongo = MongoDBHandler(
+            config['DATABASE_SETTINGS']['MONGODB_URI'],
+            config['DATABASE_SETTINGS']['DATABASE_NAME']
+        )
+        
+        # Initialize caches
+        self.trades = {}
+        self.pending_orders = {}
+        self.logger.info("Initialized data paths and MongoDB handler")
 
     async def shutdown(self):
         """Enhanced graceful shutdown sequence with error recovery"""
@@ -504,6 +536,32 @@ class BinanceBot:
             if self.telegram_handler:
                 await self.telegram_handler.send_message(fill_msg)
                 
+            # Update MongoDB
+            fill_data = {
+                'price': float(order_status['price']),
+                'quantity': float(order_status['executedQty']),
+                'fees': float(order_status.get('commission', 0)),
+                'fee_asset': order_status.get('commissionAsset', 'USDT')
+            }
+            
+            await self.mongo.mark_order_filled(order_status['orderId'], fill_data)
+            
+            # Update trade status
+            trade_update = {
+                'status': 'FILLED',
+                'filled_time': datetime.now(timezone.utc),
+                'actual_price': fill_data['price'],
+                'actual_quantity': fill_data['quantity'],
+                'fees': fill_data['fees'],
+                'fee_asset': fill_data['fee_asset']
+            }
+            
+            await self.mongo.update_trade(bot_order_id, {'trade_info': trade_update})
+            
+            # Update local cache
+            if bot_order_id in self.trades:
+                self.trades[bot_order_id]['trade_info'].update(trade_update)
+
         except Exception as e:
             self.logger.error(f"Error handling filled order: {e}")
             raise
@@ -563,8 +621,12 @@ class BinanceBot:
             return False
 
     async def monitor_order(self, trade_id):
-        """Monitor order with new structure"""
+        """Monitor order with new structure using trade data"""
         try:
+            if trade_id not in self.trades:
+                self.logger.error(f"Trade {trade_id} not found")
+                return
+
             trade = self.trades[trade_id]
             symbol = trade['trade_info']['symbol']
             order_id = trade['order_metadata']['order_id']
@@ -842,24 +904,46 @@ class BinanceBot:
             if self.telegram_handler:
                 await self.telegram_handler.send_message(fill_msg)
                 
+            # Update MongoDB
+            fill_data = {
+                'price': float(order_status['price']),
+                'quantity': float(order_status['executedQty']),
+                'fees': float(order_status.get('commission', 0)),
+                'fee_asset': order_status.get('commissionAsset', 'USDT')
+            }
+            
+            await self.mongo.mark_order_filled(order_status['orderId'], fill_data)
+            
+            # Update trade status
+            trade_update = {
+                'status': 'FILLED',
+                'filled_time': datetime.now(timezone.utc),
+                'actual_price': fill_data['price'],
+                'actual_quantity': fill_data['quantity'],
+                'fees': fill_data['fees'],
+                'fee_asset': fill_data['fee_asset']
+            }
+            
+            await self.mongo.update_trade(bot_order_id, {'trade_info': trade_update})
+            
+            # Update local cache
+            if bot_order_id in self.trades:
+                self.trades[bot_order_id]['trade_info'].update(trade_update)
+
         except Exception as e:
             self.logger.error(f"Error handling filled order: {e}")
             raise
 
     async def _save_trades_atomic(self):
-        """Save trades atomically with initialization"""
+        """Save trades to MongoDB instead of JSON"""
         try:
-            # Ensure trades file exists
-            if not self.trades_file.exists():
-                self.trades_file.parent.mkdir(parents=True, exist_ok=True)
-                with open(self.trades_file, 'w') as f:
-                    json.dump({}, f)
-                    
-            await self.file_handler.save_json_atomic(self.trades_file, self.trades)
-            
+            # Update all trades in MongoDB
+            for trade_id, trade_data in self.trades.items():
+                await self.mongo.update_trade(trade_id, trade_data)
+            return True
         except Exception as e:
-            self.logger.error(f"Error saving trades: {e}")
-            raise
+            self.logger.error(f"Error saving trades to MongoDB: {e}")
+            return False
 
     async def monitor_order(self, bot_order_id, symbol, order_id, price, placed_time):
         """Asynchronously monitor an order until it's filled"""
@@ -1145,6 +1229,35 @@ class BinanceBot:
             # Save trades immediately
             await self._save_trades_atomic()
             
+            # Start monitoring task
+            asyncio.create_task(self.monitor_order(bot_order_id))
+            
+            # Create trade record with new structure
+            trade_data = {
+                'trade_id': bot_order_id,
+                'exchange': 'testnet' if self.use_testnet else 'live',
+                'trade_info': {
+                    'symbol': symbol,
+                    'entry_price': float(formatted_price),
+                    'quantity': float(formatted_quantity),
+                    'total_cost': float(formatted_price) * float(formatted_quantity),
+                    'status': 'PENDING',
+                    'type': 'bot'
+                },
+                'order_metadata': {
+                    'order_id': order['orderId'],
+                    'placed_time': datetime.now(timezone.utc).isoformat(),
+                    'cancel_time': (datetime.now(timezone.utc) + self.limit_order_timeout).isoformat()
+                }
+            }
+
+            # Save to MongoDB
+            await self.mongo.save_trade(trade_data)
+            
+            # Update local cache
+            self.trades[bot_order_id] = trade_data
+            self.pending_orders[bot_order_id] = trade_data['order_metadata']
+
             # Start monitoring task
             asyncio.create_task(self.monitor_order(bot_order_id))
             
@@ -1502,7 +1615,7 @@ class BinanceBot:
         """Save trades atomically"""
         await self.file_handler.save_json_atomic(self.trades_file, self.trades)
 
-    def test_connection(self):
+    async def test_connection(self):
         """Test connection to Binance API and verify trading symbols"""
         retries = 12
         while retries > 0:
@@ -1527,14 +1640,12 @@ class BinanceBot:
                 if self.valid_symbols:  # If we have at least one valid symbol
                     print(f"\n{Fore.GREEN}Successfully connected to {'Testnet' if self.client.API_URL == 'https://testnet.binance.vision/api' else 'Live'} API")
                     print(f"{Fore.GREEN}Valid symbols: {', '.join(self.valid_symbols)}")
-                    print(f"\n{Fore.GREEN}Successfully connected to {'Testnet' if self.client.API_URL == 'https://testnet.binance.vision/api' else 'Live'} API")
-                    print(f"{Fore.GREEN}Valid symbols: {', '.join(self.valid_symbols)}")
                     
                     if self.invalid_symbols:
                         print(f"{Fore.YELLOW}Invalid symbols removed: {', '.join(self.invalid_symbols)}")
                         # Update tracking files
                         self._update_config_file()
-                        self._update_invalid_symbols_file()
+                        await self._update_invalid_symbols()
                     
                     return True
                 else:
@@ -1544,7 +1655,7 @@ class BinanceBot:
                 if "502 Bad Gateway" in str(e):
                     print(f"{Fore.RED}Binance servers are under maintenance.")
                     print(f"{Fore.YELLOW}Retrying in 5 minutes... ({retries} attempts remaining)")
-                    time.sleep(300)  # Wait for 5 minutes
+                    await asyncio.sleep(300)  # Changed to async sleep
                     retries -= 1
                 else:
                     print(f"Error testing connection: {str(e)}")
@@ -1576,19 +1687,14 @@ class BinanceBot:
             print(f"{Fore.RED}Error updating config file: {e}")
             self.logger.error(f"Error updating config file: {e}")
 
-    def _update_invalid_symbols_file(self):
-        """Update invalid_symbols.txt with removed symbols"""
+    async def _update_invalid_symbols(self):
+        """Update invalid symbols in MongoDB"""
         try:
-            os.makedirs('data', exist_ok=True)
-            with open(self.invalid_symbols_file, 'w') as f:
-                f.write(f"# Invalid symbols removed on {datetime.now()}\n")
-                for symbol in self.invalid_symbols:
-                    f.write(f"{symbol}\n")
-            
-            print(f"{Fore.YELLOW}Invalid symbols saved to {self.invalid_symbols_file}")
+            for symbol in self.invalid_symbols:
+                await self.mongo.save_invalid_symbol(symbol)
+            self.logger.info(f"Updated invalid symbols in database: {', '.join(self.invalid_symbols)}")
         except Exception as e:
-            print(f"{Fore.RED}Error updating invalid symbols file: {e}")
-            self.logger.error(f"Error updating invalid symbols file: {e}")
+            self.logger.error(f"Error updating invalid symbols: {e}")
 
     async def cancel_all_orders(self):
         """Cancel all pending orders and cleanup trades file"""
@@ -1668,15 +1774,15 @@ class BinanceBot:
                 else:
                     print(f"{Fore.GREEN}Telegram bot initialized successfully")
 
-            # Initialize bot systems
+            # Initialize MongoDB first
             if not await self.initialize():
-                raise Exception("Failed to initialize bot")
+                raise Exception("Failed to initialize bot systems")
 
             print(f"{Fore.GREEN}Starting price monitoring...")
             await self.main_loop()
 
         except Exception as e:
-            self.logger.error(f"Error in run_async: e")
+            self.logger.error(f"Error in run_async: {e}")
             raise
 
     def run(self):
@@ -1694,6 +1800,11 @@ class BinanceBot:
             asyncio.set_event_loop(loop)
             
             try:
+                # Test connection first
+                if not loop.run_until_complete(self.test_connection()):
+                    print(f"{Fore.RED}Connection test failed. Bot will not start.")
+                    return
+
                 # Run main loop with proper error handling
                 loop.run_until_complete(self.run_async())
             except KeyboardInterrupt:
@@ -1793,18 +1904,27 @@ class BinanceBot:
         return references
 
     async def initialize(self):
-        """Initialize bot with exchange info"""
+        """Initialize bot with MongoDB and exchange info"""
         try:
-            # Initialize exchange info first
+            # Initialize MongoDB first
+            self.logger.info("Initializing MongoDB...")
+            if not await self.mongo.initialize():
+                raise Exception("Failed to initialize MongoDB")
+            self.logger.info("MongoDB initialized successfully")
+
+            # Load cached data
+            await self._load_cached_data()
+            
+            # Initialize exchange info
             exchange_info = await self._make_api_call(
                 self.client.get_exchange_info,
-                _no_timestamp=True  # Important: no timestamp for this call
+                _no_timestamp=True
             )
             
             # Cache symbol info
             self.symbol_info_cache = {
                 s['symbol']: s for s in exchange_info['symbols']
-                if s['symbol'] in self.valid_symbols  # Only cache valid symbols
+                if s['symbol'] in self.valid_symbols
             }
             
             # Initialize API
@@ -1847,6 +1967,50 @@ class BinanceBot:
             self.logger.error(f"Telegram status check failed: {e}")
             return False
 
+    async def _load_cached_data(self):
+        """Load cached data from MongoDB with proper type checking and error handling"""
+        try:
+            # Get pending orders
+            pending_orders = await self.mongo.get_pending_orders(
+                'testnet' if self.use_testnet else 'live'
+            )
+            
+            # Initialize empty dicts if None returned
+            self.pending_orders = {}
+            self.trades = {}
+            
+            if isinstance(pending_orders, list):
+                # Convert to dict with order_id as key
+                self.pending_orders = {
+                    str(order.get('order_id', '')): order 
+                    for order in pending_orders 
+                    if order and 'order_id' in order
+                }
+
+            # Get active trades
+            active_trades = await self.mongo.get_trade_history(
+                'testnet' if self.use_testnet else 'live',
+                limit=1000
+            )
+            
+            if isinstance(active_trades, list):
+                # Convert to dict with trade_id as key
+                self.trades = {
+                    str(trade.get('trade_id', '')): trade 
+                    for trade in active_trades 
+                    if trade and 'trade_id' in trade
+                }
+
+            self.logger.info(f"Loaded {len(self.pending_orders)} pending orders and {len(self.trades)} trades from cache")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Error loading cached data: {e}")
+            # Initialize empty to prevent None references
+            self.pending_orders = {}
+            self.trades = {}
+            return False
+
 # Update main entry point
 if __name__ == "__main__":
     try:
@@ -1873,15 +2037,14 @@ if __name__ == "__main__":
         
         # Create and run bot
         bot = BinanceBot(config)
-        if bot.test_connection():
-            bot.run()
-        else:
-            print(f"{Fore.RED}Connection test failed. Bot will not start.")
+        bot.run()  # This will handle the async test_connection internally
             
     except Exception as e:
         print(f"{Fore.RED}Fatal error: {str(e)}")
         logging.error(f"Fatal error: {str(e)}")
         sys.exit(1)
+
+
 
 
 

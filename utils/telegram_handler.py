@@ -827,21 +827,29 @@ class TelegramHandler:
         await self.send_message("📊 Asset allocation analysis coming soon")
 
     async def handle_orders(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show open orders"""
+        """Show open orders using MongoDB"""
         try:
+            pending_orders = await self.bot.mongo.get_pending_orders(
+                'testnet' if self.bot.use_testnet else 'live'
+            )
+
+            if not pending_orders:
+                await self.send_message("No open orders")
+                return
+
             message = "📋 Open Orders:\n\n"
-            for order_id, order in self.bot.pending_orders.items():
+            for order in pending_orders:
                 cancel_time = datetime.fromisoformat(order['cancel_time'])
-                message += (f"ID: {order_id}\n"
-                          f"Symbol: {order['symbol']}\n"
-                          f"Price: {order['price']} USDT\n"
-                          f"Quantity: {order['quantity']}\n"
-                          f"Cancels at: {cancel_time.strftime('%Y-%m-%d %H:%M:%S')} UTC\n\n")
-            
-            if not self.bot.pending_orders:
-                message += "No open orders"
-                
+                message += (
+                    f"ID: {order['order_id']}\n"
+                    f"Symbol: {order['symbol']}\n"
+                    f"Price: {order.get('price', 'Market')} USDT\n"
+                    f"Quantity: {order['quantity']}\n"
+                    f"Cancels at: {cancel_time.strftime('%Y-%m-%d %H:%M:%S')} UTC\n\n"
+                )
+
             await self.send_message(message)
+            
         except Exception as e:
             await self.send_message(f"❌ Error fetching orders: {e}")
 
@@ -881,73 +889,74 @@ class TelegramHandler:
             await self.send_message(f"❌ Error fetching trade: {e}")
 
     async def handle_trades_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show list of all trades with tax calculations"""
+        """Show list of all trades using MongoDB"""
         try:
-            if not self.bot.trades:
+            # Get trades from MongoDB
+            trades = await self.bot.mongo.get_trade_history(
+                'testnet' if self.bot.use_testnet else 'live',
+                limit=100
+            )
+
+            if not trades:
                 await self.send_message("No trades found")
                 return
 
             # Group trades by symbol
             trades_by_symbol = {}
-            for trade_id, trade in self.bot.trades.items():
-                symbol = trade['symbol']
+            for trade in trades:
+                symbol = trade['trade_info']['symbol']
                 if symbol not in trades_by_symbol:
                     trades_by_symbol[symbol] = []
-                trades_by_symbol[symbol].append(trade_id)
+                trades_by_symbol[symbol].append(trade)
 
             message = "📈 Trading History by Symbol:\n\n"
             
             # Process each symbol
             for symbol in sorted(trades_by_symbol.keys()):
-                stats = await self.bot.get_symbol_stats(symbol)
+                stats = await self.bot.mongo.get_symbol_stats(
+                    'testnet' if self.bot.use_testnet else 'live',
+                    symbol
+                )
+                
                 if stats:
-                    profit_color = "🟢" if stats['net_profit_usdt'] >= 0 else "🔴"
+                    profit_color = "🟢" if stats['total_pnl'] >= 0 else "🔴"
                     message += (
                         f"{profit_color} {symbol}\n"
-                        f"   Trades: {stats['number_of_trades']}\n"
-                        f"   Avg Entry: {stats['average_price']:.8f}\n"
-                        f"   Net P/L: {stats['net_profit_usdt']:+.2f} USDT "
-                        f"({stats['net_profit_percentage']:+.2f}%) after tax\n\n"
+                        f"   Trades: {stats['total_trades']}\n"
+                        f"   Avg Entry: {stats['avg_entry_price']:.8f}\n"
+                        f"   Net P/L: {stats['total_pnl']:+.2f} USDT\n\n"
                     )
 
-            message += "\nUse /symbol <SYMBOL> for detailed statistics"
             await self.send_message(message)
             
         except Exception as e:
             await self.send_message(f"❌ Error fetching trades: {e}")
 
     async def handle_symbol_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show symbol statistics including tax calculations"""
+        """Show symbol statistics using MongoDB"""
         try:
             if not context.args or len(context.args) != 1:
                 await self.send_message("❌ Please provide a symbol\nExample: /symbol BTCUSDT")
                 return
 
             symbol = context.args[0].upper()
-            if symbol not in self.bot.valid_symbols:
-                await self.send_message(f"❌ Invalid symbol: {symbol}")
-                return
+            stats = await self.bot.mongo.get_symbol_stats(
+                'testnet' if self.bot.use_testnet else 'live',
+                symbol
+            )
 
-            stats = await self.bot.get_symbol_stats(symbol)
             if not stats:
                 await self.send_message(f"No trades found for {symbol}")
                 return
 
-            # Format message with detailed statistics
             message = (
                 f"📊 {symbol} Trading Summary\n\n"
-                f"Position Size: {stats['total_quantity']:.8f}\n"
-                f"Total Cost: {stats['total_cost']:.2f} USDT\n"
-                f"Average Entry: {stats['average_price']:.8f} USDT\n\n"
-                f"Current Price: {stats['current_price']:.8f} USDT\n"
-                f"Current Value: {stats['current_value']:.2f} USDT\n\n"
-                f"Gross P/L: {stats['gross_profit_usdt']:+.2f} USDT "
-                f"({stats['gross_profit_percentage']:+.2f}%)\n"
-                f"Tax (28%): {stats['tax_amount']:.2f} USDT\n"
-                f"Net P/L: {stats['net_profit_usdt']:+.2f} USDT "
-                f"({stats['net_profit_percentage']:+.2f}%)\n\n"
-                f"Number of Trades: {stats['number_of_trades']}\n"
-                f"Last Update: {stats['last_update']}"
+                f"Position Size: {stats['total_volume']:.8f}\n"
+                f"Total Value: {stats['total_value_usdt']:.2f} USDT\n"
+                f"Average Entry: {stats['avg_entry_price']:.8f} USDT\n\n"
+                f"Total P/L: {stats['total_pnl']:+.2f} USDT\n"
+                f"Number of Trades: {stats['total_trades']}\n"
+                f"Last Trade: {stats['last_trade_time'].strftime('%Y-%m-%d %H:%M:%S')} UTC"
             )
 
             await self.send_message(message)
@@ -956,56 +965,25 @@ class TelegramHandler:
             await self.send_message(f"❌ Error getting symbol stats: {e}")
 
     async def handle_portfolio_summary(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show summary of all trades and total portfolio performance"""
+        """Show portfolio summary using MongoDB"""
         try:
-            if not self.bot.trades:
-                await self.send_message("No trades found")
+            summary = await self.bot.mongo.get_portfolio_summary(
+                'testnet' if self.bot.use_testnet else 'live'
+            )
+
+            if not summary:
+                await self.send_message("No trading data available")
                 return
 
-            # Calculate totals
-            total_investment = 0
-            total_current_value = 0
-            total_gross_profit = 0
-            symbol_summaries = []
+            message = (
+                "📊 Portfolio Summary\n\n"
+                f"Total Trades: {summary['total_trades']}\n"
+                f"Total Value: {summary['total_value_usdt']:.2f} USDT\n"
+                f"Total P/L: {summary['total_pnl']:+.2f} USDT\n"
+                f"Total Fees: {summary['total_fees']:.2f} USDT\n\n"
+                f"Net P/L: {(summary['total_pnl'] - summary['total_fees']):+.2f} USDT"
+            )
 
-            # Process each symbol
-            for symbol in sorted(set(trade['symbol'] for trade in self.bot.trades.values())):
-                stats = await self.bot.get_symbol_stats(symbol)
-                if stats:
-                    total_investment += stats['total_cost']
-                    total_current_value += stats['current_value']
-                    total_gross_profit += stats['gross_profit_usdt']
-                    symbol_summaries.append(stats)
-
-            # Calculate portfolio totals
-            total_tax = total_gross_profit * self.bot.tax_rate if total_gross_profit > 0 else 0
-            total_net_profit = total_gross_profit - total_tax if total_gross_profit > 0 else total_gross_profit
-            total_profit_percentage = (total_net_profit / total_investment * 100) if total_investment > 0 else 0
-
-            # Format message
-            message = "📊 Portfolio Summary\n\n"
-            
-            # Overall summary
-            message += f"💼 Total Portfolio:\n"
-            message += f"Investment: {total_investment:.2f} USDT\n"
-            message += f"Current Value: {total_current_value:.2f} USDT\n"
-            message += f"Gross P/L: {total_gross_profit:+.2f} USDT\n"
-            message += f"Tax (28%): {total_tax:.2f} USDT\n"
-            message += f"Net P/L: {total_net_profit:+.2f} USDT ({total_profit_percentage:+.2f}%)\n\n"
-            
-            # Individual symbols
-            message += "📈 By Symbol:\n"
-            for stats in symbol_summaries:
-                profit_color = "🟢" if stats['net_profit_usdt'] >= 0 else "🔴"
-                message += (
-                    f"{profit_color} {stats['symbol']}\n"
-                    f"   Cost: {stats['total_cost']:.2f} USDT\n"
-                    f"   Value: {stats['current_value']:.2f} USDT\n"
-                    f"   Net P/L: {stats['net_profit_usdt']:+.2f} USDT ({stats['net_profit_percentage']:+.2f}%)\n"
-                    f"   Trades: {stats['number_of_trades']}\n\n"
-                )
-
-            message += "\nUse /symbol <SYMBOL> for detailed symbol statistics"
             await self.send_message(message)
             
         except Exception as e:

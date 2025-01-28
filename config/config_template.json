@@ -12,15 +12,21 @@
         "ORDER_TYPE": "limit",
         "TRADE_AMOUNT": 10,
         "USE_PERCENTAGE": false,
-        "RESERVE_BALANCE": 2000
+        "RESERVE_BALANCE": 2000,
+        "ORDER_TIMEOUT_HOURS": 8
     },
 
     "FUTURES_SETTINGS": {
-        "LEVERAGE": 5,
+        "LEVERAGE": 1,
         "MARGIN_TYPE": "isolated",
         "POSITION_MODE": "one-way",
         "AUTO_HEDGE": false,
         "MAX_POSITION_SIZE": 1000
+    },
+
+    "DATABASE_SETTINGS": {
+        "MONGODB_URI": "mongodb://localhost:27017/",
+        "DATABASE_NAME": "binance_bot"
     },
 
     "TELEGRAM_SETTINGS": {
@@ -40,23 +46,18 @@
     "TIMEFRAMES": {
         "daily": {
             "enabled": true,
-            "thresholds": [0.01, 0.02, 0.03]
+            "thresholds": [0.01, 0.02, 0.03],
+            "execution_limit": "once_per_day"
         },
         "weekly": {
             "enabled": true,
-            "thresholds": [0.03, 0.06, 0.10]
+            "thresholds": [0.03, 0.06, 0.10],
+            "execution_limit": "once_per_week"
         },
         "monthly": {
             "enabled": true,
-            "thresholds": [0.05, 0.10]
+            "thresholds": [0.05, 0.10],
+            "execution_limit": "once_per_month"
         }
-    },
-
-    "RISK_SETTINGS": {
-        "MAX_POSITIONS": 10,
-        "PER_TRADE_RISK": 1.0,
-        "DAILY_LOSS_LIMIT": 5.0,
-        "STOP_LOSS": 5.0,
-        "TAKE_PROFIT": 3.0
     }
 }

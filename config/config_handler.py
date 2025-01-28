@@ -93,12 +93,18 @@ class ConfigHandler:
 
     @staticmethod
     def _validate_timeframes(config: Dict[str, Any]) -> None:
-        """Validate timeframe configuration"""
+        """Validate timeframe configuration with execution limits"""
         timeframes = config.get('TIMEFRAMES', {})
         if not timeframes:
             raise ValueError("Missing TIMEFRAMES section")
             
         required_timeframes = ['daily', 'weekly', 'monthly']
+        execution_limits = {
+            'daily': 'once_per_day',
+            'weekly': 'once_per_week',
+            'monthly': 'once_per_month'
+        }
+        
         for timeframe in required_timeframes:
             if timeframe not in timeframes:
                 raise ValueError(f"Missing timeframe configuration: {timeframe}")
@@ -117,8 +123,15 @@ class ConfigHandler:
             if not isinstance(thresholds, list):
                 raise ValueError(f"Thresholds must be a list for {timeframe}")
                 
-            if not all(isinstance(t, (int, float)) for t in thresholds):
-                raise ValueError(f"Invalid threshold values for {timeframe}")
+            if not all(isinstance(t, (int, float)) and 0 < t < 1 for t in thresholds):
+                raise ValueError(f"Invalid threshold values for {timeframe} (must be between 0 and 1)")
+                
+            if len(set(thresholds)) != len(thresholds):
+                raise ValueError(f"Duplicate thresholds found in {timeframe}")
+                
+            # Add execution limit if missing
+            if 'execution_limit' not in settings:
+                settings['execution_limit'] = execution_limits[timeframe]
 
     @staticmethod
     def load_config(use_env: bool = False) -> Dict[str, Any]:
@@ -132,10 +145,11 @@ class ConfigHandler:
                 config = ConfigHandler._load_from_json()
                 print("Using config.json for configuration")
 
-            # Validate configuration sections
+            # Add MongoDB validation
+            ConfigHandler._validate_database_settings(config)
             ConfigHandler._validate_trading_settings(config)
             ConfigHandler._validate_timeframes(config)
-            ConfigHandler.validate_config(config)  # Original validation
+            ConfigHandler.validate_config(config)
 
             # Print loaded configuration
             print("\nValidated Configuration:")
@@ -291,7 +305,7 @@ class ConfigHandler:
 
     @staticmethod
     def _load_from_env() -> Dict[str, Any]:
-        """Load configuration from environment variables"""
+        """Load configuration from environment variables with updated validation"""
         try:
             # First load required variables
             required_vars = {
@@ -345,9 +359,34 @@ class ConfigHandler:
                 }
             }
 
-            # Parse timeframe configurations
-            config['TIMEFRAMES'] = ConfigHandler._parse_timeframe_config()
+            # Parse timeframe configurations with execution limits
+            timeframes = {}
+            for tf in ['daily', 'weekly', 'monthly']:
+                env_key = f'{tf.upper()}_CONFIG'
+                cfg = os.getenv(env_key, '').split(':')
+                if len(cfg) != 2:
+                    continue
+
+                enabled = cfg[0].lower() == 'true'
+                thresholds = [float(x)/100 for x in cfg[1].split(',')]
+                
+                # Add execution limit based on timeframe
+                execution_limit = f'once_per_{tf}'
+                
+                timeframes[tf] = {
+                    'enabled': enabled,
+                    'thresholds': thresholds,
+                    'execution_limit': execution_limit
+                }
+
+            config['TIMEFRAMES'] = timeframes
             
+            # Add database settings from environment
+            config['DATABASE_SETTINGS'] = {
+                'MONGODB_URI': os.getenv('MONGODB_URI', 'mongodb://localhost:27017'),
+                'DATABASE_NAME': os.getenv('MONGODB_DATABASE', 'binance_bot')
+            }
+
             return config
 
         except Exception as e:
@@ -359,6 +398,26 @@ class ConfigHandler:
         config_path = Path('config/config.json')
         with open(config_path) as f:
             return json.load(f)
+
+    @staticmethod
+    def _validate_database_settings(config: Dict[str, Any]) -> None:
+        """Validate MongoDB configuration"""
+        db_settings = config.get('DATABASE_SETTINGS', {})
+        if not db_settings:
+            raise ValueError("Missing DATABASE_SETTINGS section")
+            
+        required_settings = {
+            'MONGODB_URI': str,
+            'DATABASE_NAME': str
+        }
+        
+        for key, expected_type in required_settings.items():
+            if key not in db_settings:
+                raise ValueError(f"Missing required setting: DATABASE_SETTINGS.{key}")
+            if not isinstance(db_settings[key], expected_type):
+                raise ValueError(f"Invalid type for DATABASE_SETTINGS.{key}")
+            if not db_settings[key]:  # Check for empty strings
+                raise ValueError(f"Empty value for DATABASE_SETTINGS.{key}")
 
     @staticmethod
     def get_data_dir() -> Path:

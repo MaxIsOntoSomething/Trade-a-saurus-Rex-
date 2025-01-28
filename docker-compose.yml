@@ -1,52 +1,26 @@
 version: '3.8'
 
 services:
-  binance-bot:
-    build: 
-      context: .
-      dockerfile: Dockerfile
-      args:
-        APP_USER: ${APP_USER:-botuser}
-        UID: ${UID:-1000}
-        GID: ${GID:-1000}
-    container_name: binance-bot
-    user: "1000:1000"  # Explicitly set user:group
+  bot:
+    build: .
+    env_file: .env
+    depends_on:
+      - mongodb
+    networks:
+      - bot_network
+
+  mongodb:
+    image: mongo:latest
+    ports:
+      - "27017:27017"
     volumes:
-      - type: bind
-        source: ./data
-        target: /app/data
-        bind:
-          create_host_path: true
-      - type: bind
-        source: ./logs
-        target: /app/logs
-        bind:
-          create_host_path: true
-      - type: bind
-        source: ./config
-        target: /app/config
-        read_only: true
-    environment:
-      - TZ=${TZ:-UTC}
-      - UMASK=${UMASK:-0027}
-      - DOCKER=true
-      - PYTHONUNBUFFERED=1
-    env_file:
-      - .env
-    deploy:
-      resources:
-        limits:
-          memory: ${MEMORY_LIMIT:-512M}
-          cpus: ${CPU_LIMIT:-0.5}
-    healthcheck:
-      test: ["CMD", "python", "-c", "import sys, os; sys.exit(0 if os.path.exists('/app/data/trades.json') else 1)"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    restart: unless-stopped
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "200m"
-        max-file: "10"
-        compress: "true"
+      - mongodb_data:/data/db
+    networks:
+      - bot_network
+
+networks:
+  bot_network:
+    driver: bridge
+
+volumes:
+  mongodb_data:

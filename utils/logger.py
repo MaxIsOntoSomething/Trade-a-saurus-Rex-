@@ -145,5 +145,41 @@ def setup_logger(name='BinanceBot'):
     telegram_logger.setLevel(logging.DEBUG)
     telegram_logger.addHandler(telegram_handler)
     telegram_logger.propagate = False
+
+    # Add MongoDB logger configuration
+    mongodb_formatter = logging.Formatter(
+        '%(asctime)s - [%(levelname)s] - %(message)s\n'
+        'Operation: %(operation)s\n'
+        'Collection: %(collection)s\n'
+        'Query: %(query)s\n'
+        'Duration: %(duration).3fms\n'
+        'Result: %(result)s\n'
+        '----------------------------------------',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        defaults={
+            'operation': 'N/A',
+            'collection': 'N/A',
+            'query': 'N/A',
+            'duration': 0.0,
+            'result': 'N/A'
+        }
+    )
+
+    # Create MongoDB log handler
+    mongodb_file = f'logs/mongodb_{datetime.now().strftime("%Y%m%d")}.log'
+    mongodb_handler = RotatingFileHandler(
+        mongodb_file,
+        maxBytes=10*1024*1024,  # 10MB
+        backupCount=5,
+        encoding='utf-8'
+    )
+    mongodb_handler.setLevel(logging.DEBUG)
+    mongodb_handler.setFormatter(mongodb_formatter)
+
+    # Create MongoDB logger
+    mongodb_logger = logging.getLogger('MongoDB')
+    mongodb_logger.setLevel(logging.DEBUG)
+    mongodb_logger.addHandler(mongodb_handler)
+    mongodb_logger.propagate = False
     
-    return logger, api_logger, api_logger, telegram_logger
+    return logger, api_logger, api_logger, telegram_logger, mongodb_logger
