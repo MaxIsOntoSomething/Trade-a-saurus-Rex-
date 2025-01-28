@@ -326,3 +326,21 @@ class MongoDBHandler:
         except Exception as e:
             self.logger.error(f"Error getting invalid symbols: {e}")
             return []
+
+    async def move_order_to_trades(self, order_id, order_status):
+        """Move an order from the orders collection to the trades collection"""
+        try:
+            order = await self.db.orders.find_one({'order_id': order_id})
+            if order:
+                order['status'] = 'FILLED'
+                order['filled_time'] = datetime.now(timezone.utc).isoformat()
+                order['actual_price'] = float(order_status['price'])
+                order['actual_quantity'] = float(order_status['executedQty'])
+                
+                await self.db.trades.insert_one(order)
+                await self.db.orders.delete_one({'order_id': order_id})
+                self.logger.info(f"Order moved to trades: {order_id}")
+            else:
+                self.logger.warning(f"Order not found in orders collection: {order_id}")
+        except Exception as e:
+            self.logger.error(f"Error moving order to trades: {e}")
