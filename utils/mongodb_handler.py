@@ -1,8 +1,10 @@
 import motor.motor_asyncio
+import asyncio
 from datetime import datetime, timezone
 import logging
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Union
 from pymongo import ASCENDING, DESCENDING, IndexModel
+from pymongo.errors import DuplicateKeyError
 import time
 
 class MongoDBHandler:
@@ -97,25 +99,99 @@ class MongoDBHandler:
             return False
 
     async def save_trade(self, trade_data: Dict):
-        """Save trade with new structure"""
+        """Save trade with enhanced validation and error handling"""
         try:
+            # Validate required fields
+            required_fields = {
+                'trade_id': (str,),  # Fix: Use tuple for isinstance check
+                'exchange': (str,),
+                'trade_info': (dict,)  # Fix: Use tuple for isinstance check
+            }
+
+            trade_info_fields = {
+                'symbol': (str,),
+                'entry_price': (float, int),  # Allow both float and int
+                'quantity': (float, int),
+                'total_cost': (float, int),
+                'status': (str,),
+                'type': (str,)
+            }
+
+            # Validate trade_data structure
+            if not isinstance(trade_data, dict):
+                raise ValueError("Trade data must be a dictionary")
+
+            # Check required top-level fields
+            for field, field_type in required_fields.items():
+                if field not in trade_data:
+                    raise ValueError(f"Missing required field: {field}")
+                if not isinstance(trade_data[field], field_type):
+                    raise ValueError(f"Invalid type for {field}: expected {field_type}")
+
+            # Check trade_info fields
+            trade_info = trade_data.get('trade_info', {})
+            for field, field_type in trade_info_fields.items():
+                if field not in trade_info:
+                    raise ValueError(f"Missing required field in trade_info: {field}")
+                if not isinstance(trade_info[field], field_type):
+                    try:
+                        # Convert numeric values
+                        if field in ['entry_price', 'quantity', 'total_cost']:
+                            trade_info[field] = float(trade_info[field])
+                    except (ValueError, TypeError):
+                        raise ValueError(f"Invalid type for trade_info.{field}: expected {field_type}")
+
+            # Ensure symbol is uppercase and valid format
+            trade_info['symbol'] = trade_info['symbol'].upper()
+            if not trade_info['symbol'].endswith('USDT'):
+                raise ValueError(f"Invalid symbol format: {trade_info['symbol']}")
+
+            # Prepare trade document
             trade_doc = {
                 'trade_id': trade_data['trade_id'],
                 'exchange': trade_data['exchange'],
-                'symbol': trade_data['symbol'],
-                'entry_price': float(trade_data['entry_price']),
-                'quantity': float(trade_data['quantity']),
-                'status': trade_data['status'],
-                'type': trade_data.get('type', 'bot'),
+                'symbol': trade_info['symbol'],  # Add symbol at top level for easier querying
+                'trade_info': trade_info,
                 'created_at': datetime.now(timezone.utc),
                 'updated_at': datetime.now(timezone.utc)
             }
-            
-            result = await self.db.trades.insert_one(trade_doc)
-            return result.inserted_id
+
+            # Add order metadata if present
+            if 'order_metadata' in trade_data:
+                trade_doc['order_metadata'] = trade_data['order_metadata']
+
+            # Insert with retry logic
+            for attempt in range(3):
+                try:
+                    result = await self.db.trades.insert_one(trade_doc)
+                    self.logger.debug(
+                        "save_trade completed",
+                        extra={
+                            'operation': 'save_trade',
+                            'collection': 'trades',
+                            'query': str(trade_doc['trade_id']),
+                            'duration': 0.0,
+                            'result': 'Success'
+                        }
+                    )
+                    return result.inserted_id
+                except Exception as e:
+                    if attempt == 2:  # Last attempt
+                        raise
+                    await asyncio.sleep(1)
+
         except Exception as e:
-            self.logger.error(f"Error saving trade: {e}")
-            return None
+            self.logger.error(
+                f"Error saving trade: {str(e)}",
+                extra={
+                    'operation': 'save_trade',
+                    'collection': 'trades',
+                    'query': str(trade_data.get('trade_id', 'N/A')),
+                    'duration': 0.0,
+                    'result': f'Error: {str(e)}'
+                }
+            )
+            raise
 
     async def update_trade(self, trade_id: str, update_data: Dict):
         """Update existing trade"""
@@ -252,59 +328,100 @@ class MongoDBHandler:
         try:
             async with await self.client.start_session() as session:
                 async with session.start_transaction():
-                    # Get order from open_orders collection
+                    # Get order from open_orders collection with status check
                     order = await self.db.open_orders.find_one(
-                        {'order_id': order_id},
+                        {'order_id': order_id, 'status': {'$ne': 'FILLED'}},
                         session=session
                     )
                     
-                    if not order:
-                        raise ValueError(f"Order {order_id} not found in open_orders")
+                    if order:
+                        # Update trade record with FILLED status
+                        update_data = {
+                            'status': 'FILLED',
+                            'fill_price': float(fill_data['price']),
+                            'filled_quantity': float(fill_data['quantity']),
+                            'fill_time': datetime.now(timezone.utc),
+                            'fees': float(fill_data.get('fees', 0)),
+                            'fee_asset': fill_data.get('fee_asset', 'USDT'),
+                            'updated_at': datetime.now(timezone.utc)
+                        }
+                        
+                        await self.db.trades.update_one(
+                            {'trade_id': order['trade_id']},
+                            {'$set': update_data},
+                            session=session
+                        )
 
-                    # Update trade record
-                    await self.db.trades.update_one(
-                        {'trade_id': order['trade_id']},
-                        {
-                            '$set': {
-                                'status': 'FILLED',
-                                'fill_price': float(fill_data['price']),
-                                'filled_quantity': float(fill_data['quantity']),
-                                'fill_time': datetime.now(timezone.utc),
-                                'fees': float(fill_data.get('fees', 0)),
-                                'fee_asset': fill_data.get('fee_asset', 'USDT'),
-                                'updated_at': datetime.now(timezone.utc)
-                            }
-                        },
-                        session=session
-                    )
+                        # Move order to filled_orders collection
+                        filled_order = {
+                            **order,
+                            **update_data
+                        }
+                        await self.db.filled_orders.insert_one(filled_order, session=session)
+                        
+                        # Remove from open_orders
+                        await self.db.open_orders.delete_one(
+                            {'order_id': order_id},
+                            session=session
+                        )
 
-                    # Archive the filled order in trades collection
-                    filled_order = {
-                        **order,
-                        'status': 'FILLED',
-                        'fill_time': datetime.now(timezone.utc),
-                        'fill_price': float(fill_data['price']),
-                        'filled_quantity': float(fill_data['quantity']),
-                        'fees': float(fill_data.get('fees', 0)),
-                        'fee_asset': fill_data.get('fee_asset', 'USDT')
-                    }
-                    await self.db.trades.update_one(
-                        {'trade_id': order['trade_id']},
-                        {'$set': {'order': filled_order}},
-                        session=session
-                    )
-                    
-                    # Remove from open_orders collection
-                    await self.db.open_orders.delete_one(
-                        {'order_id': order_id},
-                        session=session
-                    )
-
-            self.logger.info(f"Order {order_id} marked as filled and moved to trades")
+            self.logger.info(f"Order {order_id} marked as filled and archived")
             return True
-
+            
+        except DuplicateKeyError:
+            self.logger.warning(f"Order {order_id} already processed")
+            return False
         except Exception as e:
             self.logger.error(f"Error marking order filled: {e}")
+            return False
+
+    async def cleanup_duplicate_orders(self):
+        """Remove duplicate open orders and sync with trades"""
+        try:
+            async with await self.client.start_session() as session:
+                async with session.start_transaction():
+                    # Find orders that should be closed
+                    filled_trades = await self.db.trades.find(
+                        {'status': 'FILLED'},
+                        {'trade_id': 1}
+                    ).to_list(length=None)
+                    
+                    filled_trade_ids = [t['trade_id'] for t in filled_trades]
+                    
+                    # Remove corresponding open orders
+                    if filled_trade_ids:
+                        result = await self.db.open_orders.delete_many({
+                            'trade_id': {'$in': filled_trade_ids}
+                        })
+                        
+                        if result.deleted_count > 0:
+                            self.logger.info(f"Cleaned up {result.deleted_count} stale open orders")
+                    
+                    # Remove duplicates keeping only the latest
+                    pipeline = [
+                        {'$group': {
+                            '_id': '$order_id',
+                            'latest_doc': {'$last': '$$ROOT'},
+                            'count': {'$sum': 1}
+                        }},
+                        {'$match': {
+                            'count': {'$gt': 1}
+                        }}
+                    ]
+                    
+                    duplicates = await self.db.open_orders.aggregate(pipeline).to_list(length=None)
+                    
+                    for dup in duplicates:
+                        # Keep only the latest version
+                        await self.db.open_orders.delete_many({
+                            'order_id': dup['_id'],
+                            '_id': {'$ne': dup['latest_doc']['_id']}
+                        })
+
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error cleaning up orders: {e}")
             return False
 
     async def save_invalid_symbol(self, symbol: str):

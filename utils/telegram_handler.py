@@ -102,7 +102,7 @@ class TelegramHandler:
                 await asyncio.sleep(2)
 
     async def initialize(self):
-        """Initialize Telegram bot with single startup"""
+        """Initialize Telegram bot with better error handling"""
         try:
             if self.initialized:
                 return True
@@ -111,52 +111,52 @@ class TelegramHandler:
             
             # Generate emergency stop code once during initialization
             self.emergency_stop_code = ''.join(random.choices('0123456789', k=6))
-            self.logger.info(f"Emergency stop code generated: {self.emergency_stop_code}")
             
             # Register command handlers first
             self.register_handlers()
             
-            # Initialize application
-            await self.app.initialize()
-            
-            # Start application
-            await self.app.start()
-            
-            # Start polling in background with proper error handling
-            self.poll_task = asyncio.create_task(
-                self.app.updater.start_polling(
-                    allowed_updates=Update.ALL_TYPES,
-                    drop_pending_updates=True,
-                    error_callback=self._polling_error_callback
+            # Initialize application with proper error handling
+            try:
+                await self.app.initialize()
+                if not self.app.updater:
+                    raise ValueError("Updater not initialized")
+                    
+                # Start application
+                await self.app.start()
+                
+                # Start polling with proper error handling and drop_pending_updates=True
+                self.poll_task = asyncio.create_task(
+                    self.app.updater.start_polling(
+                        drop_pending_updates=True,
+                        error_callback=self._polling_error_callback
+                    )
                 )
-            )
-            
-            # Start message processor
-            self.message_processor_task = asyncio.create_task(
-                self._process_message_queue()
-            )
-            
-            # Wait for tasks to start
-            await asyncio.sleep(1)
-            
-            # Verify tasks are running
-            if (self.poll_task.done() or 
-                self.message_processor_task.done()):
-                raise Exception("Failed to start Telegram tasks")
-            
-            # Send startup message only once
-            if not self.startup_sent:
-                await self.send_startup_notification()
-                self.startup_sent = True
-            
-            self.initialized = True
-            self.logger.info("Telegram bot initialized successfully")
-            return True
+                
+                # Wait for polling to start
+                await asyncio.sleep(2)
+                if self.poll_task.done():
+                    exception = self.poll_task.exception()
+                    if exception:
+                        raise exception
+                    else:
+                        raise ValueError("Polling task failed to start")
+                
+                # Start message processor
+                self.message_processor_task = asyncio.create_task(
+                    self._process_message_queue()
+                )
+                
+                self.initialized = True
+                self.logger.info("Telegram bot initialized successfully")
+                return True
+                
+            except Exception as e:
+                self.logger.error(f"Failed to initialize Telegram: {str(e)}")
+                await self.shutdown()  # Clean shutdown on failure
+                return False
 
         except Exception as e:
-            self.logger.error(f"Failed to initialize Telegram: {e}")
-            # Cleanup any running tasks
-            await self.shutdown()
+            self.logger.error(f"Telegram initialization error: {str(e)}")
             return False
 
     def register_handlers(self):

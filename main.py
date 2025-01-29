@@ -1532,31 +1532,38 @@ class BinanceBot:
             return False
 
     async def handle_price_update(self, symbol, price):
-        """Handle price updates with minimal console output"""
+        """Handle price updates with improved display"""
         try:
-            # Log full details
-            self.logger.info(f"Processing {symbol} @ {price} USDT")
-            
-            df = pd.DataFrame({
-                'symbol': [symbol],
-                'close': [price]
-            })
-            
+            df = pd.DataFrame({'symbol': [symbol], 'close': [price]})
             reference_prices = self.get_reference_prices(symbol)
+            
             if not reference_prices:
-                self.logger.warning(f"No reference prices for {symbol}")
                 return
-                
-            signals = self.strategy.generate_signals(
-                df,
-                reference_prices,
-                datetime.now(timezone.utc)
-            )
+
+            # Print status line
+            status_line = f"\r{symbol}: {price:.8f} USDT | "
+            timeframe_info = []
+
+            # Calculate and format drops for each timeframe
+            for timeframe in ['daily', 'weekly', 'monthly']:
+                if timeframe in reference_prices and reference_prices[timeframe]['open']:
+                    ref_price = float(reference_prices[timeframe]['open'])
+                    drop = ((ref_price - price) / ref_price) * 100
+                    arrow = "↑" if drop < 0 else "↓"
+                    color = Fore.GREEN if drop < 0 else Fore.RED
+                    timeframe_info.append(f"{timeframe}: {color}{abs(drop):+.2f}%{arrow}{Style.RESET_ALL}")
+
+            status_line += " | ".join(timeframe_info)
+            print(status_line, end='', flush=True)
+
+            # Generate signals
+            signals = self.strategy.generate_signals(df, reference_prices, datetime.now(timezone.utc))
             
             if signals:
-                # Print minimal trade info
+                # Print newline before signal to not interfere with status line
+                print("\n")
                 for timeframe, threshold, signal_price in signals:
-                    print(f"🎯 Trading {symbol} ({timeframe} -{threshold*100}%)")
+                    print(f"\n🎯 Signal: {symbol} ({timeframe} -{threshold*100}%)")
                     await self.execute_trade(symbol, price)
             
         except Exception as e:

@@ -11,3 +11,5 @@ websockets>=11.0.3
 portalocker>=2.3.0
 dash>=2.14.1  # Add dash
 plotly>=5.18.0  # Add plotly (required by dash)
+motor
+pymongo
