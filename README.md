@@ -67,7 +67,7 @@ docker-compose down
 ### API Integration
 - [x] Basic Spot Trading
 - [x] Basic Futures Trading
-- [ ] WebSocket support for real-time price updates
+- [ ] WebSocket support for real-time price updates (optional)
 - [ ] Futures-specific order types (stop-loss, take-profit)
 - [ ] OCO (One-Cancels-Other) orders
 - [ ] Trailing stops for both spot and futures
@@ -106,7 +106,7 @@ docker-compose down
 - [ ] Enhanced error recovery
 - [ ] Performance optimization
 - [ ] Distributed system support
-- [x] SQLite Database integration
+- [x] MongoDB Database integration
 
 ### User Interface
 - [ ] Web dashboard
