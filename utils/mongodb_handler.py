@@ -11,36 +11,27 @@ class MongoDBHandler:
         self.db = self.client[database_name]
         self.logger = logging.getLogger('MongoDB')
         
-        # Add new collections to initialization
-        collections = {
+        # Update collections structure with new indexes
+        self.collections = {
             'trades': [
+                IndexModel([('trade_id', ASCENDING)], unique=True),
                 IndexModel([('symbol', ASCENDING)]),
                 IndexModel([('status', ASCENDING)]),
-                IndexModel([('exchange', ASCENDING)]),
-                IndexModel([('created_at', DESCENDING)])
+                IndexModel([('created_at', DESCENDING)]),
+                IndexModel([('exchange', ASCENDING)])
             ],
             'orders': [
+                IndexModel([('order_id', ASCENDING)], unique=True),
+                IndexModel([('trade_id', ASCENDING)]),
                 IndexModel([('symbol', ASCENDING)]),
                 IndexModel([('status', ASCENDING)]),
-                IndexModel([('order_id', ASCENDING)], unique=True)
+                IndexModel([('created_at', DESCENDING)])
             ],
             'symbols': [
                 IndexModel([('symbol', ASCENDING)], unique=True),
                 IndexModel([('exchange', ASCENDING)])
             ],
-            'positions': [
-                IndexModel([('symbol', ASCENDING)]),
-                IndexModel([('exchange', ASCENDING)])
-            ],
-            'settings': [
-                IndexModel([('exchange', ASCENDING)]),
-                IndexModel([('key', ASCENDING)], unique=True)
-            ],
-            'invalid_symbols': [
-                IndexModel([('symbol', ASCENDING)], unique=True),  # New collection
-                IndexModel([('added_at', DESCENDING)])
-            ],
-            'system_settings': [  # For storing various system settings
+            'system_settings': [
                 IndexModel([('key', ASCENDING)], unique=True)
             ]
         }
@@ -88,44 +79,14 @@ class MongoDBHandler:
         # ...apply to other methods...
 
     async def initialize(self):
-        """Initialize database collections and indexes"""
+        """Initialize database with new structure"""
         try:
-            # Create collections if they don't exist
-            collections = {
-                'trades': [
-                    IndexModel([('symbol', ASCENDING)]),
-                    IndexModel([('status', ASCENDING)]),
-                    IndexModel([('exchange', ASCENDING)]),
-                    IndexModel([('created_at', DESCENDING)])
-                ],
-                'orders': [
-                    IndexModel([('symbol', ASCENDING)]),
-                    IndexModel([('status', ASCENDING)]),
-                    IndexModel([('order_id', ASCENDING)], unique=True)
-                ],
-                'symbols': [
-                    IndexModel([('symbol', ASCENDING)], unique=True),
-                    IndexModel([('exchange', ASCENDING)])
-                ],
-                'positions': [
-                    IndexModel([('symbol', ASCENDING)]),
-                    IndexModel([('exchange', ASCENDING)])
-                ],
-                'settings': [
-                    IndexModel([('exchange', ASCENDING)]),
-                    IndexModel([('key', ASCENDING)], unique=True)
-                ],
-                'invalid_symbols': [
-                    IndexModel([('symbol', ASCENDING)], unique=True),  # New collection
-                    IndexModel([('added_at', DESCENDING)])
-                ],
-                'system_settings': [  # For storing various system settings
-                    IndexModel([('key', ASCENDING)], unique=True)
-                ]
-            }
-
             # Create indexes for each collection
-            for collection_name, indexes in collections.items():
+            for collection_name, indexes in self.collections.items():
+                # Create collection if it doesn't exist
+                if collection_name not in await self.db.list_collection_names():
+                    await self.db.create_collection(collection_name)
+                # Create or update indexes
                 await self.db[collection_name].create_indexes(indexes)
 
             self.logger.info("Database initialized successfully")
@@ -136,12 +97,21 @@ class MongoDBHandler:
             return False
 
     async def save_trade(self, trade_data: Dict):
-        """Save trade with proper exchange and environment tags"""
+        """Save trade with new structure"""
         try:
-            trade_data['created_at'] = datetime.now(timezone.utc)
-            trade_data['updated_at'] = datetime.now(timezone.utc)
+            trade_doc = {
+                'trade_id': trade_data['trade_id'],
+                'exchange': trade_data['exchange'],
+                'symbol': trade_data['symbol'],
+                'entry_price': float(trade_data['entry_price']),
+                'quantity': float(trade_data['quantity']),
+                'status': trade_data['status'],
+                'type': trade_data.get('type', 'bot'),
+                'created_at': datetime.now(timezone.utc),
+                'updated_at': datetime.now(timezone.utc)
+            }
             
-            result = await self.db.trades.insert_one(trade_data)
+            result = await self.db.trades.insert_one(trade_doc)
             return result.inserted_id
         except Exception as e:
             self.logger.error(f"Error saving trade: {e}")
@@ -199,7 +169,7 @@ class MongoDBHandler:
 
     async def get_trade_history(self, exchange: str, symbol: Optional[str] = None, 
                               limit: int = 100) -> List[Dict]:
-        """Get trade history with optional symbol filter"""
+        """Get trade history with simplified structure"""
         try:
             query = {'exchange': exchange}
             if symbol:
@@ -277,24 +247,62 @@ class MongoDBHandler:
             self.logger.error(f"Error getting portfolio summary: {e}")
             return None
 
-    async def mark_order_filled(self, order_id: str, fill_data: Dict):
-        """Mark order as filled with execution details"""
+    async def mark_order_filled(self, order_id: str, fill_data: dict):
+        """Move filled order from open_orders to trades with proper cleanup"""
         try:
-            result = await self.db.orders.update_one(
-                {'order_id': order_id},
-                {
-                    '$set': {
+            async with await self.client.start_session() as session:
+                async with session.start_transaction():
+                    # Get order from open_orders collection
+                    order = await self.db.open_orders.find_one(
+                        {'order_id': order_id},
+                        session=session
+                    )
+                    
+                    if not order:
+                        raise ValueError(f"Order {order_id} not found in open_orders")
+
+                    # Update trade record
+                    await self.db.trades.update_one(
+                        {'trade_id': order['trade_id']},
+                        {
+                            '$set': {
+                                'status': 'FILLED',
+                                'fill_price': float(fill_data['price']),
+                                'filled_quantity': float(fill_data['quantity']),
+                                'fill_time': datetime.now(timezone.utc),
+                                'fees': float(fill_data.get('fees', 0)),
+                                'fee_asset': fill_data.get('fee_asset', 'USDT'),
+                                'updated_at': datetime.now(timezone.utc)
+                            }
+                        },
+                        session=session
+                    )
+
+                    # Archive the filled order in trades collection
+                    filled_order = {
+                        **order,
                         'status': 'FILLED',
                         'fill_time': datetime.now(timezone.utc),
-                        'fill_price': fill_data['price'],
-                        'filled_quantity': fill_data['quantity'],
-                        'fees': fill_data.get('fees', 0),
-                        'fee_asset': fill_data.get('fee_asset', 'USDT'),
-                        'updated_at': datetime.now(timezone.utc)
+                        'fill_price': float(fill_data['price']),
+                        'filled_quantity': float(fill_data['quantity']),
+                        'fees': float(fill_data.get('fees', 0)),
+                        'fee_asset': fill_data.get('fee_asset', 'USDT')
                     }
-                }
-            )
-            return result.modified_count > 0
+                    await self.db.trades.update_one(
+                        {'trade_id': order['trade_id']},
+                        {'$set': {'order': filled_order}},
+                        session=session
+                    )
+                    
+                    # Remove from open_orders collection
+                    await self.db.open_orders.delete_one(
+                        {'order_id': order_id},
+                        session=session
+                    )
+
+            self.logger.info(f"Order {order_id} marked as filled and moved to trades")
+            return True
+
         except Exception as e:
             self.logger.error(f"Error marking order filled: {e}")
             return False
@@ -344,3 +352,94 @@ class MongoDBHandler:
                 self.logger.warning(f"Order not found in orders collection: {order_id}")
         except Exception as e:
             self.logger.error(f"Error moving order to trades: {e}")
+
+    async def save_order(self, order_data: Dict):
+        """Save order separately from trade"""
+        try:
+            order_doc = {
+                'order_id': order_data['order_id'],
+                'trade_id': order_data['trade_id'],
+                'symbol': order_data['symbol'],
+                'price': float(order_data['price']),
+                'quantity': float(order_data['quantity']),
+                'side': order_data['side'],
+                'type': order_data['type'],
+                'status': 'PENDING',
+                'created_at': datetime.now(timezone.utc),
+                'updated_at': datetime.now(timezone.utc)
+            }
+            
+            result = await self.db.orders.update_one(
+                {'order_id': order_data['order_id']},
+                {'$set': order_doc},
+                upsert=True
+            )
+            return True
+        except Exception as e:
+            self.logger.error(f"Error saving order: {e}")
+            return False
+
+    async def get_open_orders(self, exchange: str) -> list:
+        """Get all open orders for an exchange"""
+        try:
+            cursor = self.db.open_orders.find({
+                'exchange': exchange,
+                'status': 'PENDING'
+            })
+            return await cursor.to_list(length=None)
+        except Exception as e:
+            self.logger.error(f"Error getting open orders: {e}")
+            return []
+
+    async def update_order_status(self, order_id: str, status: str):
+        """Update order status"""
+        try:
+            result = await self.db.open_orders.update_one(
+                {'order_id': order_id},
+                {'$set': {
+                    'status': status,
+                    'updated_at': datetime.now(timezone.utc)
+                }}
+            )
+            return result.modified_count > 0
+        except Exception as e:
+            self.logger.error(f"Error updating order status: {e}")
+            return False
+
+    async def cancel_order(self, order_id: str):
+        """Mark order as cancelled and remove from open orders"""
+        try:
+            result = await self.db.open_orders.delete_one({'order_id': order_id})
+            return result.deleted_count > 0
+        except Exception as e:
+            self.logger.error(f"Error cancelling order: {e}")
+            return False
+
+    async def mark_order_cancelled(self, order_id: str):
+        """Handle cancelled order"""
+        try:
+            async with await self.client.start_session() as session:
+                async with session.start_transaction():
+                    # Get order before deletion
+                    order = await self.db.open_orders.find_one({'order_id': order_id})
+                    if not order:
+                        return False
+
+                    # Update trade status
+                    await self.db.trades.update_one(
+                        {'trade_id': order['trade_id']},
+                        {
+                            '$set': {
+                                'status': 'CANCELLED',
+                                'cancel_time': datetime.now(timezone.utc)
+                            }
+                        }
+                    )
+
+                    # Remove from open_orders
+                    await self.db.open_orders.delete_one({'order_id': order_id})
+
+            return True
+        except Exception as e:
+            self.logger.error(f"Error marking order cancelled: {e}")
+            return False

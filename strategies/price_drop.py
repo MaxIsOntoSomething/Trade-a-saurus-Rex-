@@ -1,25 +1,34 @@
 import pandas as pd
 from datetime import datetime, timezone
 import logging
+from colorama import Fore  # Add this import
 
 class PriceDropStrategy:
     def __init__(self, config):
-        """Initialize strategy with config"""
         self.logger = logging.getLogger('Strategy')
-        self.config = config
+        
+        # Get timeframe config from TRADING_SETTINGS
+        self.timeframe_config = config.get('TIMEFRAMES', {})
+        if not self.timeframe_config:
+            self.logger.warning("No timeframe config provided, using defaults")
+            self.timeframe_config = {
+                'daily': {
+                    'enabled': True,
+                    'thresholds': [0.01, 0.02, 0.03]
+                },
+                'weekly': {
+                    'enabled': True,
+                    'thresholds': [0.03, 0.06, 0.10]
+                },
+                'monthly': {
+                    'enabled': True,
+                    'thresholds': [0.05, 0.10]
+                }
+            }
+        
         self.trading_settings = config.get('TRADING_SETTINGS', {})
         self.mode = self.trading_settings.get('MODE', 'spot')
         self.leverage = config.get('FUTURES_SETTINGS', {}).get('LEVERAGE', 1) if self.mode == 'futures' else 1
-        
-        # Fix timeframe config initialization
-        self.timeframe_config = config.get('TIMEFRAMES', {})
-        if not self.timeframe_config:
-            self.logger.error("No timeframe configuration found in config")
-            self.timeframe_config = {
-                'daily': {'enabled': True, 'thresholds': [0.01, 0.02, 0.03]},
-                'weekly': {'enabled': True, 'thresholds': [0.03, 0.06, 0.10]},
-                'monthly': {'enabled': True, 'thresholds': [0.05, 0.10]}
-            }
         
         # Log the loaded configuration
         self.logger.info("Loaded timeframe configuration:")
@@ -39,24 +48,52 @@ class PriceDropStrategy:
         if self.mode == 'futures':
             self.logger.info(f"Leverage: {self.leverage}x")
 
-    def can_place_order(self, timeframe, symbol, threshold, current_time):
-        """Check if order can be placed based on timeframe restrictions"""
-        if symbol not in self.order_history[timeframe]:
-            self.order_history[timeframe][symbol] = {}
-            return True
-
-        if threshold not in self.order_history[timeframe][symbol]:
-            return True
-
-        last_order = self.order_history[timeframe][symbol][threshold]
-        wait_times = {
-            'daily': 1,
-            'weekly': 7,
-            'monthly': 30
+        # Add threshold execution tracking
+        self.threshold_executions = {
+            timeframe: {} for timeframe in ['daily', 'weekly', 'monthly']
         }
-        
-        days_diff = (current_time - last_order).days
-        return days_diff >= wait_times[timeframe]
+
+    def can_place_order(self, timeframe, symbol, threshold, current_time):
+        """Enhanced order placement check with proper threshold limits"""
+        try:
+            # Each threshold has its own independent execution limit
+            if symbol not in self.threshold_executions[timeframe]:
+                self.threshold_executions[timeframe][symbol] = {}
+            if threshold not in self.threshold_executions[timeframe][symbol]:
+                self.threshold_executions[timeframe][symbol][threshold] = []
+            
+            executions = self.threshold_executions[timeframe][symbol][threshold]
+            
+            # Clean old executions based on timeframe
+            max_age_days = {
+                'daily': 1,
+                'weekly': 7,
+                'monthly': 30
+            }[timeframe]
+            
+            cleaned_executions = [
+                t for t in executions 
+                if (current_time - t).days < max_age_days
+            ]
+            
+            # Update cleaned executions
+            self.threshold_executions[timeframe][symbol][threshold] = cleaned_executions
+            
+            # Each threshold allows 1 execution within its timeframe
+            return len(cleaned_executions) < 1
+
+        except Exception as e:
+            self.logger.error(f"Error checking order placement: {e}")
+            return False
+
+    def record_execution(self, timeframe, symbol, threshold, execution_time):
+        """Record when a threshold was executed"""
+        if symbol not in self.threshold_executions[timeframe]:
+            self.threshold_executions[timeframe][symbol] = {}
+        if threshold not in self.threshold_executions[timeframe][symbol]:
+            self.threshold_executions[timeframe][symbol][threshold] = []
+            
+        self.threshold_executions[timeframe][symbol][threshold].append(execution_time)
 
     def calculate_position_size(self, available_balance, price, risk_percentage=1.0):
         """Calculate position size based on mode and leverage"""
@@ -70,32 +107,19 @@ class PriceDropStrategy:
             return round(position_size, 8)
 
     def generate_signals(self, df, reference_prices, current_time):
-        """Generate signals with priority order"""
+        """Generate signals with proper threshold tracking"""
         signals = []
-        signal_found = False  # Track if higher priority signal found
         try:
             symbol = df['symbol'].iloc[0]
             current_price = float(df['close'].iloc[-1])
             
-            print(f"\nAnalyzing {symbol}:")
-            print(f"Current Price: {current_price}")
+            # Log full details
+            self.logger.info(f"Analyzing {symbol} @ {current_price} USDT")
             
-            # Process timeframes in strict priority order
             for timeframe in self.timeframe_priority:
-                if signal_found:
-                    break  # Skip lower priority timeframes if signal found
-                    
-                timeframe_cfg = self.timeframe_config.get(timeframe, {})
-                enabled = timeframe_cfg.get('enabled', False)
-                thresholds = timeframe_cfg.get('thresholds', [])
-                
-                print(f"\nTimeframe {timeframe}:")
-                print(f"Enabled: {enabled}")
-                print(f"Thresholds: {[t*100 for t in thresholds]}%")
-
-                if not enabled:
+                if not self.timeframe_config.get(timeframe, {}).get('enabled', False):
                     continue
-
+                    
                 ref_data = reference_prices.get(timeframe, {})
                 if not ref_data or not ref_data.get('open'):
                     continue
@@ -103,26 +127,28 @@ class PriceDropStrategy:
                 ref_price = float(ref_data['open'])
                 drop_percentage = ((ref_price - current_price) / ref_price) * 100
 
-                print(f"Reference Price: {ref_price}")
-                print(f"Current Drop: {drop_percentage:.2f}%")
+                # Only log drops that meet a threshold
+                if drop_percentage > 0:
+                    self.logger.info(
+                        f"{timeframe}: {drop_percentage:.2f}% drop from {ref_price:.8f}"
+                    )
 
-                # Check thresholds in ascending order
-                for threshold in sorted(thresholds):
+                thresholds = sorted(self.timeframe_config[timeframe].get('thresholds', []))
+                
+                for threshold in thresholds:
                     threshold_pct = threshold * 100
-                    print(f"Checking {threshold_pct}% threshold...")
                     
+                    # Skip if already executed max times
+                    if not self.can_place_order(timeframe, symbol, threshold, current_time):
+                        continue
+
                     if drop_percentage >= threshold_pct:
-                        if self.can_place_order(timeframe, symbol, threshold, current_time):
-                            print(f"✅ Signal generated: {threshold_pct}% threshold met!")
-                            signals.append((timeframe, threshold, current_price))
-                            signal_found = True  # Mark signal found to skip lower priorities
-                            break
-                        else:
-                            print(f"⏳ Signal blocked by cooldown")
-                    else:
-                        print(f"❌ Drop {drop_percentage:.2f}% not enough for {threshold_pct}% threshold")
+                        # Record execution
+                        self.record_execution(timeframe, symbol, threshold, current_time)
+                        signals.append((timeframe, threshold, current_price))
+                        return signals
 
         except Exception as e:
             self.logger.error(f"Error generating signals: {e}")
 
-        return signals[:1]  # Only return the highest priority signal
+        return signals

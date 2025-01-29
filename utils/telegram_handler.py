@@ -35,10 +35,8 @@ class TelegramHandler:
 
         self.command_queue = asyncio.Queue()  # Changed from PriorityQueue to regular Queue
         self.command_workers = 3  # Number of workers processing commands
-        self.initialized = False  # Add this flag
         self.message_processor_task = None
         self.command_workers = []  # Add this to track workers
-        self.startup_sent = False  # Add flag to track startup message
         self.command_processor_task = None  # Add this line
 
         self.logger.setLevel(logging.DEBUG)  # Set to DEBUG for more detailed logs
@@ -76,13 +74,11 @@ class TelegramHandler:
         # Add priority queue
         self.priority_queue = asyncio.PriorityQueue()
         self.normal_queue = asyncio.Queue()
-        self.emergency_stop_code = None  # Will be set randomly on startup
         self.emergency_confirmed = False
-        
-        # Generate random emergency stop code
-        self.emergency_stop_code = ''.join(random.choices('0123456789', k=6))
-        self.logger.info(f"Emergency stop code generated: {self.emergency_stop_code}")
-        self.poll_task = None  # Add this line
+
+        self.initialized = False
+        self.startup_sent = False
+        self.emergency_stop_code = None
 
     async def send_startup_notification(self):
         """Send startup notification with retries and feedback"""
@@ -106,12 +102,16 @@ class TelegramHandler:
                 await asyncio.sleep(2)
 
     async def initialize(self):
-        """Initialize Telegram bot with command registration"""
+        """Initialize Telegram bot with single startup"""
         try:
             if self.initialized:
                 return True
 
             self.logger.info("Starting Telegram initialization...")
+            
+            # Generate emergency stop code once during initialization
+            self.emergency_stop_code = ''.join(random.choices('0123456789', k=6))
+            self.logger.info(f"Emergency stop code generated: {self.emergency_stop_code}")
             
             # Register command handlers first
             self.register_handlers()
@@ -122,11 +122,12 @@ class TelegramHandler:
             # Start application
             await self.app.start()
             
-            # Start polling in background with error handling
+            # Start polling in background with proper error handling
             self.poll_task = asyncio.create_task(
                 self.app.updater.start_polling(
                     allowed_updates=Update.ALL_TYPES,
-                    drop_pending_updates=True
+                    drop_pending_updates=True,
+                    error_callback=self._polling_error_callback
                 )
             )
             
@@ -135,8 +136,18 @@ class TelegramHandler:
                 self._process_message_queue()
             )
             
-            # Send startup message
-            await self.send_startup_notification()
+            # Wait for tasks to start
+            await asyncio.sleep(1)
+            
+            # Verify tasks are running
+            if (self.poll_task.done() or 
+                self.message_processor_task.done()):
+                raise Exception("Failed to start Telegram tasks")
+            
+            # Send startup message only once
+            if not self.startup_sent:
+                await self.send_startup_notification()
+                self.startup_sent = True
             
             self.initialized = True
             self.logger.info("Telegram bot initialized successfully")
@@ -144,6 +155,8 @@ class TelegramHandler:
 
         except Exception as e:
             self.logger.error(f"Failed to initialize Telegram: {e}")
+            # Cleanup any running tasks
+            await self.shutdown()
             return False
 
     def register_handlers(self):
@@ -598,51 +611,37 @@ class TelegramHandler:
                 await asyncio.sleep(1)
 
     async def send_message(self, text, parse_mode=None, reply_markup=None, priority=False, **kwargs):
-        """Enhanced message sending with HTML escaping"""
+        """Enhanced message sending with retries"""
         if not text or not self.initialized:
             return None
 
-        # Escape HTML characters to prevent parsing errors
-        if parse_mode == 'HTML':
-            text = (text.replace('<', '&lt;')
-                      .replace('>', '&gt;')
-                      .replace('&', '&amp;'))
-
-        message_data = {
-            'text': text,
-            'chat_id': self.chat_id,
-            'parse_mode': parse_mode,
-            'reply_markup': reply_markup,
-            **kwargs
-        }
-
         try:
-            self.logger.debug(
-                "Sending Telegram message",
-                extra={
-                    'details': f"Priority: {priority}\nMessage: {text[:200]}..."
-                }
-            )
+            if parse_mode == 'HTML':
+                text = (text.replace('<', '&lt;')
+                          .replace('>', '&gt;')
+                          .replace('&', '&amp;'))
 
-            if priority:
-                await self.priority_queue.put((1, message_data))
-            else:
-                await self.normal_queue.put(message_data)
-                
-            self.logger.debug(
-                "Message queued successfully",
-                extra={
-                    'details': f"Queue size: {self.normal_queue.qsize()}"
-                }
-            )
-                
+            message_data = {
+                'chat_id': self.chat_id,
+                'text': text,
+                'parse_mode': parse_mode,
+                'reply_markup': reply_markup,
+                **kwargs
+            }
+
+            for attempt in range(3):
+                try:
+                    return await self.app.bot.send_message(**message_data)
+                except telegram.error.RetryAfter as e:
+                    await asyncio.sleep(e.retry_after)
+                except Exception as e:
+                    if attempt == 2:
+                        raise
+                    await asyncio.sleep(1)
+
         except Exception as e:
-            self.logger.error(
-                "Error queuing message",
-                extra={
-                    'details': f"Error: {str(e)}\nMessage: {text[:200]}..."
-                }
-            )
+            self.logger.error(f"Failed to send message: {e}")
+            return None
 
     async def _send_with_retry(self, text, parse_mode=None, reply_markup=None):
         """Send message with retry and proper escaping"""
@@ -1195,7 +1194,7 @@ class TelegramHandler:
         self.logger.error(f"Polling error: {error}")
         
         # Try to restart polling if it fails
-        if self.initialized and not self.poll_task.done():
+        if self.initialized and self.poll_task and self.poll_task.done():
             self.poll_task.cancel()
             self.poll_task = asyncio.create_task(
                 self.app.updater.start_polling(
@@ -1204,6 +1203,7 @@ class TelegramHandler:
                     error_callback=self._polling_error_callback
                 )
             )
+            self.logger.info("Restarted polling task")
 
     def _get_startup_message(self):
         """Generate startup message with updated commands"""
@@ -1308,4 +1308,3 @@ class TelegramHandler:
 
         except Exception as e:
             await self.send_message(f"❌ Error changing margin type: {e}")
-
