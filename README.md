@@ -96,3 +96,5 @@ MIT License
 
 
 ![Drop Analysis Daily Candles](src/img/data1.png)
+![Drop Analysis Weekly Candles](src/img/data2.png)
+![Drop Analysis Monthly Candles](src/img/data3.png)
