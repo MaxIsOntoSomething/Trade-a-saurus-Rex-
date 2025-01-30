@@ -94,5 +94,14 @@ This is a hobby project and should not be used for serious trading without thoro
 MIT License
 
 
+## TODO
+
+- Open Orders command Telegram 
+- Futures Integration
+- Weekly, Monthly Analysis
+- Weekly summary and Monthly Summary (optional)
+
+
+## Analysis
 
 ![Drop Analysis Daily Candles](src/img/data1.png)
