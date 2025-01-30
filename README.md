@@ -1,135 +1,93 @@
-# Binance Trading Bot
+```
+          ___                                      .-~. /_"-._
+        `-._~-.                                  / /_ "~o\  :Y
+              \  \                                / : \~x.  ` ')
+              ]  Y                              /  |  Y< ~-.__j
+             /   !                        _.--~T : l  l<  /.-~
+            /   /                 ____.--~ .   ` l /~\ \<|Y
+           /   /             .-~~"        /| .    ',-~\ \L|
+          /   /             /     .^   \ Y~Y \.^>/l_   "--'
+         /   Y           .-"(  .  l__  j_j l_/ /~_.-~    .
+        Y    l          /    \  )    ~~~." / `/"~ / \.__/l_
+        |     \     _.-"      ~-{__     l  :  l._Z~-.___.--~
+        |      ~---~           /   ~~"---\_  ' __[>
+        l  .                _.^   ___     _>-y~
+         \  \     .      .-~   .-~   ~>--"  /
+          \  ~---"            /     ./  _.-'
+           "-.,_____.,_  _.--~\     _.-~
+                       ~~     (   _}       
+                              `. ~(
+                                )  \
+                          /,`--'~\--'~\
+                          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                         Trade-a-saurus Rex 🦖📈
+```
 
-An automated cryptocurrency trading bot for Binance with portfolio management and analytics.
+# Trade-a-saurus Rex
+
+A personal hobby project - An automated cryptocurrency trading bot for Binance that monitors price drops across multiple timeframes.
+
+## 🦖 What is Trade-a-saurus Rex?
+
+This bot watches for significant price drops in cryptocurrencies and automatically places buy orders when opportunities arise. Think of it as a digital dinosaur hunting for trading opportunities!
 
 ## Key Features 🚀
 
-- ✨ Multi-timeframe monitoring (daily, weekly, monthly)
-- 📊 Real-time analytics and visualization
-- 💰 Dynamic price drop detection
-- 🔒 USDT reserve protection
-- 🤖 Telegram integration
-- 📈 Portfolio tracking and tax calculations (28%)
+- 🕒 Multi-timeframe monitoring (daily, weekly, monthly)
+- 📊 Real-time portfolio tracking with P/L calculations
+- 🎯 Dynamic threshold-based buying
+- 🔄 Auto-cancellation of unfilled orders
+- 🤖 Telegram integration for monitoring and control
+- 📈 Tax-adjusted profit calculations (28%)
+- 🎨 ASCII art position visualizations
+- 💰 USDT balance protection
+-Docker support
 
 ## Prerequisites
 
 - Python 3.7+
+- MongoDB
 - Binance account
-- Telegram bot (optional)
+- Telegram bot token
 
 ## Quick Start
 
-1. **Clone and setup**
-   ```sh
-   git clone https://github.com/your-username/binance-bot.git
-   cd binance-bot
-   python -m venv venv
-   source venv/bin/activate  # Windows: venv\Scripts\activate
+1. **Setup**
+   ```bash
+   git clone https://github.com/yourusername/Trade-a-saurus-Rex.git
+   cd Trade-a-saurus-Rex
    pip install -r requirements.txt
    ```
 
 2. **Configure**
-   - Copy `config_template.json` to `config.json`
-   - Add API keys and trading preferences
+   - Copy `config/config_template.json` to `config/config.json`
+   - Add your API keys and settings
 
-## Main Features
+## Telegram Commands
 
-### Trading
-- Automated multi-timeframe buying strategy
-- Limit and market order support
-- 8-hour order auto-cancellation
-- Position building and tracking
+- `/balance` - Current portfolio balance
+- `/stats` - Trading statistics
+- `/profits` - P/L analysis with tax calculations
+- `/add` - Add manual trade
+- `/pause` - Pause trading
+- `/resume` - Resume trading
+- `/thresholds` - View threshold status
 
-### Portfolio Management
-- Real-time value tracking
-- P/L calculations with tax
-- Trade history and cost basis tracking
+## Portfolio Analysis
 
-### Telegram Commands
-- `/positions` - View prices and opportunities
-- `/balance` - Show current balances
-- `/trades` - List trades with P/L
-- `/portfolio` - Portfolio overview
-- `/stats` - System information
+The bot provides detailed portfolio analysis including:
+- Entry/exit points
+- Tax-adjusted profits
+- Fee calculations
+- Multi-timeframe performance
 
-## Docker Support
+## Note on Drop Analysis
 
-```sh
-# Start
-docker-compose up -d
-
-# Stop
-docker-compose down
-```
-
-## Future Plans
-
-### API Integration
-- [x] Basic Spot Trading
-- [x] Basic Futures Trading
-- [ ] WebSocket support for real-time price updates (optional)
-- [ ] Futures-specific order types (stop-loss, take-profit)
-- [ ] OCO (One-Cancels-Other) orders
-- [ ] Trailing stops for both spot and futures
-
-### Risk Management
-- [ ] Position sizing based on account risk percentage
-- [ ] Dynamic leverage adjustment based on volatility
-- [ ] Auto-hedging in futures mode
-- [ ] Liquidation price monitoring
-- [ ] Multi-level stop losses
-
-### Trading Features
-- [ ] Grid trading support
-- [ ] DCA (Dollar Cost Averaging) strategies
-- [ ] Combined spot-futures arbitrage
-- [ ] Cross-exchange arbitrage
-- [ ] Multi-timeframe trading strategies
-
-### Market Analysis
-- [ ] Technical indicators (RSI, MACD, etc.)
-- [ ] Order book depth analysis
-- [ ] Volume profile analysis
-- [ ] Funding rate monitoring for futures
-- [ ] Sentiment analysis integration
-
-### Portfolio Management
-- [ ] Auto-rebalancing
-- [ ] Cross-margin collateral management
-- [ ] PnL tracking per strategy
-- [ ] Risk-adjusted performance metrics
-- [ ] Tax-efficient trading strategies
-
-### System Improvements
-- [ ] Multi-account support
-- [ ] API failover and load balancing
-- [ ] Enhanced error recovery
-- [ ] Performance optimization
-- [ ] Distributed system support
-- [x] MongoDB Database integration
-
-### User Interface
-- [ ] Web dashboard
-- [x] Telegram integration
-- [ ] Mobile notifications
-- [ ] Real-time performance graphs
-- [ ] Position builder interface
-- [ ] Strategy backtesting UI
-
-### Advanced Features
-- [ ] Machine learning predictions
-- [ ] Custom strategy builder
-- [ ] Social trading integration
-- [ ] API marketplace
-- [ ] Automated strategy optimization
-
-## Contact
-
-Discord: **maskiplays**
+At the bottom of this repository, you'll find historical price drop analyses for various cryptocurrencies. These analyses can help you optimize the threshold settings in your config file for better trading results.
 
 ## Disclaimer
 
-For educational purposes only. Trade at your own risk.
+This is a hobby project and should not be used for serious trading without thorough testing. Trade at your own risk!
 
 ## License
 

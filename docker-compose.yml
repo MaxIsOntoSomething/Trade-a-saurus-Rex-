@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  bot:
+    build: .
+    volumes:
+      - ./logs:/app/logs
+      - ./config:/app/config
+    environment:
+      - RUNNING_IN_DOCKER=true
+      - MONGODB_URI=mongodb://mongodb:27017
+      - MONGODB_DATABASE=tradeasaurus
+      - BINANCE_API_KEY=${BINANCE_API_KEY}
+      - BINANCE_API_SECRET=${BINANCE_API_SECRET}
+      - BINANCE_TESTNET=${BINANCE_TESTNET:-true}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_ALLOWED_USERS=${TELEGRAM_ALLOWED_USERS}
+      - TRADING_BASE_CURRENCY=${TRADING_BASE_CURRENCY:-USDT}
+      - TRADING_ORDER_AMOUNT=${TRADING_ORDER_AMOUNT:-100}
+      - TRADING_CANCEL_HOURS=${TRADING_CANCEL_HOURS:-8}
+      - TRADING_PAIRS=${TRADING_PAIRS:-BTCUSDT,ETHUSDT}
+      - TRADING_THRESHOLDS_DAILY=${TRADING_THRESHOLDS_DAILY:-1,2,5}
+      - TRADING_THRESHOLDS_WEEKLY=${TRADING_THRESHOLDS_WEEKLY:-5,10,15}
+      - TRADING_THRESHOLDS_MONTHLY=${TRADING_THRESHOLDS_MONTHLY:-10,20,30}
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    restart: unless-stopped
+
+  mongodb:
+    image: mongo:latest
+    volumes:
+      - mongodb_data:/data/db
+    ports:
+      - "27017:27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  mongodb_data:
