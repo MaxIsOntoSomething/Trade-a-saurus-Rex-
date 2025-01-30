@@ -83,7 +83,7 @@ The bot provides detailed portfolio analysis including:
 
 ## Note on Drop Analysis
 
-At the bottom of this repository, you'll find historical price drop analyses for various cryptocurrencies. These analyses can help you optimize the threshold settings in your config file for better trading results.
+At the bottom of this repository, you'll find historical price drop analyses for BTC. These analyses can help you optimize the threshold settings in your config file for better trading results.
 
 ## Disclaimer
 
@@ -94,6 +94,15 @@ This is a hobby project and should not be used for serious trading without thoro
 MIT License
 
 
+## TODO
+
+- Open Orders command Telegram 
+- Futures Integration
+- Weekly, Monthly Analysis
+- Weekly summary and Monthly Summary (optional)
+
+
+## Analysis
 
 ![Drop Analysis Daily Candles](src/img/data1.png)
 ![Drop Analysis Weekly Candles](src/img/data2.png)
