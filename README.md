@@ -92,3 +92,7 @@ This is a hobby project and should not be used for serious trading without thoro
 ## License
 
 MIT License
+
+
+
+![Drop Analysis Daily Candles](src/img/data1.png)
