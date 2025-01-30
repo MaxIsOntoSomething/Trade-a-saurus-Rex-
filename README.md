@@ -98,7 +98,6 @@ MIT License
 
 - Open Orders command Telegram 
 - Futures Integration
-- Weekly, Monthly Analysis
 - Weekly summary and Monthly Summary (optional)
 
 
