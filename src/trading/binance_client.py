@@ -4,8 +4,8 @@ from decimal import Decimal
 from datetime import datetime, timedelta
 import asyncio
 import logging
-from typing import Dict, List, Optional, Tuple  # Add Tuple for return type hints
-from ..types.models import Order, OrderStatus, TimeFrame
+from typing import Dict, List, Optional, Tuple
+from ..types.models import Order, OrderStatus, TimeFrame, OrderType  # Add OrderType
 from ..utils.rate_limiter import RateLimiter
 from ..types.constants import PRECISION, MIN_NOTIONAL, TIMEFRAME_INTERVALS, TRADING_FEES
 
@@ -31,6 +31,11 @@ class BinanceClient:
             TimeFrame.MONTHLY: None
         }
         logger.setLevel(logging.DEBUG)  # Add this line
+        self.telegram_bot = None  # Add this line
+        
+    def set_telegram_bot(self, bot):
+        """Set telegram bot for notifications"""
+        self.telegram_bot = bot
         
     async def initialize(self):
         self.client = await AsyncClient.create(
@@ -59,15 +64,32 @@ class BinanceClient:
         if now - self.last_reset[timeframe] >= interval:
             # Reset reference prices and triggered thresholds for this timeframe
             logger.info(f"Resetting {timeframe.value} thresholds")
-            for symbol in self.reference_prices:
-                self.reference_prices[symbol][timeframe] = None
-                # Clear duplicates from triggered thresholds
+            
+            # Prepare reset notification
+            message_parts = [f"🔄 {timeframe.value.title()} Reset"]
+            
+            # Get opening prices for all symbols
+            for symbol in self.reference_prices.keys():
+                ref_price = await self.get_reference_price(symbol, timeframe)
+                if ref_price:
+                    message_parts.append(f"{symbol}: ${ref_price:,.2f}")
+                self.reference_prices[symbol][timeframe] = ref_price
+                
+                # Clear triggered thresholds
                 if symbol in self.triggered_thresholds:
                     unique_thresholds = list(dict.fromkeys(
                         self.triggered_thresholds[symbol][timeframe]
                     ))
                     self.triggered_thresholds[symbol][timeframe] = unique_thresholds
+                    
             self.last_reset[timeframe] = now
+            
+            # Send notification if telegram bot is available
+            if self.telegram_bot:
+                await self.telegram_bot.send_timeframe_reset_notification(
+                    timeframe,
+                    "\n".join(message_parts)
+                )
             
     async def get_reference_timestamp(self, timeframe: TimeFrame) -> int:
         """Get the reference timestamp for a timeframe"""
@@ -136,7 +158,7 @@ class BinanceClient:
         """Update reference prices for all timeframes"""
         try:
             for symbol in symbols:
-                if symbol not in self.reference_prices:
+                if (symbol not in self.reference_prices):
                     self.reference_prices[symbol] = {}
                     self.triggered_thresholds[symbol] = {tf: [] for tf in TimeFrame}
 
@@ -271,8 +293,10 @@ class BinanceClient:
         return adjusted_qty
 
     async def place_limit_buy_order(self, symbol: str, amount: float, 
-                                  threshold: float, timeframe: TimeFrame, 
+                                  threshold: Optional[float] = None,
+                                  timeframe: Optional[TimeFrame] = None,
                                   is_manual: bool = False) -> Order:
+        """Place a limit buy order. For manual trades, threshold and timeframe are optional."""
         await self.rate_limiter.acquire()
         
         try:
@@ -304,41 +328,51 @@ class BinanceClient:
                 raise ValueError(f"Order value below minimum notional: {min_notional} USDT")
             
             # Only update triggered thresholds if it's not a manual trade
-            # And only do it here, not when order is filled
-            if not is_manual and symbol in self.triggered_thresholds:
-                # Check if threshold isn't already marked
+            if not is_manual and threshold and symbol in self.triggered_thresholds and timeframe:
                 if threshold not in self.triggered_thresholds[symbol][timeframe]:
                     self.triggered_thresholds[symbol][timeframe].append(threshold)
             
-            # Place order
-            order = await self.client.create_order(
-                symbol=symbol,
-                side='BUY',
-                type='LIMIT',
-                timeInForce='GTC',
-                quantity=float(quantity),
-                price=float(price)
-            )
+            # Generate unique order ID
+            order_id = str(int(datetime.utcnow().timestamp() * 1000))
             
-            return Order(
+            if not is_manual:
+                # Place order on Binance
+                order_response = await self.client.create_order(
+                    symbol=symbol,
+                    side='BUY',
+                    type='LIMIT',
+                    timeInForce='GTC',
+                    quantity=float(quantity),
+                    price=float(price)
+                )
+                order_id = str(order_response['orderId'])
+            
+            # Create order object with all required fields
+            order = Order(
                 symbol=symbol,
-                status=OrderStatus.PENDING,
+                status=OrderStatus.PENDING if not is_manual else OrderStatus.FILLED,
+                order_type=OrderType.SPOT,
                 price=price,
                 quantity=quantity,
-                threshold=threshold,
-                timeframe=timeframe,
-                order_id=str(order['orderId']),  # Convert to string
+                timeframe=timeframe or TimeFrame.DAILY,
+                order_id=order_id,
                 created_at=datetime.utcnow(),
                 updated_at=datetime.utcnow(),
-                is_manual=is_manual,
+                filled_at=datetime.utcnow() if is_manual else None,
                 fees=fees,
-                fee_asset=fee_asset
+                fee_asset=fee_asset,
+                threshold=threshold  # This is now handled by the Order class
             )
+            
+            return order
             
         except BinanceAPIException as e:
             logger.error(f"Failed to place order: {e}")
             raise
-            
+        except Exception as e:
+            logger.error(f"Error placing order: {str(e)}")
+            raise
+
     async def cancel_order(self, symbol: str, order_id: str) -> bool:
         """Cancel an order"""
         try:
@@ -367,7 +401,7 @@ class BinanceClient:
         try:
             account = await self.client.get_account()
             for balance in account['balances']:
-                if balance['asset'] == symbol:
+                if (balance['asset'] == symbol):
                     return Decimal(balance['free'])
             return Decimal('0')
         except BinanceAPIException as e:

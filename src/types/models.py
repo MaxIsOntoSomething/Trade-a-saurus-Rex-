@@ -14,19 +14,30 @@ class OrderStatus(Enum):
     FILLED = "filled"
     CANCELLED = "cancelled"
 
+class OrderType(Enum):
+    SPOT = "spot"
+    FUTURES = "futures"
+
+class TradeDirection(Enum):
+    LONG = "long"
+    SHORT = "short"
+
 @dataclass
 class Order:
     symbol: str
     status: OrderStatus
+    order_type: OrderType
     price: Decimal
     quantity: Decimal
-    threshold: float
     timeframe: TimeFrame
     order_id: str
     created_at: datetime
     updated_at: datetime
+    leverage: Optional[int] = None
+    direction: Optional[TradeDirection] = None
     filled_at: Optional[datetime] = None
     cancelled_at: Optional[datetime] = None
-    is_manual: bool = False  # Add this field with default False
-    fees: Decimal = Decimal('0')  # Add fees field
-    fee_asset: str = 'USDT'  # Add fee asset field
+    fees: Decimal = Decimal('0')
+    fee_asset: str = 'USDT'
+    threshold: Optional[float] = None  # Add optional threshold field
+    is_manual: bool = False  # Add this field

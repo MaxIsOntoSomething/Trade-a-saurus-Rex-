@@ -8,8 +8,8 @@ from telegram.ext import (
 from datetime import datetime, timedelta
 import logging
 from decimal import Decimal  # Add this import
-from typing import List, Optional
-from ..types.models import Order, OrderStatus, TimeFrame
+from typing import List, Optional, Dict  # Add Dict import
+from ..types.models import Order, OrderStatus, TimeFrame, OrderType, TradeDirection  # Update imports
 from ..trading.binance_client import BinanceClient
 from ..database.mongo_client import MongoClient
 
@@ -40,7 +40,13 @@ DINO_ASCII = r'''
                          Trade-a-saurus Rex 🦖📈'''
 
 # Add states for conversation handler
-SYMBOL, AMOUNT, TIMEFRAME, THRESHOLD = range(4)
+SYMBOL, ORDER_TYPE, LEVERAGE, DIRECTION, AMOUNT, PRICE, FEES = range(7)
+
+class VisualizationType:
+    DAILY_VOLUME = "daily_volume"
+    PROFIT_DIST = "profit_distribution"
+    ORDER_TYPES = "order_types"
+    HOURLY_ACTIVITY = "hourly_activity"
 
 class TelegramBot:
     def __init__(self, token: str, allowed_users: List[int], 
@@ -60,7 +66,7 @@ class TelegramBot:
         self.keyboard = [
             [KeyboardButton("/balance"), KeyboardButton("/stats"), KeyboardButton("/profits")],
             [KeyboardButton("/pause"), KeyboardButton("/resume"), KeyboardButton("/add")],
-            [KeyboardButton("/history"), KeyboardButton("/thresholds"), KeyboardButton("/menu")]
+            [KeyboardButton("/history"), KeyboardButton("/viz"), KeyboardButton("/menu")]
         ]
         self.markup = ReplyKeyboardMarkup(self.keyboard, resize_keyboard=True)
         self.startup_message = f"""
@@ -73,6 +79,7 @@ Use /menu to see available commands.
 
 Status: Ready to ROAR! 🦖
 """
+        self.binance_client.set_telegram_bot(self)  # Add this line
 
     async def initialize(self):
         """Initialize the Telegram bot"""
@@ -83,9 +90,12 @@ Status: Ready to ROAR! 🦖
             entry_points=[CommandHandler("add", self.add_trade_start)],
             states={
                 SYMBOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_trade_symbol)],
+                ORDER_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_trade_order_type)],
+                LEVERAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_trade_leverage)],
+                DIRECTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_trade_direction)],
                 AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_trade_amount)],
-                TIMEFRAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_trade_timeframe)],
-                THRESHOLD: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_trade_threshold)],
+                PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_trade_fees)],
+                FEES: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_trade_final)]
             },
             fallbacks=[CommandHandler("cancel", self.add_trade_cancel)],
         )
@@ -102,6 +112,10 @@ Status: Ready to ROAR! 🦖
         self.app.add_handler(CommandHandler("stats", self.get_stats))
         self.app.add_handler(CommandHandler("history", self.get_order_history))
         self.app.add_handler(CommandHandler("profits", self.show_profits))
+        
+        # Add visualization command
+        self.app.add_handler(CommandHandler("viz", self.show_viz_menu))
+        self.app.add_handler(CallbackQueryHandler(self.handle_viz_selection, pattern="^(daily_volume|profit_distribution|order_types|hourly_activity)$"))
         
         await self.app.initialize()
         await self.app.start()
@@ -285,6 +299,7 @@ Menu:
         # Calculate total value in USDT
         total_value = order.price * order.quantity
         
+        # Fix the format specifier
         message = (
             f"{emoji[status]} Order Update\n"
             f"Order ID: {order.order_id}\n"
@@ -292,9 +307,9 @@ Menu:
             f"Status: {status.value.upper()}\n"
             f"Amount: {float(order.quantity):.8f} {order.symbol.replace('USDT', '')}\n"
             f"Price: ${float(order.price):.2f}\n"
-            f"Total: ${float(total_value):.2f} USDT\n"
-            f"Threshold: {order.threshold}%\n"
-            f"Timeframe: {order.timeframe.value}"
+            f"Total: ${float(total_value):.2f} USDT\n"  # Fixed format specifier
+            f"Threshold: {order.threshold if order.threshold else 'Manual'}\n"
+            f"Timeframe: {self._get_timeframe_value(order.timeframe)}"
         )
 
         if status == OrderStatus.FILLED:
@@ -331,7 +346,7 @@ Menu:
             f"Order {order.order_id} filled!\n"
             f"Symbol: {order.symbol}\n"
             f"Amount: {float(order.quantity):.8f}\n"
-            f"Price: ${float(order.price):.2f}\n"
+            f"Price: ${float(order.price):.2f}\n"  # Fixed double colon here
             f"Check /profits to see your updated portfolio."
         )
         
@@ -360,6 +375,7 @@ Trading Information:
 /stats - View trading statistics
 /history - View recent order history
 /thresholds - Show threshold status and resets
+/viz - Show data visualizations 📊
 
 Trading Actions:
 /add - Add a manual trade (interactive)
@@ -432,21 +448,73 @@ Menu:
         self.temp_trade_data[update.effective_user.id] = {}
         
         pairs = self.config['trading']['pairs']
+        keyboard = [[KeyboardButton(pair)] for pair in pairs]
+        markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True)
+        
         await update.message.reply_text(
-            f"Enter the trading pair symbol:\n"
-            f"Available pairs: {', '.join(pairs)}"
+            "What trading pair did you trade?",
+            reply_markup=markup
         )
         return SYMBOL
 
-    async def add_trade_symbol(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle symbol input"""
-        symbol = update.message.text.upper()
-        if symbol not in self.config['trading']['pairs']:
-            await update.message.reply_text(f"Invalid symbol. Please choose from: {', '.join(self.config['trading']['pairs'])}")
-            return SYMBOL
+    async def add_trade_order_type(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle order type input (SPOT/FUTURES)"""
+        try:
+            order_type = update.message.text.upper()
+            if order_type not in ["SPOT", "FUTURES"]:
+                await update.message.reply_text("Please select either SPOT or FUTURES")
+                return ORDER_TYPE
+                
+            user_data = self.temp_trade_data[update.effective_user.id]
+            user_data['order_type'] = OrderType(order_type.lower())
             
-        self.temp_trade_data[update.effective_user.id]['symbol'] = symbol
-        await update.message.reply_text(f"Enter the amount in {self.config['trading']['base_currency']}:")
+            if order_type == "FUTURES":
+                await update.message.reply_text("Enter leverage (e.g., 5, 10, 20):")
+                return LEVERAGE
+            else:
+                await update.message.reply_text("Enter amount in USDT (e.g., 100.50):")
+                return AMOUNT
+                
+        except Exception as e:
+            await update.message.reply_text(f"Error: {str(e)}")
+            return ORDER_TYPE
+
+    async def add_trade_leverage(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle leverage input for futures trades"""
+        try:
+            leverage = int(update.message.text)
+            if leverage <= 0:
+                raise ValueError("Leverage must be positive")
+                
+            self.temp_trade_data[update.effective_user.id]['leverage'] = leverage
+            
+            keyboard = [
+                [KeyboardButton("LONG")],
+                [KeyboardButton("SHORT")]
+            ]
+            markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True)
+            
+            await update.message.reply_text(
+                "Was this a long or short trade?",
+                reply_markup=markup
+            )
+            return DIRECTION
+            
+        except ValueError as e:
+            await update.message.reply_text("Please enter a valid leverage number")
+            return LEVERAGE
+
+    async def add_trade_direction(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle trade direction for futures"""
+        direction = update.message.text.upper()
+        if direction not in ["LONG", "SHORT"]:
+            await update.message.reply_text("Please select either LONG or SHORT")
+            return DIRECTION
+            
+        user_data = self.temp_trade_data[update.effective_user.id]
+        user_data['direction'] = TradeDirection(direction.lower())
+        
+        await update.message.reply_text("Enter amount in USDT (e.g., 100.50):")
         return AMOUNT
 
     async def add_trade_amount(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -457,101 +525,105 @@ Menu:
                 raise ValueError("Amount must be positive")
                 
             user_data = self.temp_trade_data[update.effective_user.id]
-            symbol = user_data['symbol']
+            user_data['amount'] = Decimal(str(amount))
             
-            # Get current price for amount calculation
-            ticker = await self.binance_client.client.get_symbol_ticker(symbol=symbol)
-            price = Decimal(ticker['price'])
-            quantity = Decimal(str(amount)) / price
-            
-            # Calculate fees
-            fees, fee_asset = await self.binance_client.calculate_fees(symbol, price, quantity)
-            
-            # Store values for order placement
-            user_data.update({
-                'amount': amount,
-                'price': price,
-                'quantity': quantity,
-                'fees': fees,
-                'fee_asset': fee_asset
-            })
-            
-            # Show order preview
-            await update.message.reply_text(
-                f"Order Preview:\n"
-                f"Symbol: {symbol}\n"
-                f"Amount: ${amount:,.2f} USDT\n"
-                f"Price: ${float(price):,.2f}\n"
-                f"Quantity: {float(quantity):,.8f}\n"
-                f"Fees: ${float(fees):,.2f} {fee_asset}\n"
-                f"\nEnter timeframe:"
-            )
-            return TIMEFRAME
+            await update.message.reply_text("Enter entry price (e.g., 42000.50):")
+            return PRICE
             
         except ValueError as e:
             await update.message.reply_text(f"Error: {str(e)}")
             return AMOUNT
 
-    async def add_trade_timeframe(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle timeframe input"""
-        timeframe = update.message.text.lower()
+    async def add_trade_fees(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle amount and ask for fees"""
         try:
-            tf = TimeFrame(timeframe)
-            self.temp_trade_data[update.effective_user.id]['timeframe'] = tf
+            price = Decimal(update.message.text)
+            if price <= 0:
+                raise ValueError("Price must be positive")
+                
+            user_data = self.temp_trade_data[update.effective_user.id]
+            user_data['price'] = price
             
-            thresholds = self.config['trading']['thresholds'][timeframe]
-            await update.message.reply_text(
-                f"Enter the threshold percentage:\n"
-                f"Available thresholds: {thresholds}"
-            )
-            return THRESHOLD
-        except ValueError:
-            await update.message.reply_text(f"Invalid timeframe. Choose from: {[tf.value for tf in TimeFrame]}")
-            return TIMEFRAME
+            await update.message.reply_text("Enter the trading fees in USDT (e.g., 0.25):")
+            return FEES
+            
+        except ValueError as e:
+            await update.message.reply_text(f"Please enter a valid price: {str(e)}")
+            return PRICE
 
-    async def add_trade_threshold(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle threshold input and create the trade"""
+    async def add_trade_final(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Complete trade creation with fees"""
         try:
-            threshold = float(update.message.text)
+            fees = Decimal(update.message.text)
+            if fees < 0:
+                raise ValueError("Fees cannot be negative")
+                
             user_data = self.temp_trade_data[update.effective_user.id]
             
-            # Create and place the order with is_manual=True
-            order = await self.binance_client.place_limit_buy_order(
+            # Generate unique order ID
+            order_id = f"MANUAL_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+            
+            # Create order object
+            order = Order(
                 symbol=user_data['symbol'],
-                amount=user_data['amount'],
-                threshold=threshold,
-                timeframe=user_data['timeframe'],
-                is_manual=True  # Add this parameter
+                status=OrderStatus.FILLED,  # Manual trades are always filled
+                order_type=user_data['order_type'],
+                price=user_data['price'],
+                quantity=user_data['amount'] / user_data['price'],
+                timeframe=TimeFrame.DAILY,  # Default to daily for manual trades
+                order_id=order_id,
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow(),
+                filled_at=datetime.utcnow(),
+                leverage=user_data.get('leverage'),
+                direction=user_data.get('direction'),
+                fees=fees,
+                fee_asset='USDT'
             )
             
             # Save to database
-            await self.mongo_client.insert_order(order)
+            await self.mongo_client.insert_manual_trade(order)
             
             # Send confirmation
+            direction_info = f"\nDirection: {order.direction.value}" if order.direction else ""
+            leverage_info = f"\nLeverage: {order.leverage}x" if order.leverage else ""
+            
             await update.message.reply_text(
-                f"✅ Manual trade created:\n"
+                f"✅ Manual trade added:\n"
                 f"Symbol: {order.symbol}\n"
-                f"Amount: {order.quantity}\n"
-                f"Timeframe: {order.timeframe.value}\n"
-                f"Threshold: {order.threshold}%"
+                f"Type: {order.order_type.value}"
+                f"{direction_info}"
+                f"{leverage_info}\n"
+                f"Amount: {float(order.quantity):.8f}\n"
+                f"Price: ${float(order.price):.2f}\n"
+                f"Fees: ${float(order.fees):.2f}\n"
+                f"Total Value: ${float(order.price * order.quantity):.2f}",  # Fixed double colon here
+                reply_markup=self.markup  # Restore original keyboard
             )
             
             # Cleanup
             del self.temp_trade_data[update.effective_user.id]
             return ConversationHandler.END
             
-        except ValueError:
-            await update.message.reply_text("Please enter a valid threshold percentage")
-            return THRESHOLD
+        except ValueError as e:
+            await update.message.reply_text(f"Please enter valid fees: {str(e)}")
+            return FEES
         except Exception as e:
-            await update.message.reply_text(f"❌ Error creating trade: {str(e)}")
+            logger.error(f"Error creating manual trade: {e}")
+            await update.message.reply_text(
+                f"❌ Error creating trade: {str(e)}",
+                reply_markup=self.markup  # Restore original keyboard even on error
+            )
             return ConversationHandler.END
 
     async def add_trade_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Cancel the trade addition process"""
         if update.effective_user.id in self.temp_trade_data:
             del self.temp_trade_data[update.effective_user.id]
-        await update.message.reply_text("Trade creation cancelled")
+        await update.message.reply_text(
+            "Trade creation cancelled",
+            reply_markup=self.markup  # Restore original keyboard
+        )
         return ConversationHandler.END
 
     async def show_profits(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -654,3 +726,276 @@ Menu:
         except Exception as e:
             logger.error(f"Error calculating profits: {e}", exc_info=True)
             await update.message.reply_text(f"❌ Error calculating profits: {str(e)}")
+
+    def _get_timeframe_value(self, timeframe) -> str:
+        """Safely get timeframe value, handling both enum and string cases"""
+        if hasattr(timeframe, 'value'):
+            return timeframe.value
+        return str(timeframe)
+
+    async def add_trade_symbol(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle symbol input"""
+        if not self._is_authorized(update.effective_user.id):
+            await update.message.reply_text("⛔ Unauthorized access")
+            return ConversationHandler.END
+
+        symbol = update.message.text.upper()
+        if symbol not in self.config['trading']['pairs']:
+            await update.message.reply_text(f"Invalid symbol. Please choose from: {', '.join(self.config['trading']['pairs'])}")
+            return SYMBOL
+            
+        self.temp_trade_data[update.effective_user.id] = {'symbol': symbol}
+        
+        keyboard = [
+            [KeyboardButton("SPOT")],
+            [KeyboardButton("FUTURES")]
+        ]
+        markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True)
+        
+        await update.message.reply_text(
+            "What type of trade is this?",
+            reply_markup=markup
+        )
+        return ORDER_TYPE
+
+    async def add_trade_price(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle price input"""
+        try:
+            direction = update.message.text.upper()
+            user_data = self.temp_trade_data[update.effective_user.id]
+            
+            if user_data.get('order_type') == OrderType.FUTURES:
+                user_data['direction'] = TradeDirection(direction.lower())
+            
+            await update.message.reply_text(
+                "What was your entry price? (e.g., 42000.50)"
+            )
+            return PRICE
+            
+        except ValueError:
+            await update.message.reply_text("Please enter a valid direction (LONG/SHORT)")
+            return DIRECTION
+
+    async def add_trade_fees(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle fees input and create the trade"""
+        try:
+            price = Decimal(update.message.text)
+            if price <= 0:
+                raise ValueError("Price must be positive")
+                
+            user_data = self.temp_trade_data[update.effective_user.id]
+            user_data['price'] = price
+            
+            await update.message.reply_text(
+                "What were the trading fees? (in USDT, e.g., 0.25)"
+            )
+            return FEES
+            
+        except ValueError as e:
+            await update.message.reply_text(f"Please enter a valid price: {str(e)}")
+            return PRICE
+
+    async def add_trade_final(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Complete trade creation with fees"""
+        try:
+            fees = Decimal(update.message.text)
+            if fees < 0:
+                raise ValueError("Fees cannot be negative")
+                
+            user_data = self.temp_trade_data[update.effective_user.id]
+            
+            # Generate unique order ID
+            order_id = f"MANUAL_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+            
+            # Create order object
+            order = Order(
+                symbol=user_data['symbol'],
+                status=OrderStatus.FILLED,
+                order_type=user_data['order_type'],
+                price=user_data['price'],
+                quantity=user_data['amount'] / user_data['price'],
+                timeframe=TimeFrame.DAILY,  # Default to daily for manual trades
+                order_id=order_id,
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow(),
+                filled_at=datetime.utcnow(),
+                leverage=user_data.get('leverage'),
+                direction=user_data.get('direction'),
+                fees=fees,
+                fee_asset='USDT'
+            )
+            
+            # Save to database using manual trade method
+            if await self.mongo_client.insert_manual_trade(order):
+                direction_info = f"\nDirection: {order.direction.value}" if order.direction else ""
+                leverage_info = f"\nLeverage: {order.leverage}x" if order.leverage else ""
+                
+                await update.message.reply_text(
+                    f"✅ Manual trade added:\n"
+                    f"Symbol: {order.symbol}\n"
+                    f"Type: {order.order_type.value}"
+                    f"{direction_info}"
+                    f"{leverage_info}\n"
+                    f"Amount: {float(order.quantity):.8f}\n"
+                    f"Price: ${float(order.price):.2f}\n"
+                    f"Fees: ${float(order.fees):.2f}\n"
+                    f"Total Value: ${float(order.price * order.quantity):.2f}",  # Fixed double colon here
+                    reply_markup=self.markup  # Restore original keyboard
+                )
+            else:
+                await update.message.reply_text("❌ Failed to save trade")
+            
+            # Cleanup
+            del self.temp_trade_data[update.effective_user.id]
+            return ConversationHandler.END
+            
+        except ValueError as e:
+            await update.message.reply_text(f"Please enter valid fees: {str(e)}")
+            return FEES
+        except Exception as e:
+            logger.error(f"Error creating manual trade: {e}")
+            await update.message.reply_text(
+                f"❌ Error creating trade: {str(e)}",
+                reply_markup=self.markup  # Restore original keyboard even on error
+            )
+            return ConversationHandler.END
+
+    async def add_trade_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Cancel the trade addition process"""
+        if update.effective_user.id in self.temp_trade_data:
+            del self.temp_trade_data[update.effective_user.id]
+        await update.message.reply_text(
+            "Trade creation cancelled",
+            reply_markup=self.markup  # Restore original keyboard
+        )
+        return ConversationHandler.END
+
+    async def show_viz_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show data visualization options"""
+        if not self._is_authorized(update.effective_user.id):
+            await update.message.reply_text("⛔ Unauthorized access")
+            return
+
+        keyboard = [
+            [InlineKeyboardButton("📊 Daily Volume", callback_data=VisualizationType.DAILY_VOLUME)],
+            [InlineKeyboardButton("💰 Profit Distribution", callback_data=VisualizationType.PROFIT_DIST)],
+            [InlineKeyboardButton("📈 Order Types", callback_data=VisualizationType.ORDER_TYPES)],
+            [InlineKeyboardButton("⏰ Hourly Activity", callback_data=VisualizationType.HOURLY_ACTIVITY)]
+        ]
+        
+        await update.message.reply_text(
+            "📊 Select Data Visualization:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    async def handle_viz_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle visualization selection"""
+        query = update.callback_query
+        await query.answer()
+        
+        viz_type = query.data
+        data = await self.mongo_client.get_visualization_data(viz_type)
+        
+        if not data:
+            await query.message.reply_text(
+                "No data available for visualization.",
+                reply_markup=self.markup
+            )
+            return
+
+        # Generate visualization based on type
+        if viz_type == VisualizationType.DAILY_VOLUME:
+            response = await self._generate_volume_viz(data)
+        elif viz_type == VisualizationType.PROFIT_DIST:
+            response = await self._generate_profit_viz(data)
+        elif viz_type == VisualizationType.ORDER_TYPES:
+            response = await self._generate_types_viz(data)
+        elif viz_type == VisualizationType.HOURLY_ACTIVITY:
+            response = await self._generate_activity_viz(data)
+        else:
+            response = "Invalid visualization type"
+
+        # Send visualization and restore keyboard
+        await query.message.reply_text(response, reply_markup=self.markup)
+
+    async def _generate_volume_viz(self, data: List[Dict]) -> str:
+        """Generate volume visualization"""
+        response = ["📊 Daily Trading Volume\n"]
+        
+        for entry in data:
+            date = entry['_id']['date']
+            volume = float(entry['volume'])
+            count = entry['count']
+            bar = "█" * min(int(volume/100), 20)  # Scale bar to max 20 chars
+            response.append(f"{date}: ${volume:,.2f} ({count} trades)\n{bar}")
+            
+        return "\n".join(response)
+
+    async def _generate_profit_viz(self, data: List[Dict]) -> str:
+        """Generate profit distribution visualization"""
+        response = ["💰 Profit Distribution\n"]
+        
+        total_profit = sum(float(d['total_profit']) for d in data)
+        for entry in data:
+            symbol = entry['_id']
+            profit = float(entry['total_profit'])
+            percentage = (profit / total_profit * 100) if total_profit > 0 else 0
+            bar = "█" * int(percentage / 5)  # 1 block per 5%
+            response.append(f"{symbol}: {percentage:.1f}%\n{bar}")
+            
+        return "\n".join(response)
+
+    async def _generate_types_viz(self, data: List[Dict]) -> str:
+        """Generate order types visualization"""
+        response = ["📈 Order Types Distribution\n"]
+        
+        total = sum(d['count'] for d in data)
+        for entry in data:
+            type_name = f"{entry['_id']['type']} ({entry['_id']['status']})"
+            count = entry['count']
+            percentage = (count / total * 100) if total > 0 else 0
+            bar = "█" * int(percentage / 5)
+            response.append(f"{type_name}: {percentage:.1f}%\n{bar}")
+            
+        return "\n".join(response)
+
+    async def _generate_activity_viz(self, data: List[Dict]) -> str:
+        """Generate hourly activity visualization"""
+        response = ["⏰ Hourly Trading Activity\n"]
+        
+        max_count = max(d['count'] for d in data)
+        for entry in data:
+            hour = entry['_id']['hour']
+            count = entry['count']
+            status = entry['_id']['status']
+            bar = "█" * int((count / max_count) * 20)  # Scale to 20 chars max
+            response.append(f"{hour:02d}:00 {status}: {count}\n{bar}")
+            
+        return "\n".join(response)
+
+    async def send_timeframe_reset_notification(self, timeframe: TimeFrame, message: str):
+        """Send notification when a timeframe resets"""
+        emoji_map = {
+            TimeFrame.DAILY: "📅",
+            TimeFrame.WEEKLY: "📆",
+            TimeFrame.MONTHLY: "📊"
+        }
+        
+        formatted_message = (
+            f"{emoji_map.get(timeframe, '🔄')} Timeframe Reset\n\n"
+            f"{message}\n\n"
+            f"All {timeframe.value} thresholds have been reset."
+        )
+        
+        for user_id in self.allowed_users:
+            try:
+                await self.app.bot.send_message(
+                    chat_id=user_id,
+                    text=formatted_message,
+                    reply_markup=self.markup
+                )
+            except Exception as e:
+                logger.error(f"Failed to send reset notification to {user_id}: {e}")
+
+    # ...rest of existing code...
+
