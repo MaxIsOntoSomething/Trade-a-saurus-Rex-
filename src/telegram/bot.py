@@ -80,6 +80,7 @@ Use /menu to see available commands.
 Status: Ready to ROAR! 🦖
 """
         self.binance_client.set_telegram_bot(self)  # Add this line
+        self.sent_roars = set()  # Add this to track sent roar notifications
 
     async def initialize(self):
         """Initialize the Telegram bot"""
@@ -313,6 +314,11 @@ Menu:
             logger.error("Telegram bot not initialized")
             return
 
+        # Skip filled notification if we already sent a roar for this order
+        if status == OrderStatus.FILLED and order.order_id in self.sent_roars:
+            logger.debug(f"Skipping filled notification for {order.order_id} - ROAR already sent")
+            return
+
         status = status or order.status
         emoji = {
             OrderStatus.PENDING: "🔵",
@@ -420,25 +426,55 @@ Menu:
             logger.error(f"Failed to generate trade chart: {e}")
 
     async def send_roar(self, order: Order):
-        """Send a dinosaur roar notification with trade summary and chart"""
-        message = (
-            f"🦖 ROARRR! Trade Complete! 💥\n"
-            f"Order {order.order_id} filled!\n"
-            f"Symbol: {order.symbol}\n"
-            f"Amount: {float(order.quantity):.8f}\n"
-            f"Price: ${float(order.price):.2f}\n"
-            f"Check /profits to see your updated portfolio."
-        )
+        """Send a dinosaur roar notification with trade summary in chart"""
+        # Add order ID to sent roars set
+        self.sent_roars.add(order.order_id)
         
-        # Send text notification
-        for user_id in self.allowed_users:
-            try:
-                await self.app.bot.send_message(chat_id=user_id, text=message)
-            except Exception as e:
-                logger.error(f"Failed to send roar to {user_id}: {e}")
-        
-        # Send chart
-        await self.send_trade_chart(order)
+        # Send chart with full information
+        try:
+            ref_price = self.binance_client.reference_prices.get(
+                order.symbol, {}
+            ).get(order.timeframe)
+            
+            if ref_price is not None:
+                ref_price = Decimal(str(ref_price))
+            
+            chart_data = await self.binance_client.generate_trade_chart(order)
+            if not chart_data:
+                logger.error("Failed to generate chart data")
+                return
+                
+            # Create detailed caption
+            caption = (
+                f"🦖 ROARRR! Trade Complete! 💥\n\n"
+                f"Order ID: {order.order_id}\n"
+                f"Symbol: {order.symbol}\n"
+                f"Amount: {float(order.quantity):.8f} {order.symbol.replace('USDT', '')}\n"
+                f"Price: ${float(order.price):.2f}\n"
+                f"Total: ${float(order.price * order.quantity):.2f} USDT\n"
+                f"Fees: ${float(order.fees):.4f} {order.fee_asset}\n"
+                f"Threshold: {order.threshold if order.threshold else 'Manual'}\n"
+                f"Timeframe: {self._get_timeframe_value(order.timeframe)}\n\n"
+                f"Check /profits to see your updated portfolio."
+            )
+            
+            # Send single message with chart and all info
+            for user_id in self.allowed_users:
+                try:
+                    await self.app.bot.send_photo(
+                        chat_id=user_id,
+                        photo=chart_data,
+                        caption=caption
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to send roar to {user_id}: {e}")
+                    
+            # Cleanup old roar notifications periodically
+            if len(self.sent_roars) > 1000:
+                self.sent_roars.clear()
+                
+        except Exception as e:
+            logger.error(f"Failed to send roar: {e}")
 
     async def show_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show all available commands with descriptions"""
@@ -936,7 +972,7 @@ Menu:
                     f"Amount: {float(order.quantity):.8f}\n"
                     f"Price: ${float(order.price):.2f}\n"
                     f"Fees: ${float(order.fees):.2f}\n"
-                    f"Total Value: ${float(order.price * order.quantity)::.2f}",  # Fixed double colon here
+                    f"Total Value: ${float(order.price * order.quantity):.2f}",  # Fixed double colon here
                     reply_markup=self.markup  # Restore original keyboard
                 )
             else:
@@ -1054,7 +1090,7 @@ Menu:
             bar = "█" * int(percentage / 5)
             response.append(f"{type_name}: {percentage:.1f}%\n{bar}")
             
-        return "\n".join(response)
+        return "\n".join(response)  # Fixed string joining syntax
 
     async def _generate_activity_viz(self, data: List[Dict]) -> str:
         """Generate hourly activity visualization"""
@@ -1145,7 +1181,7 @@ Menu:
         """Send alert when initial balance is below reserve"""
         message = (
             "⚠️ WARNING - Insufficient Initial Balance\n\n"
-            f"Current Balance: ${float(current_balance):.2f}\n"
+            f"Current Balance: ${float(current_balance)::.2f}\n"
             f"Required Reserve: ${reserve_balance:.2f}\n\n"
             "Trading is paused until balance is above reserve requirement.\n"
             "You can:\n"

@@ -205,7 +205,7 @@ class OrderManager:
                             await self.telegram_bot.send_balance_update(
                                 order.symbol, balance_change
                             )
-                        # Send ROAR! notification with order details
+                        # Send only ROAR notification for filled orders
                         await self.telegram_bot.send_roar(order)
                         
                     elif status == OrderStatus.CANCELLED:
@@ -213,8 +213,9 @@ class OrderManager:
                         await self.mongo_client.update_order_status(
                             order.order_id, status, cancelled_at=order.cancelled_at
                         )
-                    await self.telegram_bot.send_order_notification(order)
-            
+                        # Send notification only for cancelled orders
+                        await self.telegram_bot.send_order_notification(order)
+
             # Add delay after order checks if there were orders
             await asyncio.sleep(3)
             os.system(self.clear_command)
