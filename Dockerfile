@@ -1,18 +1,22 @@
-FROM python:3.10-slim
+FROM python:3.11-slim
+
+# Install build dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    gcc \
+    python3-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Install dependencies
+# Install Python dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -U pip && \
+    pip install --no-cache-dir -r requirements.txt
 
-# Copy source code
-COPY src/ ./src/
-COPY main.py .
-COPY config/ ./config/
+# Copy application code
+COPY . .
 
-# Set environment variables
-ENV PYTHONUNBUFFERED=1
 ENV RUNNING_IN_DOCKER=true
 
 CMD ["python", "main.py"]

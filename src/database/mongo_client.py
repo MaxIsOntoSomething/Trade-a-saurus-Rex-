@@ -388,10 +388,16 @@ class MongoClient:
                             "date": {"$dateToString": {"format": "%Y-%m-%d", "date": "$created_at"}},
                             "symbol": "$symbol"
                         },
-                        "volume": {"$sum": {"$multiply": [
-                            {"$toDecimal": "$price"},
-                            {"$toDecimal": "$quantity"}
-                        ]}},
+                        "volume": {
+                            "$sum": {
+                                "$toDouble": {  # Convert to double before multiplication
+                                    "$multiply": [
+                                        {"$toDouble": "$price"},  # Convert price to double
+                                        {"$toDouble": "$quantity"}  # Convert quantity to double
+                                    ]
+                                }
+                            }
+                        },
                         "count": {"$sum": 1}
                     }},
                     {"$sort": {"_id.date": 1}}
@@ -402,8 +408,12 @@ class MongoClient:
                     {"$match": {"status": OrderStatus.FILLED.value}},
                     {"$group": {
                         "_id": "$symbol",
-                        "total_profit": {"$sum": "$profit"},
-                        "avg_profit": {"$avg": "$profit"},
+                        "total_profit": {
+                            "$sum": {"$toDouble": "$profit"}  # Convert profit to double
+                        },
+                        "avg_profit": {
+                            "$avg": {"$toDouble": "$profit"}  # Convert profit to double
+                        },
                         "count": {"$sum": 1}
                     }}
                 ]
@@ -437,9 +447,18 @@ class MongoClient:
 
             results = []
             async for doc in self.orders.aggregate(pipeline):
+                # Convert all numeric values to float
+                if 'volume' in doc:
+                    doc['volume'] = float(doc['volume'])
+                if 'total_profit' in doc:
+                    doc['total_profit'] = float(doc['total_profit'])
+                if 'avg_profit' in doc:
+                    doc['avg_profit'] = float(doc['avg_profit'])
                 results.append(doc)
             return results
 
         except Exception as e:
             logger.error(f"Error getting visualization data: {e}")
             return []
+
+    # ...rest of existing code...

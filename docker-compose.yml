@@ -1,11 +1,10 @@
-version: '3.8'
-
 services:
   bot:
     build: .
+    container_name: tradeasaurus
+    env_file: .env
     volumes:
       - ./logs:/app/logs
-      - ./config:/app/config
     environment:
       - RUNNING_IN_DOCKER=true
       - MONGODB_URI=mongodb://mongodb:27017
@@ -22,13 +21,14 @@ services:
       - TRADING_THRESHOLDS_DAILY=${TRADING_THRESHOLDS_DAILY:-1,2,5}
       - TRADING_THRESHOLDS_WEEKLY=${TRADING_THRESHOLDS_WEEKLY:-5,10,15}
       - TRADING_THRESHOLDS_MONTHLY=${TRADING_THRESHOLDS_MONTHLY:-10,20,30}
+      - TRADING_RESERVE_BALANCE=${TRADING_RESERVE_BALANCE:-500}
     depends_on:
-      mongodb:
-        condition: service_healthy
+      - mongodb
     restart: unless-stopped
 
   mongodb:
     image: mongo:latest
+    container_name: tradeasaurus-mongo
     volumes:
       - mongodb_data:/data/db
     ports:

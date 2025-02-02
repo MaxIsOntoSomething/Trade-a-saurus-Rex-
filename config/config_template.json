@@ -20,8 +20,9 @@
         "thresholds": {
             "daily": [1, 2, 5],
             "weekly": [5, 10, 15],
-            "monthly": [10, 20, 30]
-        }
+            "monthly": [] // Empty array means no monthly threshold remove comment for code to work
+        },
+        "reserve_balance": 500  
     }
 }
 

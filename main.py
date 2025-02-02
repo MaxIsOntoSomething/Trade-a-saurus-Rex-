@@ -19,10 +19,8 @@ from src.telegram.bot import TelegramBot, DINO_ASCII
 from src.trading.order_manager import OrderManager
 from src.utils.logger import setup_logging
 
-# Setup logging first
-setup_logging()
-
-# Get logger for main
+# Setup logging first and get config logger
+config_logger = setup_logging()
 logger = logging.getLogger(__name__)
 
 def validate_config(config: dict) -> bool:
@@ -49,6 +47,14 @@ def validate_config(config: dict) -> bool:
 
 def load_config_from_env() -> dict:
     """Load configuration from environment variables"""
+    # Load reserve balance first to ensure it exists
+    try:
+        reserve_balance = float(os.getenv('TRADING_RESERVE_BALANCE'))
+        logger.info(f"Loaded reserve balance from ENV: ${reserve_balance:,.2f}")
+    except (TypeError, ValueError):
+        reserve_balance = 500  # Default value
+        logger.warning(f"Using default reserve balance: ${reserve_balance:,.2f}")
+
     return {
         'binance': {
             'api_key': os.getenv('BINANCE_API_KEY'),
@@ -68,6 +74,7 @@ def load_config_from_env() -> dict:
             'order_amount': float(os.getenv('TRADING_ORDER_AMOUNT', '100')),
             'cancel_after_hours': int(os.getenv('TRADING_CANCEL_HOURS', '8')),
             'pairs': os.getenv('TRADING_PAIRS', 'BTCUSDT,ETHUSDT').split(','),
+            'reserve_balance': reserve_balance,  # Use loaded or default value
             'thresholds': {
                 'daily': [float(x) for x in os.getenv('TRADING_THRESHOLDS_DAILY', '1,2,5').split(',')],
                 'weekly': [float(x) for x in os.getenv('TRADING_THRESHOLDS_WEEKLY', '5,10,15').split(',')],
@@ -76,17 +83,39 @@ def load_config_from_env() -> dict:
         }
     }
 
-def load_config_from_file(file_path: str) -> dict:
-    """Load configuration from a JSON file"""
-    # Look for config file in the config directory
-    config_dir = Path('config')
-    config_path = config_dir / file_path
-    
-    if not config_path.exists():
-        raise FileNotFoundError(f"Config file not found at: {config_path}")
+def load_and_merge_config() -> dict:
+    """Load and merge configuration from appropriate sources"""
+    try:
+        in_docker = os.getenv('RUNNING_IN_DOCKER', '').lower() == 'true'
+        config_logger.log_config(f"Running in Docker: {in_docker}")
         
-    with open(config_path, 'r') as file:
-        return json.load(file)
+        config = {}
+        config_path = Path('config/config.json')
+        if not in_docker and config_path.exists():
+            config_logger.log_config("Loading configuration from config.json")
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+        else:
+            config_logger.log_config("Loading configuration from environment variables")
+            load_dotenv()
+            config = load_config_from_env()
+        
+        if not validate_config(config):
+            raise ValueError("Invalid configuration")
+            
+        # Log final configuration
+        config_logger.log_config(
+            f"Active Configuration:\n"
+            f"Base Currency: {config['trading']['base_currency']}\n"
+            f"Reserve Balance: ${config['trading']['reserve_balance']:,.2f}\n"
+            f"Trading Pairs: {', '.join(config['trading']['pairs'])}"
+        )
+        
+        return config
+        
+    except Exception as e:
+        logger.error(f"Error loading configuration: {e}")
+        raise
 
 async def check_initial_connection(binance_client: BinanceClient, config: dict) -> bool:
     """Check initial connection and get prices for all configured pairs"""
@@ -112,27 +141,23 @@ async def check_initial_connection(binance_client: BinanceClient, config: dict) 
         return False
 
 async def main():
+    """Main function with improved config loading"""
     print(DINO_ASCII)
-    logger.info("=" * 50)
     logger.info("Starting Trade-a-saurus Rex...")
-    logger.info("=" * 50)
     
     try:
-        # Check if running in Docker
-        if os.getenv('RUNNING_IN_DOCKER'):
-            logger.info("Running in Docker environment, using environment variables...")
-            load_dotenv()  # Will load from environment variables
-            config = load_config_from_env()
-        else:
-            # Try to load config from file first
-            try:
-                config = load_config_from_file('config.json')
-            except FileNotFoundError as e:
-                logger.warning(f"Config file error: {e}")
-                logger.info("Falling back to environment variables...")
-                load_dotenv()
-                config = load_config_from_env()
-    
+        # Load configuration from appropriate source
+        config = load_and_merge_config()
+        
+        # Debug log the configuration
+        logger.info("=" * 50)
+        logger.info("[CONFIG] Active Configuration:")
+        logger.info(f"[CONFIG] Base Currency: {config['trading']['base_currency']}")
+        logger.info(f"[CONFIG] Reserve Balance: ${config['trading']['reserve_balance']:,.2f}")
+        logger.info(f"[CONFIG] Trading Pairs: {', '.join(config['trading']['pairs'])}")
+        logger.info(f"[CONFIG] Order Amount: ${config['trading']['order_amount']:,.2f}")
+        logger.info("=" * 50)
+
         if not validate_config(config):
             logger.error("Invalid configuration, exiting...")
             return

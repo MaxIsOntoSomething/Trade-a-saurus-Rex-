@@ -65,7 +65,7 @@ class TelegramBot:
         self.temp_trade_data = {}
         self.keyboard = [
             [KeyboardButton("/balance"), KeyboardButton("/stats"), KeyboardButton("/profits")],
-            [KeyboardButton("/pause"), KeyboardButton("/resume"), KeyboardButton("/add")],
+            [KeyboardButton("/trading"), KeyboardButton("/add"), KeyboardButton("/thresholds")],
             [KeyboardButton("/history"), KeyboardButton("/viz"), KeyboardButton("/menu")]
         ]
         self.markup = ReplyKeyboardMarkup(self.keyboard, resize_keyboard=True)
@@ -106,8 +106,7 @@ Status: Ready to ROAR! 🦖
         
         # Register command handlers
         self.app.add_handler(CommandHandler("start", self.start_command))
-        self.app.add_handler(CommandHandler("pause", self.pause_trading))
-        self.app.add_handler(CommandHandler("resume", self.resume_trading))
+        self.app.add_handler(CommandHandler("trading", self.toggle_trading))
         self.app.add_handler(CommandHandler("balance", self.get_balance))
         self.app.add_handler(CommandHandler("stats", self.get_stats))
         self.app.add_handler(CommandHandler("history", self.get_order_history))
@@ -172,8 +171,7 @@ Status: Ready to ROAR! 🦖
 Available commands:
 
 Trading Controls:
-/pause - Pause all trading operations
-/resume - Resume trading operations
+/trading - Toggle trading on/off
 
 Trading Information:
 /balance - Check current balance
@@ -197,23 +195,49 @@ Menu:
         """Check if user is authorized"""
         return user_id in self.allowed_users
 
-    async def pause_trading(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Pause trading operations"""
+    async def toggle_trading(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Toggle trading state between paused and active"""
         if not self._is_authorized(update.effective_user.id):
             await update.message.reply_text("⛔ Unauthorized access")
             return
             
-        self.is_paused = True
-        await update.message.reply_text("⏸ Trading paused")
-
-    async def resume_trading(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Resume trading operations"""
-        if not self._is_authorized(update.effective_user.id):
-            await update.message.reply_text("⛔ Unauthorized access")
-            return
+        # Check reserve balance before resuming
+        if not self.is_paused:
+            current_balance = await self.binance_client.get_balance('USDT')
+            if float(current_balance) < self.binance_client.reserve_balance:
+                await update.message.reply_text(
+                    "❌ Cannot resume trading: Balance below reserve requirement\n"
+                    f"Current: ${float(current_balance):.2f}\n"
+                    f"Required: ${self.binance_client.reserve_balance:.2f}"
+                )
+                return
+                
+        # Toggle state
+        self.is_paused = not self.is_paused
+        
+        # Create keyboard with current state
+        status_keyboard = ReplyKeyboardMarkup(
+            [
+                [KeyboardButton("/balance"), KeyboardButton("/stats"), KeyboardButton("/profits")],
+                [KeyboardButton("/trading"), KeyboardButton("/add"), KeyboardButton("/thresholds")],
+                [KeyboardButton("/history"), KeyboardButton("/viz"), KeyboardButton("/menu")]
+            ],
+            resize_keyboard=True
+        )
+        
+        if self.is_paused:
+            message = "⏸ Trading paused"
+            emoji = "▶️"
+            action = "Resume"
+        else:
+            message = "▶️ Trading resumed"
+            emoji = "⏸"
+            action = "Pause"
             
-        self.is_paused = False
-        await update.message.reply_text("▶️ Trading resumed")
+        await update.message.reply_text(
+            f"{message}\nUse /trading to {action} {emoji}",
+            reply_markup=status_keyboard
+        )
 
     async def get_balance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Get current balance"""
@@ -339,22 +363,82 @@ Menu:
             except Exception as e:
                 logger.error(f"Failed to send balance update to {user_id}: {e}")
 
+    async def send_trade_chart(self, order: Order):
+        """Send trade chart to users"""
+        try:
+            # Get reference price and convert to Decimal
+            ref_price = self.binance_client.reference_prices.get(
+                order.symbol, {}
+            ).get(order.timeframe)
+            
+            if ref_price is not None:
+                ref_price = Decimal(str(ref_price))
+            
+            chart_data = await self.binance_client.generate_trade_chart(order)
+            if not chart_data:
+                logger.error("Failed to generate chart data")
+                # Send text-only notification as fallback
+                for user_id in self.allowed_users:
+                    try:
+                        await self.app.bot.send_message(
+                            chat_id=user_id,
+                            text=self.binance_client.chart_generator.format_info_text(
+                                order,
+                                ref_price
+                            )
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to send fallback message to {user_id}: {e}")
+                return
+                
+            # Attempt to send chart with caption
+            for user_id in self.allowed_users:
+                try:
+                    await self.app.bot.send_photo(
+                        chat_id=user_id,
+                        photo=chart_data,
+                        caption=self.binance_client.chart_generator.format_info_text(
+                            order,
+                            ref_price
+                        )
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to send chart to {user_id}: {e}")
+                    # Try sending text-only notification as fallback
+                    try:
+                        await self.app.bot.send_message(
+                            chat_id=user_id,
+                            text=self.binance_client.chart_generator.format_info_text(
+                                order,
+                                ref_price
+                            )
+                        )
+                    except Exception as e2:
+                        logger.error(f"Failed to send fallback message to {user_id}: {e2}")
+                    
+        except Exception as e:
+            logger.error(f"Failed to generate trade chart: {e}")
+
     async def send_roar(self, order: Order):
-        """Send a dinosaur roar notification with trade summary"""
+        """Send a dinosaur roar notification with trade summary and chart"""
         message = (
             f"🦖 ROARRR! Trade Complete! 💥\n"
             f"Order {order.order_id} filled!\n"
             f"Symbol: {order.symbol}\n"
             f"Amount: {float(order.quantity):.8f}\n"
-            f"Price: ${float(order.price):.2f}\n"  # Fixed double colon here
+            f"Price: ${float(order.price):.2f}\n"
             f"Check /profits to see your updated portfolio."
         )
         
+        # Send text notification
         for user_id in self.allowed_users:
             try:
                 await self.app.bot.send_message(chat_id=user_id, text=message)
             except Exception as e:
                 logger.error(f"Failed to send roar to {user_id}: {e}")
+        
+        # Send chart
+        await self.send_trade_chart(order)
 
     async def show_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show all available commands with descriptions"""
@@ -367,8 +451,7 @@ Menu:
 
 Trading Controls:
 /start - Start the bot and show welcome message
-/pause - Pause all trading operations
-/resume - Resume trading operations
+/trading - Toggle trading on/off
 
 Trading Information:
 /balance - Check current balance
@@ -412,31 +495,45 @@ Menu:
                 hours, remainder = divmod(time_until_reset.total_seconds(), 3600)
                 minutes, _ = divmod(remainder, 60)
                 
-                # Get triggered and available thresholds
-                threshold_info = {}
+                # Format timeframe header
+                timeframe_msg = [f"\n🕒 {timeframe.value.title()}"]
+                timeframe_msg.append(f"Reset in: {int(hours)}h {int(minutes)}m")
+                
+                # Process each symbol
                 for symbol in self.config['trading']['pairs']:
+                    # Get current and reference prices
+                    ref_price = self.binance_client.reference_prices.get(symbol, {}).get(timeframe)
+                    
+                    # Get current price
+                    ticker = await self.binance_client.client.get_symbol_ticker(symbol=symbol)
+                    current_price = float(ticker['price'])
+                    
+                    # Calculate price change if reference price exists
+                    if ref_price:
+                        price_change = ((current_price - ref_price) / ref_price) * 100
+                        price_info = f"Open: ${ref_price:,.2f} | Current: ${current_price:,.2f} ({price_change:+.2f}%)"
+                    else:
+                        price_info = f"Current: ${current_price:,.2f}"
+                    
+                    # Get threshold information
                     triggered = self.binance_client.triggered_thresholds.get(symbol, {}).get(timeframe, [])
                     available = [t for t in self.config['trading']['thresholds'][timeframe.value] 
                                if t not in triggered]
-                    threshold_info[symbol] = {
-                        'triggered': triggered,
-                        'available': available
-                    }
+                    
+                    # Format symbol section
+                    timeframe_msg.extend([
+                        f"\n{symbol}:",
+                        price_info,
+                        f"✅ Triggered: {triggered}",
+                        f"⏳ Available: {available}"
+                    ])
                 
-                # Format timeframe message
-                timeframe_msg = f"\n🕒 {timeframe.value.title()}\n"
-                timeframe_msg += f"Reset in: {int(hours)}h {int(minutes)}m\n"
-                
-                for symbol, info in threshold_info.items():
-                    timeframe_msg += f"\n{symbol}:\n"
-                    timeframe_msg += f"✅ Triggered: {info['triggered']}\n"
-                    timeframe_msg += f"⏳ Available: {info['available']}\n"
-                
-                message_parts.append(timeframe_msg)
+                message_parts.append("\n".join(timeframe_msg))
             
             await update.message.reply_text("📊 Threshold Status:\n" + "\n".join(message_parts))
             
         except Exception as e:
+            logger.error(f"Error getting thresholds: {e}", exc_info=True)
             await update.message.reply_text(f"❌ Error getting thresholds: {str(e)}")
 
     async def add_trade_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -714,7 +811,7 @@ Menu:
             if portfolio_stats["total_tax"] > 0:
                 net_profit = portfolio_stats["total_profit"] - portfolio_stats["total_tax"]
                 summary.extend([
-                    f"Total Tax: ${portfolio_stats['total_tax']:.2f}",
+                    f"Total Tax: ${portfolio_stats["total_tax"]:.2f}",
                     f"Net P/L: ${net_profit:.2f}"
                 ])
 
@@ -839,7 +936,7 @@ Menu:
                     f"Amount: {float(order.quantity):.8f}\n"
                     f"Price: ${float(order.price):.2f}\n"
                     f"Fees: ${float(order.fees):.2f}\n"
-                    f"Total Value: ${float(order.price * order.quantity):.2f}",  # Fixed double colon here
+                    f"Total Value: ${float(order.price * order.quantity)::.2f}",  # Fixed double colon here
                     reply_markup=self.markup  # Restore original keyboard
                 )
             else:
@@ -996,6 +1093,76 @@ Menu:
                 )
             except Exception as e:
                 logger.error(f"Failed to send reset notification to {user_id}: {e}")
+
+    async def send_threshold_notification(self, symbol: str, timeframe: TimeFrame, 
+                                       threshold: float, current_price: float,
+                                       reference_price: float, price_change: float):
+        """Send notification when a threshold is triggered"""
+        message = (
+            f"🎯 Threshold Triggered!\n\n"
+            f"Symbol: {symbol}\n"
+            f"Timeframe: {timeframe.value}\n"
+            f"Threshold: {threshold}%\n"
+            f"Reference Price: ${reference_price:,.2f}\n"
+            f"Current Price: ${current_price:,.2f}\n"
+            f"Change: {price_change:+.2f}%"
+        )
+        
+        for user_id in self.allowed_users:
+            try:
+                await self.app.bot.send_message(
+                    chat_id=user_id,
+                    text=message,
+                    reply_markup=self.markup
+                )
+            except Exception as e:
+                logger.error(f"Failed to send threshold notification to {user_id}: {e}")
+
+    async def send_reserve_alert(self, current_balance: Decimal, reserve_balance: float, pending_value: Decimal):
+        """Send alert when reserve balance would be violated"""
+        available_balance = float(current_balance - pending_value)
+        message = (
+            "⚠️ Trading Paused - Reserve Balance Protection\n\n"
+            f"Current Balance: ${float(current_balance):.2f}\n"
+            f"Pending Orders: ${float(pending_value):.2f}\n"
+            f"Available Balance: ${available_balance:.2f}\n"
+            f"Reserve Balance: ${reserve_balance:.2f}\n\n"
+            "Trading will resume automatically on next timeframe reset\n"
+            "when balance is above reserve requirement."
+        )
+        
+        for user_id in self.allowed_users:
+            try:
+                await self.app.bot.send_message(
+                    chat_id=user_id,
+                    text=message,
+                    reply_markup=self.markup
+                )
+            except Exception as e:
+                logger.error(f"Failed to send reserve alert to {user_id}: {e}")
+
+    async def send_initial_balance_alert(self, current_balance: Decimal, reserve_balance: float):
+        """Send alert when initial balance is below reserve"""
+        message = (
+            "⚠️ WARNING - Insufficient Initial Balance\n\n"
+            f"Current Balance: ${float(current_balance):.2f}\n"
+            f"Required Reserve: ${reserve_balance:.2f}\n\n"
+            "Trading is paused until balance is above reserve requirement.\n"
+            "You can:\n"
+            "1. Add more funds\n"
+            "2. Lower reserve balance in config\n"
+            "3. Use /trading to check balance and resume"
+        )
+        
+        for user_id in self.allowed_users:
+            try:
+                await self.app.bot.send_message(
+                    chat_id=user_id,
+                    text=message,
+                    reply_markup=self.markup
+                )
+            except Exception as e:
+                logger.error(f"Failed to send initial balance alert to {user_id}: {e}")
 
     # ...rest of existing code...
 
