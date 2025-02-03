@@ -47,15 +47,22 @@ def validate_config(config: dict) -> bool:
 
 def load_config_from_env() -> dict:
     """Load configuration from environment variables"""
-    # Load reserve balance first to ensure it exists
+    # Load reserve balance with proper parsing
     try:
-        reserve_balance = float(os.getenv('TRADING_RESERVE_BALANCE'))
-        logger.info(f"Loaded reserve balance from ENV: ${reserve_balance:,.2f}")
-    except (TypeError, ValueError):
-        reserve_balance = 500  # Default value
-        logger.warning(f"Using default reserve balance: ${reserve_balance:,.2f}")
+        reserve_balance = os.getenv('TRADING_RESERVE_BALANCE')
+        if reserve_balance:
+            # Handle scientific notation and large numbers
+            reserve_balance = float(reserve_balance.replace(',', ''))
+            logger.info(f"[CONFIG] Loaded reserve balance from ENV: ${reserve_balance:,.2f}")
+        else:
+            reserve_balance = 500  # Default value
+            logger.warning(f"[CONFIG] Using default reserve balance: ${reserve_balance:,.2f}")
+    except (TypeError, ValueError) as e:
+        logger.error(f"[CONFIG] Error parsing reserve balance: {e}")
+        reserve_balance = 500  # Fallback to default
 
-    return {
+    # Rest of the config loading
+    config = {
         'binance': {
             'api_key': os.getenv('BINANCE_API_KEY'),
             'api_secret': os.getenv('BINANCE_API_SECRET'),
@@ -74,14 +81,15 @@ def load_config_from_env() -> dict:
             'order_amount': float(os.getenv('TRADING_ORDER_AMOUNT', '100')),
             'cancel_after_hours': int(os.getenv('TRADING_CANCEL_HOURS', '8')),
             'pairs': os.getenv('TRADING_PAIRS', 'BTCUSDT,ETHUSDT').split(','),
-            'reserve_balance': reserve_balance,  # Use loaded or default value
+            'reserve_balance': reserve_balance,  # Use parsed reserve balance
             'thresholds': {
-                'daily': [float(x) for x in os.getenv('TRADING_THRESHOLDS_DAILY', '1,2,5').split(',')],
-                'weekly': [float(x) for x in os.getenv('TRADING_THRESHOLDS_WEEKLY', '5,10,15').split(',')],
-                'monthly': [float(x) for x in os.getenv('TRADING_THRESHOLDS_MONTHLY', '10,20,30').split(',')]
+                'daily': [float(x) for x in os.getenv('TRADING_THRESHOLDS_DAILY', '1,2,5').split(',') if x],
+                'weekly': [float(x) for x in os.getenv('TRADING_THRESHOLDS_WEEKLY', '5,10,15').split(',') if x],
+                'monthly': [float(x) for x in os.getenv('TRADING_THRESHOLDS_MONTHLY', '10,20,30').split(',') if x]
             }
         }
     }
+    return config
 
 def load_and_merge_config() -> dict:
     """Load and merge configuration from appropriate sources"""

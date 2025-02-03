@@ -81,6 +81,11 @@ class BinanceClient:
             api_secret=self.api_secret,
             testnet=self.testnet
         )
+
+        # Log initial configuration
+        logger.info(f"[INIT] Base Currency: {self.base_currency}")
+        logger.info(f"[INIT] Reserve Balance: ${self.reserve_balance:,.2f}" if self.reserve_balance else "[INIT] No reserve balance set")
+
         # Get exchange info for precision
         exchange_info = await self.client.get_exchange_info()
         for symbol in exchange_info['symbols']:
@@ -96,6 +101,7 @@ class BinanceClient:
             self.base_currency = self.telegram_bot.config['trading']['base_currency']
             logger.info(f"[CRITICAL] Reserve balance set to: ${self.reserve_balance:,.2f} {self.base_currency}")
         else:
+            self.reserve_balance = 0  # Set default value instead of None
             logger.warning("[CRITICAL] No config found for reserve balance!")
             
             # Add initial balance check
@@ -365,18 +371,16 @@ class BinanceClient:
     async def check_reserve_balance(self, order_amount: float) -> bool:
         """Check if placing an order would violate reserve balance"""
         try:
-            # Add debug logging for reserve balance check
             logger.info("[RESERVE CHECK] Starting reserve balance check...")
             
-            if self.reserve_balance is None:
-                logger.warning("[RESERVE CHECK] No reserve balance set!")
+            if self.reserve_balance is None or self.reserve_balance <= 0:
+                logger.warning("[RESERVE CHECK] No valid reserve balance set!")
                 return True
-
-            logger.info(f"[RESERVE CHECK] Reserve balance set to: ${float(self.reserve_balance):,.2f}")
 
             # Get current balance in base currency (USDT)
             current_balance = await self.get_balance(self.base_currency)
             logger.info(f"[RESERVE CHECK] Current balance: ${float(current_balance):,.2f}")
+            logger.info(f"[RESERVE CHECK] Reserve balance: ${float(self.reserve_balance):,.2f}")
             
             # Get sum of pending orders
             pending_orders_value = Decimal('0')
@@ -388,40 +392,15 @@ class BinanceClient:
             available_balance = float(current_balance - pending_orders_value)
             remaining_after_order = available_balance - order_amount
 
-            logger.info(f"[RESERVE CHECK] Details:")
-            logger.info(f"- Available balance: ${available_balance:,.2f}")
-            logger.info(f"- Pending orders value: ${float(pending_orders_value):,.2f}")
-            logger.info(f"- Order amount: ${order_amount:,.2f}")
-            logger.info(f"- Remaining after order: ${remaining_after_order:,.2f}")
-            logger.info(f"- Required reserve: ${float(self.reserve_balance):,.2f}")
+            logger.info(f"[RESERVE CHECK] Available after pending: ${available_balance:,.2f}")
+            logger.info(f"[RESERVE CHECK] Remaining after order: ${remaining_after_order:,.2f}")
+            logger.info(f"[RESERVE CHECK] Required reserve: ${float(self.reserve_balance):,.2f}")
 
-            if remaining_after_order < self.reserve_balance:
-                logger.warning(
-                    f"[RESERVE CHECK] Order cancelled: Would violate reserve balance\n"
-                    f"Current Balance: ${available_balance:,.2f}\n"
-                    f"Pending Orders: ${float(pending_orders_value):,.2f}\n"
-                    f"Order Amount: ${order_amount:.2f}\n"
-                    f"Remaining: ${remaining_after_order:,.2f}\n"
-                    f"Reserve: ${float(self.reserve_balance):,.2f}"
-                )
-                
-                # Pause trading if we hit reserve balance
-                if self.telegram_bot:
-                    self.telegram_bot.is_paused = True
-                    await self.telegram_bot.send_reserve_alert(
-                        current_balance=current_balance,
-                        reserve_balance=self.reserve_balance,
-                        pending_value=pending_orders_value
-                    )
-                return False
+            # Check if remaining balance would be above reserve
+            return remaining_after_order >= self.reserve_balance
 
-            logger.info("[RESERVE CHECK] Reserve balance check passed")
-            return True
-            
         except Exception as e:
-            logger.error(f"[RESERVE CHECK] Error checking reserve balance: {str(e)}")
-            logger.debug(f"Reserve balance: {self.reserve_balance}, type: {type(self.reserve_balance)}")
-            logger.debug(f"Current balance: {current_balance}, type: {type(current_balance)}")
+            logger.error(f"[RESERVE CHECK] Error checking reserve balance: {e}")
             return False
 
     async def place_limit_buy_order(self, symbol: str, amount: float, 

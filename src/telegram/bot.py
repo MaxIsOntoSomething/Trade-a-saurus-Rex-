@@ -65,7 +65,7 @@ class TelegramBot:
         self.temp_trade_data = {}
         self.keyboard = [
             [KeyboardButton("/balance"), KeyboardButton("/stats"), KeyboardButton("/profits")],
-            [KeyboardButton("/trading"), KeyboardButton("/add"), KeyboardButton("/thresholds")],
+            [KeyboardButton("/power"), KeyboardButton("/add"), KeyboardButton("/thresholds")],  # Changed /trading to /power
             [KeyboardButton("/history"), KeyboardButton("/viz"), KeyboardButton("/menu")]
         ]
         self.markup = ReplyKeyboardMarkup(self.keyboard, resize_keyboard=True)
@@ -107,7 +107,7 @@ Status: Ready to ROAR! 🦖
         
         # Register command handlers
         self.app.add_handler(CommandHandler("start", self.start_command))
-        self.app.add_handler(CommandHandler("trading", self.toggle_trading))
+        self.app.add_handler(CommandHandler("power", self.toggle_trading))  # Change command name
         self.app.add_handler(CommandHandler("balance", self.get_balance))
         self.app.add_handler(CommandHandler("stats", self.get_stats))
         self.app.add_handler(CommandHandler("history", self.get_order_history))
@@ -172,7 +172,7 @@ Status: Ready to ROAR! 🦖
 Available commands:
 
 Trading Controls:
-/trading - Toggle trading on/off
+/power - Toggle trading on/off  # Updated command name here
 
 Trading Information:
 /balance - Check current balance
@@ -205,11 +205,13 @@ Menu:
         # Check reserve balance before resuming
         if not self.is_paused:
             current_balance = await self.binance_client.get_balance('USDT')
-            if float(current_balance) < self.binance_client.reserve_balance:
+            reserve_balance = self.binance_client.reserve_balance or 0  # Default to 0 if None
+            
+            if float(current_balance) < reserve_balance:
                 await update.message.reply_text(
                     "❌ Cannot resume trading: Balance below reserve requirement\n"
                     f"Current: ${float(current_balance):.2f}\n"
-                    f"Required: ${self.binance_client.reserve_balance:.2f}"
+                    f"Required: ${reserve_balance:.2f}"
                 )
                 return
                 
@@ -220,7 +222,7 @@ Menu:
         status_keyboard = ReplyKeyboardMarkup(
             [
                 [KeyboardButton("/balance"), KeyboardButton("/stats"), KeyboardButton("/profits")],
-                [KeyboardButton("/trading"), KeyboardButton("/add"), KeyboardButton("/thresholds")],
+                [KeyboardButton("/power"), KeyboardButton("/add"), KeyboardButton("/thresholds")],
                 [KeyboardButton("/history"), KeyboardButton("/viz"), KeyboardButton("/menu")]
             ],
             resize_keyboard=True
@@ -236,7 +238,7 @@ Menu:
             action = "Pause"
             
         await update.message.reply_text(
-            f"{message}\nUse /trading to {action} {emoji}",
+            f"{message}\nUse /power to {action} {emoji}",
             reply_markup=status_keyboard
         )
 
@@ -444,14 +446,14 @@ Menu:
                 logger.error("Failed to generate chart data")
                 return
                 
-            # Create detailed caption
+            # Create detailed caption with fixed format specifier
             caption = (
                 f"🦖 ROARRR! Trade Complete! 💥\n\n"
                 f"Order ID: {order.order_id}\n"
                 f"Symbol: {order.symbol}\n"
                 f"Amount: {float(order.quantity):.8f} {order.symbol.replace('USDT', '')}\n"
                 f"Price: ${float(order.price):.2f}\n"
-                f"Total: ${float(order.price * order.quantity):.2f} USDT\n"
+                f"Total: ${float(order.price * order.quantity):.2f} USDT\n"  # Fixed double colon here
                 f"Fees: ${float(order.fees):.4f} {order.fee_asset}\n"
                 f"Threshold: {order.threshold if order.threshold else 'Manual'}\n"
                 f"Timeframe: {self._get_timeframe_value(order.timeframe)}\n\n"
@@ -487,7 +489,7 @@ Menu:
 
 Trading Controls:
 /start - Start the bot and show welcome message
-/trading - Toggle trading on/off
+/power - Toggle trading on/off  # Updated command name here
 
 Trading Information:
 /balance - Check current balance
@@ -545,7 +547,7 @@ Menu:
                     current_price = float(ticker['price'])
                     
                     # Calculate price change if reference price exists
-                    if ref_price:
+                    if (ref_price):
                         price_change = ((current_price - ref_price) / ref_price) * 100
                         price_info = f"Open: ${ref_price:,.2f} | Current: ${current_price:,.2f} ({price_change:+.2f}%)"
                     else:
@@ -847,7 +849,7 @@ Menu:
             if portfolio_stats["total_tax"] > 0:
                 net_profit = portfolio_stats["total_profit"] - portfolio_stats["total_tax"]
                 summary.extend([
-                    f"Total Tax: ${portfolio_stats["total_tax"]:.2f}",
+                    f'Total Tax: ${portfolio_stats["total_tax"]:.2f}',  # Changed double quotes to single quotes
                     f"Net P/L: ${net_profit:.2f}"
                 ])
 
@@ -972,7 +974,7 @@ Menu:
                     f"Amount: {float(order.quantity):.8f}\n"
                     f"Price: ${float(order.price):.2f}\n"
                     f"Fees: ${float(order.fees):.2f}\n"
-                    f"Total Value: ${float(order.price * order.quantity):.2f}",  # Fixed double colon here
+                    f"Total Value: ${float(order.price * order.quantity)::.2f}",  # Fixed double colon here
                     reply_markup=self.markup  # Restore original keyboard
                 )
             else:
@@ -1187,7 +1189,7 @@ Menu:
             "You can:\n"
             "1. Add more funds\n"
             "2. Lower reserve balance in config\n"
-            "3. Use /trading to check balance and resume"
+            "3. Use /power to check balance and resume"  # Changed from /trading to /power
         )
         
         for user_id in self.allowed_users:

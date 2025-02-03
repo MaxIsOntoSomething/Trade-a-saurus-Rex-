@@ -69,9 +69,10 @@ This bot watches for significant price drops in cryptocurrencies and automatical
 - `/stats` - Trading statistics
 - `/profits` - P/L analysis with tax calculations
 - `/add` - Add manual trade
-- `/pause` - Pause trading
-- `/resume` - Resume trading
 - `/thresholds` - View threshold status
+- `/start` - Start the bot and show welcome message
+- `/power` - Toggle trading on/off 
+- `/balance` - Check current balance
 
 ## Portfolio Analysis
 
