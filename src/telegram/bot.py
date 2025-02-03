@@ -517,25 +517,45 @@ Menu:
             message_parts = []
             
             for timeframe in TimeFrame:
-                # Get next reset time
+                # Get next reset time with corrected timezone handling
                 if timeframe == TimeFrame.DAILY:
-                    next_reset = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+                    # For daily, next reset is at UTC midnight
+                    next_reset = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                    if now >= next_reset:
+                        next_reset += timedelta(days=1)
+
                 elif timeframe == TimeFrame.WEEKLY:
+                    # For weekly, next reset is Monday UTC midnight
                     days_until_monday = (7 - now.weekday()) % 7
-                    next_reset = (now + timedelta(days=days_until_monday)).replace(hour=0, minute=0, second=0, microsecond=0)
+                    next_reset = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                    if days_until_monday == 0 and now >= next_reset:
+                        days_until_monday = 7
+                    next_reset += timedelta(days=days_until_monday)
+
                 else:  # MONTHLY
+                    # For monthly, next reset is 1st of next month UTC midnight
                     if now.month == 12:
-                        next_reset = now.replace(year=now.year + 1, month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+                        next_reset = now.replace(year=now.year + 1, month=1, day=1,
+                                              hour=0, minute=0, second=0, microsecond=0)
                     else:
-                        next_reset = now.replace(month=now.month + 1, day=1, hour=0, minute=0, second=0, microsecond=0)
+                        next_reset = now.replace(month=now.month + 1, day=1,
+                                              hour=0, minute=0, second=0, microsecond=0)
+                    if now.day == 1 and now >= next_reset:
+                        # If we're on the 1st but after midnight, use next month
+                        if now.month == 12:
+                            next_reset = next_reset.replace(year=next_reset.year + 1, month=1)
+                        else:
+                            next_reset = next_reset.replace(month=next_reset.month + 1)
                 
+                # Calculate time until reset
                 time_until_reset = next_reset - now
-                hours, remainder = divmod(time_until_reset.total_seconds(), 3600)
-                minutes, _ = divmod(remainder, 60)
+                total_seconds = time_until_reset.total_seconds()
+                hours = int(total_seconds // 3600)
+                minutes = int((total_seconds % 3600) // 60)
                 
                 # Format timeframe header
                 timeframe_msg = [f"\n🕒 {timeframe.value.title()}"]
-                timeframe_msg.append(f"Reset in: {int(hours)}h {int(minutes)}m")
+                timeframe_msg.append(f"Reset in: {hours}h {minutes}m")
                 
                 # Process each symbol
                 for symbol in self.config['trading']['pairs']:
