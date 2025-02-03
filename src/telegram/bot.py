@@ -1128,25 +1128,42 @@ Menu:
             
         return "\n".join(response)
 
-    async def send_timeframe_reset_notification(self, timeframe: TimeFrame, message: str):
-        """Send notification when a timeframe resets"""
+    async def send_timeframe_reset_notification(self, reset_data: dict):
+        """Send notification when a timeframe resets with price information"""
         emoji_map = {
             TimeFrame.DAILY: "📅",
             TimeFrame.WEEKLY: "📆",
             TimeFrame.MONTHLY: "📊"
         }
         
-        formatted_message = (
-            f"{emoji_map.get(timeframe, '🔄')} Timeframe Reset\n\n"
-            f"{message}\n\n"
-            f"All {timeframe.value} thresholds have been reset."
-        )
+        timeframe = reset_data["timeframe"]
+        message_parts = [
+            f"{emoji_map.get(timeframe, '🔄')} {timeframe.value.title()} Reset",
+            f"\nOpening Prices:"
+        ]
         
+        # Add price information for each symbol
+        for price_data in reset_data["prices"]:
+            symbol = price_data["symbol"]
+            current = price_data["current_price"]
+            reference = price_data["reference_price"]
+            change = price_data["price_change"]
+            
+            message_parts.append(
+                f"\n{symbol}:"
+                f"\nOpening: ${reference:,.2f}"
+                f"\nCurrent: ${current:,.2f}"
+                f"\nChange: {change:+.2f}%"
+            )
+        
+        message_parts.append(f"\n\nAll {timeframe.value} thresholds have been reset.")
+        
+        # Send to all authorized users
         for user_id in self.allowed_users:
             try:
                 await self.app.bot.send_message(
                     chat_id=user_id,
-                    text=formatted_message,
+                    text="\n".join(message_parts),
                     reply_markup=self.markup
                 )
             except Exception as e:

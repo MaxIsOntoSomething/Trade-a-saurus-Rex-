@@ -111,17 +111,19 @@ class BinanceClient:
         if self.client:
             await self.client.close_connection()
             
-    async def check_timeframe_reset(self, timeframe: TimeFrame):
-        """Check if timeframe needs to be reset"""
+    async def check_timeframe_reset(self, timeframe: TimeFrame) -> bool:
+        """Check if timeframe needs to be reset and return True if reset occurred"""
         now = datetime.utcnow()
         interval = TIMEFRAME_INTERVALS[timeframe.value.upper()]
         
         if now - self.last_reset[timeframe] >= interval:
             logger.info(f"Resetting {timeframe.value} thresholds")
             
-            # Prepare reset notification
-            message_parts = [f"🔄 {timeframe.value.title()} Reset"]
-            message_parts.append(f"\nOpening Prices:")
+            # Prepare reset data
+            reset_data = {
+                "timeframe": timeframe,
+                "prices": []
+            }
             
             # Get opening prices for all symbols
             for symbol in self.reference_prices.keys():
@@ -129,14 +131,14 @@ class BinanceClient:
                 current_price = float(ticker['price'])
                 ref_price = await self.get_reference_price(symbol, timeframe)
                 
-                if ref_price:
-                    price_change = ((current_price - ref_price) / ref_price) * 100
-                    message_parts.append(
-                        f"{symbol}:\n"
-                        f"Opening: ${ref_price:,.2f}\n"
-                        f"Current: ${current_price:,.2f}\n"
-                        f"Change: {price_change:+.2f}%"
-                    )
+                price_data = {
+                    "symbol": symbol,
+                    "current_price": current_price,
+                    "reference_price": ref_price,
+                    "price_change": ((current_price - ref_price) / ref_price * 100) if ref_price else 0
+                }
+                reset_data["prices"].append(price_data)
+                
                 self.reference_prices[symbol][timeframe] = ref_price or current_price
                 
                 # Clear triggered thresholds
@@ -145,16 +147,14 @@ class BinanceClient:
                     
             self.last_reset[timeframe] = now
             
-            # Send notification if telegram bot is available
+            # Send notification via telegram bot if available
             if self.telegram_bot:
-                try:
-                    await self.telegram_bot.send_timeframe_reset_notification(
-                        timeframe,
-                        "\n".join(message_parts)
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to send reset notification: {e}")
+                await self.telegram_bot.send_timeframe_reset_notification(reset_data)
             
+            return True
+            
+        return False
+
     async def get_reference_timestamp(self, timeframe: TimeFrame) -> int:
         """Get the reference timestamp for a timeframe"""
         now = datetime.utcnow()
