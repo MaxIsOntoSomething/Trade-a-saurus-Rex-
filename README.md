@@ -108,12 +108,13 @@ MIT License
 - ✅ **Reset Updates Send**  
 - ✅ **MongoDB Integration**  
 - ✅ **Migrating from SQLite**  
+- ✅ **Docker Support**
 
 ### 📌 Planned  
 - 📌 **Weekly & Monthly Summary (Optional)**  
 - 📌 **Hyperliquid Integration**
 - 📌 **Backtest Option to Test Performance**
-
+- 📌 **Report with real Balance 5k+**
 
 ## Analysis
 
