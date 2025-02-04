@@ -101,6 +101,7 @@ MIT License
 - Futures Integration
 - Weekly summary and Monthly Summary (optional)
 - Hyperliquid Integration
+- Bitget Integration
 
 
 ## Analysis
