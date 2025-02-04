@@ -115,6 +115,7 @@ MIT License
 - 📌 **Hyperliquid Integration**
 - 📌 **Backtest Option to Test Performance**
 - 📌 **Report with real Balance 5k+**
+- 📌 **More Detailed Explanation of Bot Readme**
 
 ## Analysis
 
