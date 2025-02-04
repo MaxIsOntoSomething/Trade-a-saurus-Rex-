@@ -39,9 +39,9 @@ This bot watches for significant price drops in cryptocurrencies and automatical
 - 🔄 Auto-cancellation of unfilled orders
 - 🤖 Telegram integration for monitoring and control
 - 📈 Tax-adjusted profit calculations (28%)
-- 🎨 ASCII art position visualizations
+- 🎨 Chat position visualizations after Order Executions
 - 💰 USDT balance protection
--Docker support
+- 🐳 Docker support (works best when running on Server)
 
 ## Prerequisites
 
@@ -100,6 +100,7 @@ MIT License
 - Open Orders command Telegram 
 - Futures Integration
 - Weekly summary and Monthly Summary (optional)
+- Hyperliquid Integration
 
 
 ## Analysis
