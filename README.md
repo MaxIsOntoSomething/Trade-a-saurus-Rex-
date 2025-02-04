@@ -112,7 +112,7 @@ MIT License
 ### 📌 Planned  
 - 📌 **Weekly & Monthly Summary (Optional)**  
 - 📌 **Hyperliquid Integration**
-
+- 📌 **Backtest Option to Test Performance**
 
 
 ## Analysis
