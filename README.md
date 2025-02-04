@@ -95,13 +95,24 @@ This is a hobby project and should not be used for serious trading without thoro
 MIT License
 
 
-## TODO
+## ✅ TODO  
 
-- Open Orders command Telegram 
-- Futures Integration
-- Weekly summary and Monthly Summary (optional)
-- Hyperliquid Integration
-- Bitget Integration
+### 🚀 Work in Progress  
+- ⚙️ **Futures Integration** ⏳ (In Progress)  
+- 🔗 **Bitget Integration** ⏳ (In Progress)  
+
+### ✅ Finished  
+- ✅ **Telegram - Open Orders Command**  
+- ✅ **Reserve Balance**  
+- ✅ **Chart Generation**  
+- ✅ **Reset Updates Send**  
+- ✅ **MongoDB Integration**  
+- ✅ **Migrating from SQLite**  
+
+### 📌 Planned  
+- 📌 **Weekly & Monthly Summary (Optional)**  
+- 📌 **Hyperliquid Integration**
+
 
 
 ## Analysis
