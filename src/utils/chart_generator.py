@@ -34,7 +34,7 @@ class ChartGenerator:
         """Validate candle data for completeness and correctness"""
         try:
             if not candles or len(candles) < 2:
-                logger.error("Not enough candles for chart generation")
+                logger.warning("Not enough candles for chart generation (minimum 2 required)")
                 return False
 
             required_fields = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
@@ -115,7 +115,7 @@ class ChartGenerator:
         try:
             # Validate input data
             if not self.validate_candle_data(candles):
-                logger.error("Failed candle data validation")
+                logger.warning("Skipping chart generation due to insufficient data")
                 return None
 
             df = self.prepare_candle_data(candles)

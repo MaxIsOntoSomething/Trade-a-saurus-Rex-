@@ -5,6 +5,7 @@ services:
     env_file: .env
     volumes:
       - ./logs:/app/logs
+      - ./crash_reports:/app/crash_reports  # Add crash reports volume
     environment:
       - RUNNING_IN_DOCKER=true
       - MONGODB_URI=mongodb://mongodb:27017
@@ -25,6 +26,12 @@ services:
     depends_on:
       - mongodb
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
 
   mongodb:
     image: mongo:latest
@@ -42,3 +49,4 @@ services:
 
 volumes:
   mongodb_data:
+  crash_reports:  # Add new volume for crash reports

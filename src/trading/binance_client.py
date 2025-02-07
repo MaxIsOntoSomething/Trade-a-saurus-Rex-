@@ -31,12 +31,13 @@ class BinanceClient:
             TimeFrame.WEEKLY: None,
             TimeFrame.MONTHLY: None
         }
-        logger.setLevel(logging.DEBUG)  # Add this line
-        self.telegram_bot = None  # Add this line
+        logger.setLevel(logging.DEBUG)
+        self.telegram_bot = None
         self.chart_generator = ChartGenerator()
+        # Initialize these as None
         self.reserve_balance = None
         self.base_currency = None
-        
+
     def set_telegram_bot(self, bot):
         """Set telegram bot for notifications"""
         self.telegram_bot = bot
@@ -75,16 +76,25 @@ class BinanceClient:
             return False
 
     async def initialize(self):
-        """Initialize client with reserve balance and base currency"""
+        """Initialize client with proper error handling for configuration"""
         self.client = await AsyncClient.create(
             api_key=self.api_key,
             api_secret=self.api_secret,
             testnet=self.testnet
         )
 
-        # Log initial configuration
+        # Validate configuration
+        if not self.base_currency:
+            logger.warning("[INIT] No base currency configured, using USDT")
+            self.base_currency = 'USDT'
+            
+        if self.reserve_balance is None:
+            logger.warning("[INIT] No reserve balance configured, using 0")
+            self.reserve_balance = 0
+            
+        # Log configuration status
         logger.info(f"[INIT] Base Currency: {self.base_currency}")
-        logger.info(f"[INIT] Reserve Balance: ${self.reserve_balance:,.2f}" if self.reserve_balance else "[INIT] No reserve balance set")
+        logger.info(f"[INIT] Reserve Balance: ${self.reserve_balance:,.2f}")
 
         # Get exchange info for precision
         exchange_info = await self.client.get_exchange_info()

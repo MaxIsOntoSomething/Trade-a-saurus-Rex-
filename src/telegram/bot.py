@@ -81,6 +81,12 @@ Status: Ready to ROAR! 🦖
 """
         self.binance_client.set_telegram_bot(self)  # Add this line
         self.sent_roars = set()  # Add this to track sent roar notifications
+        # Add environment info
+        self.env_info = (
+            "📍 Environment: "
+            f"{'Testnet' if config['binance']['testnet'] else 'Mainnet'} | "
+            f"{config['trading']['base_currency']}"
+        )
 
     async def initialize(self):
         """Initialize the Telegram bot"""
@@ -121,10 +127,13 @@ Status: Ready to ROAR! 🦖
         await self.app.start()
 
     async def start(self):
-        """Start the bot and begin polling"""
+        """Start the bot and begin polling with improved error handling"""
         self.running = True
+        reconnect_delay = 1  # Initial delay in seconds
+        max_delay = 300  # Maximum delay of 5 minutes
+        consecutive_errors = 0
         
-        # Send startup message without ASCII art to avoid encoding issues
+        # Send startup message
         for user_id in self.allowed_users:
             try:
                 await self.app.bot.send_message(
@@ -135,7 +144,7 @@ Status: Ready to ROAR! 🦖
             except Exception as e:
                 logger.error(f"Failed to send startup message to {user_id}: {e}")
         
-        # Start polling in the background
+        # Start polling with automatic recovery
         while self.running:
             try:
                 updates = await self.app.bot.get_updates(
@@ -143,22 +152,53 @@ Status: Ready to ROAR! 🦖
                     timeout=30
                 )
                 
+                # Reset error counter and delay on successful update
+                consecutive_errors = 0
+                reconnect_delay = 1
+                
                 for update in updates:
                     if update.update_id >= self._update_id:
                         self._update_id = update.update_id + 1
                         await self.app.process_update(update)
                         
             except Exception as e:
+                consecutive_errors += 1
                 logger.error(f"Polling error: {e}")
-                await asyncio.sleep(1)
+                
+                # Send error notification if too many consecutive errors
+                if consecutive_errors >= 5:
+                    error_msg = (
+                        "⚠️ Bot Connection Warning!\n\n"
+                        f"Consecutive errors: {consecutive_errors}\n"
+                        f"Last error: {str(e)}\n"
+                        f"Next retry in {reconnect_delay}s"
+                    )
+                    for user_id in self.allowed_users:
+                        try:
+                            await self.app.bot.send_message(
+                                chat_id=user_id,
+                                text=error_msg
+                            )
+                        except Exception as notify_error:
+                            logger.error(f"Failed to send error notification: {notify_error}")
+                
+                # Exponential backoff with maximum delay
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, max_delay)
                 
             await asyncio.sleep(0.1)
 
     async def stop(self):
-        """Stop the Telegram bot"""
+        """Stop the Telegram bot with proper cleanup"""
         self.running = False
         if self.app:
-            await self.app.stop()
+            try:
+                # Close any pending client sessions
+                if hasattr(self.app.bot, '_client_session'):
+                    await self.app.bot._client_session.close()
+                await self.app.stop()
+            except Exception as e:
+                logger.error(f"Error during bot shutdown: {e}")
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle the /start command"""
@@ -311,7 +351,7 @@ Menu:
             await update.message.reply_text(f"❌ Error getting history: {str(e)}")
 
     async def send_order_notification(self, order: Order, status: Optional[OrderStatus] = None):
-        """Send order notification to all allowed users"""
+        """Send order notification with environment info"""
         if not self.app:
             logger.error("Telegram bot not initialized")
             return
@@ -331,8 +371,9 @@ Menu:
         # Calculate total value in USDT
         total_value = order.price * order.quantity
         
-        # Fix the format specifier
+        # Include environment info in message
         message = (
+            f"{self.env_info}\n\n"
             f"{emoji[status]} Order Update\n"
             f"Order ID: {order.order_id}\n"
             f"Symbol: {order.symbol}\n"
@@ -358,8 +399,9 @@ Menu:
                 logger.error(f"Failed to send notification to {user_id}: {e}")
 
     async def send_balance_update(self, symbol: str, change: Decimal):
-        """Send balance change notification"""
+        """Send balance change notification with environment info"""
         message = (
+            f"{self.env_info}\n\n"
             f"💰 Balance Update\n"
             f"Symbol: {symbol}\n"
             f"Change: {change:+.8f} USDT"
@@ -428,26 +470,17 @@ Menu:
             logger.error(f"Failed to generate trade chart: {e}")
 
     async def send_roar(self, order: Order):
-        """Send a dinosaur roar notification with trade summary in chart"""
+        """Send trade notification with fallback for chart failures"""
         # Add order ID to sent roars set
         self.sent_roars.add(order.order_id)
         
-        # Send chart with full information
         try:
-            ref_price = self.binance_client.reference_prices.get(
-                order.symbol, {}
-            ).get(order.timeframe)
-            
-            if ref_price is not None:
-                ref_price = Decimal(str(ref_price))
-            
+            # Try to generate chart first
             chart_data = await self.binance_client.generate_trade_chart(order)
-            if not chart_data:
-                logger.error("Failed to generate chart data")
-                return
-                
-            # Create detailed caption with fixed format specifier
+            
+            # Create detailed caption with environment info
             caption = (
+                f"{self.env_info}\n\n"
                 f"🦖 ROARRR! Trade Complete! 💥\n\n"
                 f"Order ID: {order.order_id}\n"
                 f"Symbol: {order.symbol}\n"
@@ -460,21 +493,32 @@ Menu:
                 f"Check /profits to see your updated portfolio."
             )
             
-            # Send single message with chart and all info
+            # Send notification with or without chart
             for user_id in self.allowed_users:
                 try:
-                    await self.app.bot.send_photo(
-                        chat_id=user_id,
-                        photo=chart_data,
-                        caption=caption
-                    )
+                    if chart_data:
+                        await self.app.bot.send_photo(
+                            chat_id=user_id,
+                            photo=chart_data,
+                            caption=caption
+                        )
+                    else:
+                        # Fallback to text-only with explanation
+                        await self.app.bot.send_message(
+                            chat_id=user_id,
+                            text=f"{caption}\n\n⚠️ Chart not available: Insufficient candle data"
+                        )
                 except Exception as e:
                     logger.error(f"Failed to send roar to {user_id}: {e}")
+                    # Ensure at least basic notification is sent
+                    try:
+                        await self.app.bot.send_message(
+                            chat_id=user_id,
+                            text=caption
+                        )
+                    except Exception as e2:
+                        logger.error(f"Failed to send fallback message: {e2}")
                     
-            # Cleanup old roar notifications periodically
-            if len(self.sent_roars) > 1000:
-                self.sent_roars.clear()
-                
         except Exception as e:
             logger.error(f"Failed to send roar: {e}")
 

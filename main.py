@@ -4,6 +4,11 @@ import logging
 import os
 from pathlib import Path
 import sys
+import signal
+import traceback
+from aiohttp import web
+import threading
+from datetime import datetime
 
 # Configure Windows console for UTF-8
 if sys.platform == 'win32':
@@ -148,99 +153,159 @@ async def check_initial_connection(binance_client: BinanceClient, config: dict) 
         logger.error("=" * 50)
         return False
 
-async def main():
-    """Main function with improved config loading"""
-    print(DINO_ASCII)
-    logger.info("Starting Trade-a-saurus Rex...")
+# Add health check endpoint
+async def health_check(request):
+    return web.Response(text="OK")
+
+# Add crash handler
+def handle_crash(exc_type, exc_value, exc_traceback):
+    crash_time = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    crash_file = f"crash_reports/crash_{crash_time}.txt"
     
     try:
-        # Load configuration from appropriate source
-        config = load_and_merge_config()
-        
-        # Debug log the configuration
-        logger.info("=" * 50)
-        logger.info("[CONFIG] Active Configuration:")
-        logger.info(f"[CONFIG] Base Currency: {config['trading']['base_currency']}")
-        logger.info(f"[CONFIG] Reserve Balance: ${config['trading']['reserve_balance']:,.2f}")
-        logger.info(f"[CONFIG] Trading Pairs: {', '.join(config['trading']['pairs'])}")
-        logger.info(f"[CONFIG] Order Amount: ${config['trading']['order_amount']:,.2f}")
-        logger.info("=" * 50)
-
-        if not validate_config(config):
-            logger.error("Invalid configuration, exiting...")
-            return
-
-        # Initialize components
-        binance_client = BinanceClient(
-            api_key=config['binance']['api_key'],
-            api_secret=config['binance']['api_secret'],
-            testnet=config['binance']['testnet']
-        )
-        await binance_client.initialize()
-        
-        # Check initial connection with all configured pairs
-        if not await check_initial_connection(binance_client, config):
-            logger.error("Initial connection check failed, exiting...")
-            return
-        
-        mongo_client = MongoClient(
-            uri=config['mongodb']['uri'],
-            database=config['mongodb']['database']
-        )
-        await mongo_client.init_indexes()
-        
-        telegram_bot = TelegramBot(
-            token=config['telegram']['bot_token'],
-            allowed_users=config['telegram']['allowed_users'],
-            binance_client=binance_client,
-            mongo_client=mongo_client,
-            config=config  # Add config here
-        )
-        await telegram_bot.initialize()
-        
-        order_manager = OrderManager(
-            binance_client=binance_client,
-            mongo_client=mongo_client,
-            telegram_bot=telegram_bot,
-            config=config
-        )
-
-        # Run both components concurrently
-        try:
-            # Start both services
-            tasks = [
-                asyncio.create_task(order_manager.start()),
-                asyncio.create_task(telegram_bot.start())
-            ]
+        os.makedirs("crash_reports", exist_ok=True)
+        with open(crash_file, "w") as f:
+            f.write(f"Crash Report - {crash_time}\n\n")
+            traceback.print_exception(exc_type, exc_value, exc_traceback, file=f)
             
-            # Keep the main loop running
-            while True:
-                try:
-                    await asyncio.sleep(1)
-                except asyncio.CancelledError:
-                    logger.info("Shutdown signal received...")
-                    break
-                    
-        except KeyboardInterrupt:
-            logger.info("Received keyboard interrupt...")
-        finally:
-            # Cancel all tasks
-            for task in tasks:
-                task.cancel()
-            # Wait for tasks to complete
-            await asyncio.gather(*tasks, return_exceptions=True)
-            # Cleanup
-            logger.info("Shutting down components...")
-            await asyncio.gather(
-                order_manager.stop(),
-                telegram_bot.stop(),
-                binance_client.close(),
-                return_exceptions=True
-            )
-            
+        logger.critical(f"Bot crashed! Report saved to {crash_file}")
+        
+        # Force restart container
+        if os.getenv('RUNNING_IN_DOCKER') == 'true':
+            os.kill(1, signal.SIGTERM)
     except Exception as e:
-        logger.error(f"Fatal error: {e}", exc_info=True)
+        logger.critical(f"Failed to save crash report: {e}")
+
+# Add monitoring server
+async def start_monitoring_server():
+    app = web.Application()
+    app.router.add_get('/health', health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, 'localhost', 8080)
+    await site.start()
+    return runner
+
+async def main():
+    """Main function with crash recovery"""
+    print(DINO_ASCII)
+    logger.info("Starting Trade-a-saurus Rex...")
+
+    # Set up crash handler
+    sys.excepthook = handle_crash
+
+    # Start monitoring server
+    monitor = await start_monitoring_server()
+    
+    try:
+        restart_count = 0
+        max_restarts = 5
+        
+        while restart_count < max_restarts:
+            try:
+                # Load configuration from appropriate source
+                config = load_and_merge_config()
+                
+                # Initialize components (remove redundant initialization)
+                binance_client = BinanceClient(
+                    api_key=config['binance']['api_key'],
+                    api_secret=config['binance']['api_secret'],
+                    testnet=config['binance']['testnet']
+                )
+                
+                # Set base currency and reserve balance before initialization
+                binance_client.base_currency = config['trading']['base_currency']
+                binance_client.reserve_balance = config['trading']['reserve_balance']
+                
+                await binance_client.initialize()
+                
+                # Check initial connection with all configured pairs
+                if not await check_initial_connection(binance_client, config):
+                    logger.error("Initial connection check failed, retrying...")
+                    restart_count += 1
+                    await asyncio.sleep(30)
+                    continue
+
+                # Debug log the configuration once
+                logger.info("=" * 50)
+                logger.info("[CONFIG] Active Configuration:")
+                logger.info(f"[CONFIG] Base Currency: {config['trading']['base_currency']}")
+                logger.info(f"[CONFIG] Reserve Balance: ${config['trading']['reserve_balance']:,.2f}")
+                logger.info(f"[CONFIG] Trading Pairs: {', '.join(config['trading']['pairs'])}")
+                logger.info(f"[CONFIG] Order Amount: ${config['trading']['order_amount']:,.2f}")
+                logger.info("=" * 50)
+
+                # Remove redundant validation and client creation
+                mongo_client = MongoClient(
+                    uri=config['mongodb']['uri'],
+                    database=config['mongodb']['database']
+                )
+                await mongo_client.init_indexes()
+                
+                telegram_bot = TelegramBot(
+                    token=config['telegram']['bot_token'],
+                    allowed_users=config['telegram']['allowed_users'],
+                    binance_client=binance_client,
+                    mongo_client=mongo_client,
+                    config=config  # Add config here
+                )
+                await telegram_bot.initialize()
+                
+                order_manager = OrderManager(
+                    binance_client=binance_client,
+                    mongo_client=mongo_client,
+                    telegram_bot=telegram_bot,
+                    config=config
+                )
+
+                # Run components with automatic recovery
+                while True:
+                    try:
+                        # Start both services
+                        tasks = [
+                            asyncio.create_task(order_manager.start()),
+                            asyncio.create_task(telegram_bot.start())
+                        ]
+                        
+                        # Monitor tasks
+                        while True:
+                            for task in tasks:
+                                if task.done() and task.exception():
+                                    raise task.exception()
+                                await asyncio.sleep(1)
+                                
+                    except Exception as e:
+                        logger.error(f"Service error, restarting: {e}")
+                        # Cancel all tasks
+                        for task in tasks:
+                            task.cancel()
+                        await asyncio.gather(*tasks, return_exceptions=True)
+                        await asyncio.sleep(5)  # Wait before restart
+                        continue
+
+            except Exception as e:
+                logger.error(f"Critical error: {e}", exc_info=True)
+                restart_count += 1
+                if restart_count < max_restarts:
+                    logger.info(f"Restarting bot (attempt {restart_count}/{max_restarts})...")
+                    await asyncio.sleep(30)  # Wait before restart
+                else:
+                    logger.critical("Max restart attempts reached!")
+                    raise
+                
+    except Exception as e:
+        logger.critical(f"Fatal error: {e}", exc_info=True)
         raise
+    finally:
+        # Cleanup
+        await monitor.cleanup()
+        logger.info("Bot shutdown complete")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Received keyboard interrupt, shutting down...")
+    except Exception as e:
+        logger.critical(f"Fatal error in main: {e}", exc_info=True)
+        sys.exit(1)

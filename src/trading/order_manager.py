@@ -45,19 +45,48 @@ class OrderManager:
                 pass
             
     async def check_connection_health(self):
-        """Check if all connections are healthy"""
+        """Check if all connections are healthy with improved error handling"""
         try:
-            # Check Binance connection
-            await self.binance_client.client.ping()
+            # Check Binance connection with timeout
+            await asyncio.wait_for(self.binance_client.client.ping(), timeout=5.0)
             
-            # Check MongoDB connection
-            await self.mongo_client.db.command('ping')
+            # Check MongoDB connection with timeout
+            await asyncio.wait_for(self.mongo_client.db.command('ping'), timeout=5.0)
             
             return True
+        except asyncio.TimeoutError as e:
+            logger.error(f"Connection health check timeout: {e}")
+            await self._notify_connection_issue("Connection timeout")
+            return False
         except Exception as e:
             logger.error(f"Health check failed: {e}")
+            await self._notify_connection_issue(str(e))
             return False
-            
+
+    async def _notify_connection_issue(self, error_message: str):
+        """Send connection issue notification"""
+        if not hasattr(self, '_last_notification_time'):
+            self._last_notification_time = 0
+
+        current_time = time.time()
+        # Only send notification every 5 minutes to avoid spam
+        if current_time - self._last_notification_time >= 300:
+            self._last_notification_time = current_time
+            message = (
+                "🚨 Connection Issue Detected!\n\n"
+                f"Error: {error_message}\n"
+                "Bot will automatically attempt to reconnect.\n"
+                "Check server status if this persists."
+            )
+            try:
+                for user_id in self.telegram_bot.allowed_users:
+                    await self.telegram_bot.app.bot.send_message(
+                        chat_id=user_id,
+                        text=message
+                    )
+            except Exception as e:
+                logger.error(f"Failed to send connection notification: {e}")
+
     async def process_symbol(self, symbol: str):
         """Check daily/weekly/monthly timeframes for a single symbol."""
         try:
@@ -94,9 +123,12 @@ class OrderManager:
             logger.error(f"Error processing {symbol}: {e}", exc_info=True)
 
     async def monitor_thresholds(self):
+        """Monitor thresholds with improved error handling and recovery"""
         logger.info("Starting price monitoring loop")
-        self.check_interval = 5  # Now 5 seconds
+        self.check_interval = 5  # 5 seconds between checks
         last_check = time.time()
+        consecutive_failures = 0
+        max_failures = 10  # Maximum consecutive failures before forced restart
 
         while self.running:
             try:
@@ -109,9 +141,33 @@ class OrderManager:
                 last_check = current_time
 
                 if not await self.check_connection_health():
-                    logger.error("Connection health check failed, waiting 30s...")
+                    consecutive_failures += 1
+                    logger.error(f"Connection health check failed ({consecutive_failures}/{max_failures})")
+                    
+                    if consecutive_failures >= max_failures:
+                        # Send critical error notification
+                        message = (
+                            "🚨 CRITICAL: Maximum connection failures reached!\n"
+                            "Bot will attempt to restart.\n"
+                            "Please check server status."
+                        )
+                        try:
+                            for user_id in self.telegram_bot.allowed_users:
+                                await self.telegram_bot.app.bot.send_message(
+                                    chat_id=user_id,
+                                    text=message
+                                )
+                        except Exception as e:
+                            logger.error(f"Failed to send critical error notification: {e}")
+                            
+                        # Force restart by raising exception
+                        raise RuntimeError("Maximum connection failures reached")
+                        
                     await asyncio.sleep(30)
                     continue
+                
+                # Reset failure counter on successful health check
+                consecutive_failures = 0
 
                 if not self.telegram_bot.is_paused:
                     logger.info("\n" + "="*50)
