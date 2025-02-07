@@ -115,8 +115,10 @@ MIT License
 - 📌 **Hyperliquid Integration**
 - 📌 **Backtest Option to Test Performance**
 - 📌 **Report with real Balance 5k+**
-- 📌 **More Detailed Explanation of Bot Readme**
-
+- 📌 **More Detailed Explanation of Config Readme**
+- 📌 **Take Profit and Stop Lose for Future Trades**
+- 📌 **Add Coins and delete them trough Telegram**
+- 📌 **Chart Generation , Equitiy Curve and Buys Marked**
 ## Analysis
 
 ![Drop Analysis Daily Candles](src/img/data1.png)
