@@ -23,29 +23,149 @@ from src.database.mongo_client import MongoClient
 from src.telegram.bot import TelegramBot, DINO_ASCII
 from src.trading.order_manager import OrderManager
 from src.utils.logger import setup_logging
+from src.trading.futures_client import FuturesClient
 
 # Setup logging first and get config logger
 config_logger = setup_logging()
 logger = logging.getLogger(__name__)
 
+class ClientManager:
+    def __init__(self, config: dict):
+        self.config = config
+        self.spot_client = None
+        self.futures_client = None
+        self.active_client = None
+        self.trading_mode = config['environment']['trading_mode']
+        self.testnet = config['environment']['testnet']
+
+    async def initialize(self) -> BinanceClient:
+        """Initialize appropriate client based on configuration"""
+        try:
+            # Get API credentials based on environment
+            if self.testnet:
+                if self.trading_mode == 'futures':
+                    api_config = {
+                        **self.config['binance']['testnet_futures'],
+                        'testnet': True,  # Add testnet flag
+                        **self.config['trading'].get('futures_settings', {})  # Add futures settings
+                    }
+                else:
+                    api_config = {
+                        **self.config['binance']['testnet_spot'],
+                        'testnet': True
+                    }
+            else:
+                api_config = {
+                    **self.config['binance']['mainnet'],
+                    'testnet': False
+                }
+
+            # Initialize appropriate client
+            if self.trading_mode == 'futures':
+                self.futures_client = FuturesClient(api_config)
+                await self.futures_client.initialize()
+                self.active_client = self.futures_client
+            else:
+                self.spot_client = BinanceClient(
+                    api_key=api_config['api_key'],
+                    api_secret=api_config['api_secret'],
+                    testnet=self.testnet
+                )
+                await self.spot_client.initialize()
+                self.active_client = self.spot_client
+
+            logger.info(
+                f"Initialized {self.trading_mode.upper()} client "
+                f"on {'Testnet' if self.testnet else 'Mainnet'}"
+            )
+            return self.active_client
+
+        except Exception as e:
+            logger.error(f"Failed to initialize client manager: {e}")
+            raise
+
 def validate_config(config: dict) -> bool:
     """Validate configuration parameters"""
     required_fields = {
-        'binance': ['api_key', 'api_secret', 'testnet'],
+        'environment': ['testnet', 'trading_mode'],
+        'binance': {
+            'mainnet': ['api_key', 'api_secret'],
+            'testnet_spot': ['api_key', 'api_secret'],
+            'testnet_futures': ['api_key', 'api_secret']
+        },
         'telegram': ['bot_token', 'allowed_users'],
         'mongodb': ['uri', 'database'],
         'trading': ['base_currency', 'order_amount', 'cancel_after_hours', 
-                   'pairs', 'thresholds']
+                   'pairs', 'thresholds', 'reserve_balance']
     }
     
     try:
+        # Validate environment settings
+        if config['environment']['trading_mode'] not in ['spot', 'futures']:
+            raise ValueError("trading_mode must be 'spot' or 'futures'")
+
+        # Validate nested structure
         for section, fields in required_fields.items():
             if section not in config:
                 raise ValueError(f"Missing section: {section}")
-            for field in fields:
-                if field not in config[section]:
-                    raise ValueError(f"Missing field: {section}.{field}")
+                
+            if isinstance(fields, dict):
+                for subsection, subfields in fields.items():
+                    if subsection not in config[section]:
+                        raise ValueError(f"Missing subsection: {section}.{subsection}")
+                    for field in subfields:
+                        if field not in config[section][subsection]:
+                            raise ValueError(f"Missing field: {section}.{subsection}.{field}")
+            else:
+                for field in fields:
+                    if field not in config[section]:
+                        raise ValueError(f"Missing field: {section}.{field}")
+
+        # Validate futures settings if in futures mode
+        if config['environment']['trading_mode'] == 'futures':
+            futures_settings = config['trading'].get('futures_settings')
+            if not futures_settings:
+                raise ValueError("Missing futures_settings in trading section")
+            
+            required_futures_fields = [
+                'default_leverage',
+                'margin_type',
+                'position_mode',
+                'allowed_pairs'
+            ]
+            
+            for field in required_futures_fields:
+                if field not in futures_settings:
+                    raise ValueError(f"Missing required futures field: {field}")
+                    
+            # Validate leverage range
+            if not (1 <= futures_settings['default_leverage'] <= 125):
+                raise ValueError("default_leverage must be between 1 and 125")
+                
+            # Validate margin type
+            if futures_settings['margin_type'] not in ['ISOLATED', 'CROSSED']:
+                raise ValueError("margin_type must be 'ISOLATED' or 'CROSSED'")
+                
+            # Validate position mode
+            if futures_settings['position_mode'] not in ['ONE_WAY', 'HEDGE']:
+                raise ValueError("position_mode must be 'ONE_WAY' or 'HEDGE'")
+                
+            # Validate allowed pairs
+            if not isinstance(futures_settings['allowed_pairs'], list):
+                raise ValueError("allowed_pairs must be a list")
+            if not all(isinstance(pair, str) for pair in futures_settings['allowed_pairs']):
+                raise ValueError("all pairs in allowed_pairs must be strings")
+
+        # Validate thresholds structure
+        threshold_timeframes = ['daily', 'weekly', 'monthly']
+        for timeframe in threshold_timeframes:
+            if timeframe not in config['trading']['thresholds']:
+                raise ValueError(f"Missing threshold timeframe: {timeframe}")
+            if not isinstance(config['trading']['thresholds'][timeframe], list):
+                raise ValueError(f"Thresholds for {timeframe} must be a list")
+
         return True
+        
     except Exception as e:
         logger.error(f"Configuration validation failed: {e}")
         return False
@@ -68,10 +188,23 @@ def load_config_from_env() -> dict:
 
     # Rest of the config loading
     config = {
+        'environment': {
+            'testnet': os.getenv('TRADING_TESTNET', 'true').lower() == 'true',
+            'trading_mode': os.getenv('TRADING_MODE', 'spot').lower()
+        },
         'binance': {
-            'api_key': os.getenv('BINANCE_API_KEY'),
-            'api_secret': os.getenv('BINANCE_API_SECRET'),
-            'testnet': os.getenv('BINANCE_TESTNET', 'true').lower() == 'true'
+            'mainnet': {
+                'api_key': os.getenv('BINANCE_MAINNET_API_KEY'),
+                'api_secret': os.getenv('BINANCE_MAINNET_API_SECRET')
+            },
+            'testnet_spot': {
+                'api_key': os.getenv('BINANCE_TESTNET_SPOT_API_KEY'),
+                'api_secret': os.getenv('BINANCE_TESTNET_SPOT_API_SECRET')
+            },
+            'testnet_futures': {
+                'api_key': os.getenv('BINANCE_TESTNET_FUTURES_API_KEY'),
+                'api_secret': os.getenv('BINANCE_TESTNET_FUTURES_API_SECRET')
+            }
         },
         'telegram': {
             'bot_token': os.getenv('TELEGRAM_BOT_TOKEN'),
@@ -94,6 +227,17 @@ def load_config_from_env() -> dict:
             }
         }
     }
+    
+    # Add futures configuration if needed
+    if config['environment']['trading_mode'] == 'futures':
+        config['trading']['futures'] = {
+            'enabled': True,
+            'default_leverage': int(os.getenv('FUTURES_DEFAULT_LEVERAGE', '5')),
+            'default_margin_type': os.getenv('FUTURES_MARGIN_TYPE', 'ISOLATED'),
+            'allowed_pairs': os.getenv('FUTURES_ALLOWED_PAIRS', '').split(','),
+            'position_mode': os.getenv('FUTURES_POSITION_MODE', 'ONE_WAY')
+        }
+
     return config
 
 def load_and_merge_config() -> dict:
@@ -206,53 +350,28 @@ async def main():
                 # Load configuration from appropriate source
                 config = load_and_merge_config()
                 
-                # Initialize components (remove redundant initialization)
-                binance_client = BinanceClient(
-                    api_key=config['binance']['api_key'],
-                    api_secret=config['binance']['api_secret'],
-                    testnet=config['binance']['testnet']
-                )
-                
-                # Set base currency and reserve balance before initialization
-                binance_client.base_currency = config['trading']['base_currency']
-                binance_client.reserve_balance = config['trading']['reserve_balance']
-                
-                await binance_client.initialize()
-                
-                # Check initial connection with all configured pairs
-                if not await check_initial_connection(binance_client, config):
-                    logger.error("Initial connection check failed, retrying...")
-                    restart_count += 1
-                    await asyncio.sleep(30)
-                    continue
+                # Initialize client manager
+                client_manager = ClientManager(config)
+                active_client = await client_manager.initialize()
 
-                # Debug log the configuration once
-                logger.info("=" * 50)
-                logger.info("[CONFIG] Active Configuration:")
-                logger.info(f"[CONFIG] Base Currency: {config['trading']['base_currency']}")
-                logger.info(f"[CONFIG] Reserve Balance: ${config['trading']['reserve_balance']:,.2f}")
-                logger.info(f"[CONFIG] Trading Pairs: {', '.join(config['trading']['pairs'])}")
-                logger.info(f"[CONFIG] Order Amount: ${config['trading']['order_amount']:,.2f}")
-                logger.info("=" * 50)
-
-                # Remove redundant validation and client creation
+                # Initialize other components with active client
                 mongo_client = MongoClient(
                     uri=config['mongodb']['uri'],
                     database=config['mongodb']['database']
                 )
                 await mongo_client.init_indexes()
-                
+
                 telegram_bot = TelegramBot(
                     token=config['telegram']['bot_token'],
                     allowed_users=config['telegram']['allowed_users'],
-                    binance_client=binance_client,
+                    binance_client=active_client,
                     mongo_client=mongo_client,
-                    config=config  # Add config here
+                    config=config
                 )
                 await telegram_bot.initialize()
                 
                 order_manager = OrderManager(
-                    binance_client=binance_client,
+                    binance_client=active_client,
                     mongo_client=mongo_client,
                     telegram_bot=telegram_bot,
                     config=config
@@ -276,11 +395,10 @@ async def main():
                                 
                     except Exception as e:
                         logger.error(f"Service error, restarting: {e}")
-                        # Cancel all tasks
                         for task in tasks:
                             task.cancel()
                         await asyncio.gather(*tasks, return_exceptions=True)
-                        await asyncio.sleep(5)  # Wait before restart
+                        await asyncio.sleep(5)
                         continue
 
             except Exception as e:
@@ -288,16 +406,15 @@ async def main():
                 restart_count += 1
                 if restart_count < max_restarts:
                     logger.info(f"Restarting bot (attempt {restart_count}/{max_restarts})...")
-                    await asyncio.sleep(30)  # Wait before restart
+                    await asyncio.sleep(30)
                 else:
                     logger.critical("Max restart attempts reached!")
                     raise
-                
+
     except Exception as e:
         logger.critical(f"Fatal error: {e}", exc_info=True)
         raise
     finally:
-        # Cleanup
         await monitor.cleanup()
         logger.info("Bot shutdown complete")
 

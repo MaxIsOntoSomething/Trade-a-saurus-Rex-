@@ -13,11 +13,29 @@ class MongoClient:
         self.client = motor.motor_asyncio.AsyncIOMotorClient(uri)
         self.db = self.client[database]
         self.orders = self.db.orders
+        self.positions = self.db.positions  # Add positions collection
+        self.thresholds = self.db.thresholds  # Add thresholds collection
 
     async def init_indexes(self):
         await self.orders.create_index("order_id", unique=True)
         await self.orders.create_index("status")
         await self.orders.create_index("symbol")
+        
+        # Add indexes for positions collection
+        await self.positions.create_index([
+            ("symbol", 1),
+            ("order_type", 1)
+        ])
+        await self.positions.create_index("last_updated")
+        await self.positions.create_index("status")
+        
+        # Add indexes for thresholds
+        await self.thresholds.create_index([
+            ("symbol", 1),
+            ("timeframe", 1),
+            ("threshold", 1)
+        ], unique=True)
+        await self.thresholds.create_index("triggered_at")
 
     def _validate_order_data(self, order: Order) -> bool:
         """Validate order data before insertion"""
@@ -70,6 +88,7 @@ class MongoClient:
             order_dict = {
                 "symbol": order.symbol,
                 "status": order.status.value,
+                "order_type": OrderType.SPOT.value,  # Marked as spot order
                 "price": str(order.price),
                 "quantity": str(order.quantity),
                 "threshold": float(order.threshold),
@@ -460,5 +479,368 @@ class MongoClient:
         except Exception as e:
             logger.error(f"Error getting visualization data: {e}")
             return []
+
+    async def update_futures_position(self, position_data: Dict) -> bool:
+        """Update or create futures position"""
+        try:
+            # Map position data fields correctly
+            update_data = {
+                "symbol": position_data["symbol"],
+                "positionAmt": str(position_data["positionAmt"]),  # Use positionAmt instead of amount
+                "entryPrice": str(position_data["entryPrice"]),
+                "leverage": position_data["leverage"],
+                "marginType": position_data["marginType"],
+                "unrealizedProfit": str(position_data["unrealizedProfit"]),
+                "last_updated": datetime.utcnow(),
+                "status": "OPEN" if float(position_data["positionAmt"]) != 0 else "CLOSED",
+                "order_type": "futures"
+            }
+
+            result = await self.positions.update_one(
+                {
+                    "symbol": position_data["symbol"],
+                    "order_type": "futures"
+                },
+                {"$set": update_data},
+                upsert=True
+            )
+
+            logger.debug(f"Updated position for {position_data['symbol']}: {update_data}")
+            return bool(result.modified_count or result.upserted_id)
+
+        except Exception as e:
+            logger.error(f"Failed to update futures position: {e}")
+            return False
+
+    async def get_futures_positions(self, active_only: bool = True) -> List[Dict]:
+        """Get futures positions"""
+        try:
+            query = {"order_type": "futures"}
+            if active_only:
+                query["status"] = "OPEN"
+            
+            cursor = self.positions.find(query)
+            positions = []
+            async for pos in cursor:
+                positions.append(pos)
+            return positions
+        except Exception as e:
+            logger.error(f"Failed to get futures positions: {e}")
+            return []
+
+    async def calculate_futures_pnl(self, symbol: str, timeframe: str = "all") -> Dict:
+        """Calculate futures P&L for a symbol"""
+        try:
+            match_stage = {
+                "symbol": symbol,
+                "order_type": OrderType.FUTURES.value
+            }
+
+            if timeframe != "all":
+                now = datetime.utcnow()
+                if timeframe == "daily":
+                    match_stage["created_at"] = {"$gte": now - timedelta(days=1)}
+                elif timeframe == "weekly":
+                    match_stage["created_at"] = {"$gte": now - timedelta(weeks=1)}
+                elif timeframe == "monthly":
+                    match_stage["created_at"] = {"$gte": now - timedelta(days=30)}
+
+            pipeline = [
+                {"$match": match_stage},
+                {"$group": {
+                    "_id": "$direction",
+                    "total_volume": {"$sum": {"$multiply": ["$price", "$quantity"]}},
+                    "total_fees": {"$sum": "$fees"},
+                    "count": {"$sum": 1},
+                    "pnl": {"$sum": "$realized_pnl"}
+                }}
+            ]
+
+            results = await self.orders.aggregate(pipeline).to_list(None)
+            return {
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "long": next((r for r in results if r["_id"] == "long"), 
+                           {"total_volume": 0, "total_fees": 0, "count": 0, "pnl": 0}),
+                "short": next((r for r in results if r["_id"] == "short"), 
+                            {"total_volume": 0, "total_fees": 0, "count": 0, "pnl": 0})
+            }
+        except Exception as e:
+            logger.error(f"Failed to calculate futures PNL: {e}")
+            return {}
+
+    async def update_order_pnl(self, order_id: str, realized_pnl: Decimal) -> bool:
+        """Update order with realized PNL"""
+        try:
+            result = await self.orders.update_one(
+                {"order_id": order_id},
+                {
+                    "$set": {
+                        "realized_pnl": str(realized_pnl),
+                        "updated_at": datetime.utcnow()
+                    }
+                }
+            )
+            return result.modified_count > 0
+        except Exception as e:
+            logger.error(f"Failed to update order PNL: {e}")
+            return False
+
+    async def get_trading_summary(self, include_futures: bool = True) -> Dict:
+        """Get comprehensive trading summary"""
+        try:
+            pipeline = [
+                {
+                    "$facet": {
+                        "spot_orders": [
+                            {"$match": {"order_type": "spot", "status": "filled"}},
+                            {"$group": {
+                                "_id": None,
+                                "total_volume": {"$sum": {"$multiply": ["$price", "$quantity"]}},
+                                "total_fees": {"$sum": "$fees"},
+                                "count": {"$sum": 1}
+                            }}
+                        ],
+                        "futures_orders": [
+                            {"$match": {"order_type": "futures", "status": "filled"}},
+                            {"$group": {
+                                "_id": "$direction",
+                                "total_volume": {"$sum": {"$multiply": ["$price", "$quantity"]}},
+                                "total_fees": {"$sum": "$fees"},
+                                "total_pnl": {"$sum": "$realized_pnl"},
+                                "count": {"$sum": 1}
+                            }}
+                        ]
+                    }
+                }
+            ]
+
+            results = await self.orders.aggregate(pipeline).to_list(None)
+            summary = results[0] if results else {}
+
+            # Add active positions if including futures
+            if include_futures:
+                active_positions = await self.get_futures_positions(active_only=True)
+                summary["active_positions"] = len(active_positions)
+                summary["unrealized_pnl"] = sum(
+                    float(pos["unrealized_profit"]) for pos in active_positions
+                )
+
+            return summary
+        except Exception as e:
+            logger.error(f"Failed to get trading summary: {e}")
+            return {}
+
+    async def track_futures_position(self, symbol: str, price: Decimal, quantity: Decimal, 
+                                   direction: str, leverage: int) -> bool:
+        """Track new futures position or update existing one"""
+        try:
+            # Get existing position
+            position = await self.positions.find_one({
+                "symbol": symbol,
+                "status": "OPEN"
+            })
+
+            if position:
+                # Update existing position with average entry
+                old_quantity = Decimal(position['quantity'])
+                old_entry = Decimal(position['entry_price'])
+                total_quantity = old_quantity + quantity
+                
+                # Calculate new average entry price
+                avg_entry = ((old_quantity * old_entry) + (quantity * price)) / total_quantity
+                
+                await self.positions.update_one(
+                    {"_id": position["_id"]},
+                    {
+                        "$set": {
+                            "quantity": str(total_quantity),
+                            "entry_price": str(avg_entry),
+                            "last_updated": datetime.utcnow()
+                        }
+                    }
+                )
+            else:
+                # Create new position
+                await self.positions.insert_one({
+                    "symbol": symbol,
+                    "quantity": str(quantity),
+                    "entry_price": str(price),
+                    "direction": direction,
+                    "leverage": leverage,
+                    "created_at": datetime.utcnow(),
+                    "last_updated": datetime.utcnow(),
+                    "status": "OPEN",
+                    "trades": [{
+                        "price": str(price),
+                        "quantity": str(quantity),
+                        "timestamp": datetime.utcnow()
+                    }]
+                })
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to track futures position: {e}")
+            return False
+
+    async def get_position_pnl(self, symbol: str, current_price: Decimal) -> Dict:
+        """Calculate PnL for a position"""
+        try:
+            position = await self.positions.find_one({
+                "symbol": symbol,
+                "status": "OPEN"
+            })
+
+            if not position:
+                return {}
+
+            entry_price = Decimal(position['entry_price'])
+            quantity = Decimal(position['quantity'])
+            leverage = int(position['leverage'])
+            direction = position['direction']
+
+            # Calculate PnL
+            if direction == "LONG":
+                pnl = (current_price - entry_price) * quantity * leverage
+            else:
+                pnl = (entry_price - current_price) * quantity * leverage
+
+            pnl_percentage = (pnl / (entry_price * quantity)) * 100
+
+            return {
+                "entry_price": float(entry_price),
+                "current_price": float(current_price),
+                "quantity": float(quantity),
+                "leverage": leverage,
+                "direction": direction,
+                "unrealized_pnl": float(pnl),
+                "pnl_percentage": float(pnl_percentage),
+                "position_value": float(entry_price * quantity),
+                "trades": position.get('trades', [])
+            }
+
+        except Exception as e:
+            logger.error(f"Failed to calculate position PnL: {e}")
+            return {}
+
+    async def update_position_status(self, symbol: str, status: str, 
+                                   closed_at: datetime = None,
+                                   closing_order_id: str = None,
+                                   realized_pnl: Decimal = None) -> bool:
+        """Update position status and add closing details"""
+        try:
+            update_data = {
+                "status": status,
+                "updated_at": datetime.utcnow()
+            }
+            
+            if status == "CLOSED":
+                update_data.update({
+                    "closed_at": closed_at,
+                    "closing_order_id": closing_order_id,
+                    "realized_pnl": str(realized_pnl) if realized_pnl else None
+                })
+            
+            result = await self.positions.update_one(
+                {"symbol": symbol, "status": "OPEN"},
+                {"$set": update_data}
+            )
+            return result.modified_count > 0
+            
+        except Exception as e:
+            logger.error(f"Failed to update position status: {e}")
+            return False
+
+    async def get_position(self, symbol: str) -> Optional[Dict]:
+        """Get single position by symbol"""
+        try:
+            return await self.positions.find_one({
+                "symbol": symbol,
+                "status": "OPEN"
+            })
+        except Exception as e:
+            logger.error(f"Failed to get position: {e}")
+            return None
+
+    async def track_spot_order(self, symbol: str, price: Decimal, quantity: Decimal) -> bool:
+        """Track a new spot order"""
+        try:
+            # Calculate total cost
+            total_cost = price * quantity
+            
+            # Create order tracking document
+            order_doc = {
+                "symbol": symbol,
+                "quantity": str(quantity),
+                "price": str(price), 
+                "total_cost": str(total_cost),
+                "order_type": "spot",
+                "created_at": datetime.utcnow(),
+                "last_updated": datetime.utcnow(),
+                "status": "OPEN"
+            }
+            
+            await self.orders.insert_one(order_doc)
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to track spot order: {e}")
+            return False
+
+    async def get_triggered_thresholds(self, symbol: str, timeframe: str) -> List[float]:
+        """Get triggered thresholds for symbol and timeframe"""
+        try:
+            cursor = self.thresholds.find({
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "active": True
+            })
+            thresholds = []
+            async for doc in cursor:
+                thresholds.append(float(doc['threshold']))
+            return thresholds
+        except Exception as e:
+            logger.error(f"Error getting triggered thresholds: {e}")
+            return []
+
+    async def add_triggered_threshold(self, symbol: str, timeframe: str, 
+                                   threshold: float, price: float,
+                                   reference_price: float, price_change: float) -> bool:
+        """Store triggered threshold"""
+        try:
+            await self.thresholds.update_one(
+                {
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "threshold": threshold
+                },
+                {
+                    "$set": {
+                        "triggered_at": datetime.utcnow(),
+                        "price": price,
+                        "reference_price": reference_price,
+                        "price_change": price_change,
+                        "active": True
+                    }
+                },
+                upsert=True
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Error storing triggered threshold: {e}")
+            return False
+
+    async def reset_timeframe_thresholds(self, timeframe: str) -> bool:
+        """Reset thresholds for timeframe"""
+        try:
+            result = await self.thresholds.update_many(
+                {"timeframe": timeframe},
+                {"$set": {"active": False}}
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Error resetting thresholds: {e}")
+            return False
 
     # ...rest of existing code...

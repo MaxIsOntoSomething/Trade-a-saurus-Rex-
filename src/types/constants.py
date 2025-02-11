@@ -12,7 +12,13 @@ PRECISION = {
 TIMEFRAME_INTERVALS = {
     'DAILY': timedelta(days=1),
     'WEEKLY': timedelta(weeks=1),
-    'MONTHLY': timedelta(days=30)
+    'MONTHLY': timedelta(days=30)  # approximation
+}
+
+FUTURES_TIMEFRAME_INTERVALS = {
+    'DAILY': timedelta(days=1),
+    'WEEKLY': timedelta(weeks=1),
+    'MONTHLY': timedelta(days=30)  # Approximation
 }
 
 # Rate limiting
@@ -24,6 +30,27 @@ MIN_NOTIONAL = {
     'BTCUSDT': 10,
     'ETHUSDT': 10,
     'DEFAULT': 10
+}
+
+# Futures-specific constants
+FUTURES_SETTINGS = {
+    'DEFAULT_LEVERAGE': 2,
+    'MAX_LEVERAGE': 125,
+    'MIN_LEVERAGE': 1,
+    'MARGIN_TYPES': ['ISOLATED', 'CROSSED'],
+    'POSITION_MODES': ['ONE_WAY', 'HEDGE']
+}
+
+FUTURES_MAINTENANCE_MARGINS = {
+    'BTCUSDT': 0.0075,  # 0.75%
+    'ETHUSDT': 0.01,    # 1%
+    'DEFAULT': 0.02     # 2%
+}
+
+FUTURES_MIN_NOTIONAL = {
+    'BTCUSDT': 5,
+    'ETHUSDT': 5,
+    'DEFAULT': 5
 }
 
 # Tax settings

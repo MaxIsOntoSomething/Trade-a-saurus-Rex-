@@ -1,34 +1,37 @@
-import mplfinance as mpf
-import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import matplotlib.ticker as ticker
 from datetime import datetime
 from decimal import Decimal
-from typing import List, Dict, Optional
-import logging
-from ..types.models import TimeFrame, Order
 import io
+import logging
+import pandas as pd  # Add missing pandas import
+from typing import List, Dict, Optional
+from ..types.models import Order, OrderType, TradeDirection, TimeFrame  # Added TimeFrame import
 
 logger = logging.getLogger(__name__)
 
 class ChartGenerator:
     def __init__(self):
-        self.style = mpf.make_mpf_style(
-            base_mpf_style='yahoo',  # Changed to yahoo style for better readability
-            gridstyle='',
-            y_on_right=True,
-            marketcolors=mpf.make_marketcolors(
-                up='#26a69a',
-                down='#ef5350',
-                edge='inherit',
-                wick='inherit',
-                volume='in',
-                ohlc='inherit'
-            ),
-            rc={
-                'axes.labelsize': 12,
-                'axes.titlesize': 14,
-                'font.size': 12
-            }
-        )
+        plt.style.use('dark_background')
+        self.colors = {
+            'up': '#26a69a',    # Green for up candles
+            'down': '#ef5350',   # Red for down candles
+            'line': '#e0e0e0',   # White for lines
+            'entry': '#ffeb3b',  # Yellow for entry line
+            'liq_long': '#ef5350',  # Red for long liquidation
+            'liq_short': '#26a69a',  # Green for short liquidation
+            'futures_long': '#26a69a',  # Green for long trades
+            'futures_short': '#ef5350',  # Red for short trades
+            'spot': '#ffeb3b'    # Yellow for spot trades
+        }
+        
+        # Timeframe formats for x-axis
+        self.timeframe_formats = {
+            TimeFrame.DAILY: '%H:%M',    # Show hours and minutes for daily
+            TimeFrame.WEEKLY: '%Y-%m-%d', # Show full date for weekly
+            TimeFrame.MONTHLY: '%Y-%m-%d' # Show full date for monthly
+        }
 
     def validate_candle_data(self, candles: List[Dict]) -> bool:
         """Validate candle data for completeness and correctness"""
@@ -40,24 +43,16 @@ class ChartGenerator:
             required_fields = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
             
             for candle in candles:
-                # Check all required fields exist
                 if not all(field in candle for field in required_fields):
                     logger.error(f"Missing required fields in candle: {candle}")
                     return False
                     
-                # Validate price relationships
                 if not (float(candle['low']) <= float(candle['high']) and 
                        float(candle['open']) <= float(candle['high']) and 
                        float(candle['close']) <= float(candle['high']) and
                        float(candle['low']) <= float(candle['open']) and
                        float(candle['low']) <= float(candle['close'])):
                     logger.error(f"Invalid price relationships in candle: {candle}")
-                    return False
-                    
-                # Validate numeric values
-                if any(not isinstance(candle[field], (int, float)) 
-                      for field in ['open', 'high', 'low', 'close', 'volume']):
-                    logger.error(f"Non-numeric values in candle: {candle}")
                     return False
 
             return True
@@ -66,157 +61,130 @@ class ChartGenerator:
             logger.error(f"Error validating candle data: {e}")
             return False
 
-    def validate_reference_price(self, ref_price: float, candles: List[Dict]) -> bool:
-        """Validate reference price against candle data"""
-        if not candles:
-            return False
-            
-        # Get price range from candles
-        all_prices = []
-        for candle in candles:
-            all_prices.extend([
-                float(candle['open']),
-                float(candle['high']),
-                float(candle['low']),
-                float(candle['close'])
-            ])
-            
-        min_price = min(all_prices)
-        max_price = max(all_prices)
-        price_range = max_price - min_price
-        
-        # Calculate acceptable range (50% of price range)
-        margin = price_range * 0.5
-        acceptable_min = min_price - margin
-        acceptable_max = max_price + margin
-        
-        # Check if reference price is within acceptable range
-        if not acceptable_min <= ref_price <= acceptable_max:
-            logger.warning(
-                f"Reference price ${ref_price:.3f} outside acceptable range "
-                f"${acceptable_min:.3f} - ${acceptable_max:.3f}"
-            )
-            return False
-            
-        return True
+    def calculate_liquidation_price(self, order: Order) -> Optional[float]:
+        """Calculate liquidation price for futures orders"""
+        if order.order_type != OrderType.FUTURES or not order.leverage:
+            return None
 
-    def prepare_candle_data(self, candles: List[Dict]) -> pd.DataFrame:
-        """Convert raw candle data to pandas DataFrame"""
-        df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df.set_index('timestamp', inplace=True)
-        return df
+        try:
+            entry_price = float(order.price)
+            leverage = float(order.leverage)
+            
+            # Simplified liquidation calculation (adjust maintenance margin as needed)
+            maintenance_margin = 0.01  # 1% maintenance margin
+            
+            if order.direction == TradeDirection.LONG:
+                liq_price = entry_price * (1 - (1 / leverage) + maintenance_margin)
+            else:
+                liq_price = entry_price * (1 + (1 / leverage) - maintenance_margin)
+            
+            return liq_price
+        except Exception as e:
+            logger.error(f"Error calculating liquidation price: {e}")
+            return None
 
-    async def generate_trade_chart(self, 
-                                 candles: List[Dict], 
-                                 order: Order,
-                                 reference_price: Optional[Decimal] = None) -> Optional[bytes]:
-        """Generate candlestick chart with trade markers"""
+    async def generate_trade_chart(self, candles: List[Dict], order: Order, 
+                                 ref_price: Optional[Decimal] = None) -> Optional[bytes]:
+        """Generate clean chart with thicker candles and proper date formatting"""
         try:
             # Validate input data
             if not self.validate_candle_data(candles):
-                logger.warning("Skipping chart generation due to insufficient data")
+                logger.error("Invalid candle data")
                 return None
 
-            df = self.prepare_candle_data(candles)
-            
-            # Validate reference price if provided
-            ref_value = float(reference_price) if reference_price else None
-            if ref_value and not self.validate_reference_price(ref_value, candles):
-                logger.warning("Using first candle's open price as reference")
-                ref_value = float(df.iloc[0]['open'])
+            # Limit to last 8 candles for cleaner look
+            candles = candles[-8:]
 
-            # Verify opening price
-            opening_price = float(df.iloc[0]['open'])
-            if abs(opening_price - float(reference_price if reference_price else 0)) > (opening_price * 0.1):
-                logger.warning(f"Large discrepancy between reference price and candle open price: "
-                             f"Open={opening_price}, Ref={reference_price}")
-            
-            # Create empty list for addplots
-            addplots = []
+            # Create figure with black background
+            fig, ax = plt.subplots(figsize=(12, 6), facecolor='black')
+            ax.set_facecolor('black')
 
-            # Add entry point marker
-            entry_time = order.filled_at or order.created_at
-            if entry_time:
-                # Create entry marker with NaN values
-                entry_series = pd.Series(index=df.index, dtype=float)
-                entry_series.loc[:] = float('nan')
+            # Calculate candle width based on data
+            times = [datetime.fromtimestamp(c['timestamp'] / 1000) for c in candles]
+            if len(times) > 1:
+                time_diff = (times[-1] - times[0]).total_seconds()
+                width = (time_diff / len(candles)) * 0.6  # 60% of average time delta
+            else:
+                width = 43200  # 12 hours in seconds
+
+            # Plot candlesticks with thicker style
+            for candle in candles:
+                t = datetime.fromtimestamp(candle['timestamp'] / 1000)
+                o = float(candle['open'])
+                h = float(candle['high'])
+                l = float(candle['low'])
+                c = float(candle['close'])
+
+                color = self.colors['up'] if c >= o else self.colors['down']
                 
-                # Find closest candle time
-                closest_time = min(df.index, key=lambda x: abs(x - entry_time))
-                entry_series.loc[closest_time] = float(order.price)
+                # Plot thicker wicks with shadow effect
+                ax.vlines(t, l, h, color=color, linewidth=2, zorder=1)
                 
-                ap_entry = mpf.make_addplot(
-                    entry_series,
-                    type='scatter',
-                    marker='^',
-                    markersize=100,
-                    color='lime'
-                )
-                addplots.append(ap_entry)
+                # Plot thicker body with 3D effect
+                body_height = c - o if c >= o else o - c
+                body_bottom = min(o, c)
+                ax.bar(t, body_height, bottom=body_bottom, 
+                      width=width/86400, color=color,  # Divide by seconds in day
+                      alpha=1.0, zorder=2)
 
-            # Add reference price line if provided and valid
-            if reference_price is not None:
-                ref_value = float(reference_price)
-                if not pd.isna(ref_value):
-                    ref_series = pd.Series([ref_value] * len(df), index=df.index)
-                    ap_ref = mpf.make_addplot(
-                        ref_series,
-                        type='line',
-                        color='blue',
-                        linestyle='--',
-                        width=1
-                    )
-                    addplots.append(ap_ref)
+            # Add entry price line
+            entry_price = float(order.price)
+            ax.axhline(y=entry_price, color=self.colors['entry'], 
+                      linestyle='--', linewidth=1.5,
+                      label=f'Entry ${entry_price:,.2f}')
 
-            # Add opening price line
-            open_series = pd.Series([opening_price] * len(df), index=df.index)
-            ap_open = mpf.make_addplot(
-                open_series,
-                type='line',
-                color='gray',
-                linestyle=':',
-                width=1,
-                alpha=0.5
+            # Add liquidation price for futures
+            if order.order_type == OrderType.FUTURES:
+                liq_price = self.calculate_liquidation_price(order)
+                if liq_price:
+                    liq_color = (self.colors['liq_long'] if order.direction == TradeDirection.LONG 
+                               else self.colors['liq_short'])
+                    ax.axhline(y=liq_price, color=liq_color, 
+                             linestyle=':', linewidth=1.5,
+                             label=f'Liq ${liq_price:,.2f}')
+
+            # Format axes
+            ax.grid(True, alpha=0.1, linestyle='--')
+            ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, p: f'${x:,.2f}'))
+            
+            # Set date format based on timeframe
+            date_format = self.timeframe_formats.get(order.timeframe, '%Y-%m-%d %H:%M')
+            ax.xaxis.set_major_formatter(mdates.DateFormatter(date_format))
+            plt.xticks(rotation=45)
+
+            # Add footer with timeframe info
+            footer_text = (
+                f"{order.symbol} • {order.timeframe.value.title()} Chart • "
+                f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC"
             )
-            addplots.append(ap_open)
+            plt.figtext(0.99, 0.01, footer_text, 
+                       ha='right', va='bottom', 
+                       color='gray', alpha=0.7, 
+                       fontsize=8)
 
-            # Create plot
-            buf = io.BytesIO()
-            
-            # Plot configuration with percentages
-            entry_change = ((float(order.price) - opening_price) / opening_price) * 100
-            current_change = ((float(df.iloc[-1]['close']) - opening_price) / opening_price) * 100
-            
-            title = (
-                f"{order.symbol} Trade Analysis ({order.timeframe.value})\n"
-                f"Open: ${opening_price:.2f} | Entry: ${float(order.price):.2f} ({entry_change:+.2f}%)\n"
-                f"Current: ${float(df.iloc[-1]['close']):.2f} ({current_change:+.2f}%)"
-            )
+            # Add title
+            title = f"{order.symbol}"
+            if order.order_type == OrderType.FUTURES:
+                title += f" {order.direction.value.upper()} {order.leverage}x"
+            plt.title(title, pad=10)
 
-            # Generate plot with error handling
-            try:
-                mpf.plot(
-                    df,
-                    type='candle',
-                    style=self.style,
-                    title=title,
-                    ylabel='Price (USDT)',
-                    ylabel_lower='Volume',
-                    volume=True,
-                    figsize=(12, 8),
-                    addplot=addplots,
-                    savefig=dict(fname=buf, dpi=150, bbox_inches='tight')
-                )
-            except Exception as plot_error:
-                logger.error(f"Plot generation error: {plot_error}")
-                return None
+            # Add legend with better positioning
+            ax.legend(loc='upper left', bbox_to_anchor=(0.02, 0.98))
 
-            buf.seek(0)
-            return buf.getvalue()
-            
+            # Adjust layout
+            plt.tight_layout()
+
+            # Save with high quality
+            buffer = io.BytesIO()
+            plt.savefig(buffer, format='png', dpi=150, bbox_inches='tight')
+            buffer.seek(0)
+            plt.close()
+
+            return buffer.getvalue()
+
         except Exception as e:
-            logger.error(f"Error generating chart: {e}")
+            logger.error(f"Error generating chart: {e}", exc_info=True)
+            plt.close()
             return None
 
     def format_info_text(self, order: Order, reference_price: Optional[Decimal] = None) -> str:
@@ -227,7 +195,6 @@ class ChartGenerator:
                 f"Entry Price: ${float(order.price):.2f}"
             ]
             
-            # Safe decimal calculations
             if reference_price is not None:
                 order_price = Decimal(str(order.price))
                 change = ((order_price - reference_price) / reference_price) * Decimal('100')
@@ -235,7 +202,7 @@ class ChartGenerator:
                 
             info.extend([
                 f"Amount: {float(order.quantity):.8f}",
-                f"Total Value: ${float(order.price * order.quantity):.2f}",  # Fixed format string here
+                f"Total Value: ${float(order.price * order.quantity)::.2f}",
                 f"Type: {order.order_type.value.upper()}"
             ])
             
@@ -247,5 +214,5 @@ class ChartGenerator:
             return "\n".join(info)
             
         except Exception as e:
-            logger.error(f"Error formatting info text: {e}", exc_info=True)  # Added stack trace
+            logger.error(f"Error formatting info text: {e}", exc_info=True)
             return "Error generating trade information"

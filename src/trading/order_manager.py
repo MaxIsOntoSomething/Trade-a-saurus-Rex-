@@ -5,10 +5,11 @@ import os
 import platform
 from datetime import datetime, timedelta
 from typing import Dict, List
-from ..types.models import Order, OrderStatus, TimeFrame
+from ..types.models import Order, OrderStatus, TimeFrame, OrderType, TradeDirection
 from ..trading.binance_client import BinanceClient
 from ..database.mongo_client import MongoClient
 from ..telegram.bot import TelegramBot
+from .futures_client import FuturesClient
 
 logger = logging.getLogger(__name__)
 
@@ -21,15 +22,45 @@ class OrderManager:
         self.config = config
         self.running = False
         self.monitor_task = None
-        self.check_interval = 60  # 60 seconds between checks
-        logger.setLevel(logging.DEBUG)  # Add this line
+        self.check_interval = 60
+        logger.setLevel(logging.DEBUG)
         self.clear_command = 'cls' if platform.system() == 'Windows' else 'clear'
         
+        # Add client type tracking
+        self.client_type = config['environment']['trading_mode']
+        
+        # Initialize futures client if enabled
+        self.futures_client = None
+        if (config['environment']['trading_mode'] == 'futures' or 
+            config['trading'].get('futures', {}).get('enabled', False)):
+            if config['environment']['testnet']:
+                api_config = {
+                    **config['binance']['testnet_futures'],
+                    'testnet': True,  # Add testnet flag
+                    **config['trading'].get('futures_settings', {})
+                }
+            else:
+                api_config = {
+                    **config['binance']['mainnet'],
+                    'testnet': False,
+                    **config['trading'].get('futures_settings', {})
+                }
+            self.futures_client = FuturesClient(api_config)
+            logger.info("Futures trading enabled")
+
+        # Track active client
+        self.active_client = binance_client
+
     async def start(self):
-        """Start the order manager"""
+        """Start the order manager with futures support"""
         self.running = True
         logger.info("Starting order monitoring...")
-        # Don't await the task, just create and return it
+        
+        # Initialize futures client if enabled
+        if self.futures_client:
+            await self.futures_client.initialize()
+            logger.info("Futures trading enabled")
+            
         self.monitor_task = asyncio.create_task(self.monitor_thresholds())
         return self.monitor_task  # Return the task instead of awaiting it
         
@@ -47,13 +78,29 @@ class OrderManager:
     async def check_connection_health(self):
         """Check if all connections are healthy with improved error handling"""
         try:
-            # Check Binance connection with timeout
-            await asyncio.wait_for(self.binance_client.client.ping(), timeout=5.0)
+            # Check MongoDB connection first
+            mongo_status = await asyncio.wait_for(
+                self.mongo_client.db.command("ping"),
+                timeout=5.0
+            )
             
-            # Check MongoDB connection with timeout
-            await asyncio.wait_for(self.mongo_client.db.command('ping'), timeout=5.0)
-            
+            if not mongo_status.get('ok', 0):
+                raise ConnectionError("MongoDB ping failed")
+
+            # Check exchange connection based on client type
+            if isinstance(self.active_client, FuturesClient):
+                await asyncio.wait_for(
+                    self.active_client.ping(),
+                    timeout=5.0
+                )
+            else:
+                await asyncio.wait_for(
+                    self.binance_client.client.ping(),
+                    timeout=5.0
+                )
+
             return True
+
         except asyncio.TimeoutError as e:
             logger.error(f"Connection health check timeout: {e}")
             await self._notify_connection_issue("Connection timeout")
@@ -87,26 +134,56 @@ class OrderManager:
             except Exception as e:
                 logger.error(f"Failed to send connection notification: {e}")
 
-    async def process_symbol(self, symbol: str):
-        """Check daily/weekly/monthly timeframes for a single symbol."""
+    async def get_price(self, symbol: str) -> float:
+        """Get price with fallback between spot and futures"""
         try:
-            logger.info(f"\n=== Processing {symbol} ===")
-            ticker = await self.binance_client.client.get_symbol_ticker(symbol=symbol)
+            # Try primary client first
+            try:
+                ticker = await self.active_client.get_symbol_ticker(symbol=symbol)
+                return float(ticker['price'])
+            except AttributeError:
+                # Fallback to alternate client
+                if self.futures_client and isinstance(self.active_client, BinanceClient):
+                    ticker = await self.futures_client.get_symbol_ticker(symbol=symbol)
+                    return float(ticker['price'])
+                elif isinstance(self.active_client, FuturesClient):
+                    ticker = await self.binance_client.get_symbol_ticker(symbol=symbol)
+                    return float(ticker['price'])
+                raise
+        except Exception as e:
+            logger.error(f"Failed to get price for {symbol}: {e}")
+            raise
+
+    async def process_symbol(self, symbol: str):
+        """Process symbol with improved error handling and fallback"""
+        try:
+            # Use new price getter with fallback
+            current_price = await self.get_price(symbol)
+            logger.info(f"Current {symbol} price: ${current_price:,.2f}")
+
+            # Check if symbol is futures-enabled
+            is_futures = (
+                self.futures_client and 
+                symbol in self.config['trading'].get('futures_settings', {}).get('allowed_pairs', [])
+            )
+            
+            # Get current price from correct client
+            client = self.futures_client if is_futures else self.binance_client
+            # Use client's get_symbol_ticker method which handles the differences
+            ticker = await client.get_symbol_ticker(symbol=symbol)
             current_price = float(ticker['price'])
             logger.info(f"Current {symbol} price: ${current_price:,.2f}")
 
-            # Fetch all reference prices first and wait for completion
-            await self.binance_client.update_reference_prices([symbol])
-            await asyncio.sleep(0.1)  # Small delay after fetching references
+            # Update reference prices using correct client
+            await client.update_reference_prices([symbol])
+            await asyncio.sleep(0.1)
 
-            # Check each timeframe in order
             for timeframe in TimeFrame:
-                await self.binance_client.check_timeframe_reset(timeframe)
+                await client.check_timeframe_reset(timeframe)
                 logger.info(f"Checking {timeframe.value} timeframe...")
                 
-                # Check thresholds with proper timeframe values
                 thresholds = self.config['trading']['thresholds'][timeframe.value]
-                triggered = await self.binance_client.check_thresholds(
+                triggered = await client.check_thresholds(
                     symbol, {timeframe.value: thresholds}
                 )
                 
@@ -118,6 +195,10 @@ class OrderManager:
                     logger.info(f"Created buy order for {symbol} at threshold {threshold}%")
                 
                 await asyncio.sleep(0.1)  # Small delay between timeframes
+
+            # Add futures position check if applicable
+            if is_futures:
+                await self.monitor_futures_positions()
 
         except Exception as e:
             logger.error(f"Error processing {symbol}: {e}", exc_info=True)
@@ -208,29 +289,82 @@ class OrderManager:
                 await asyncio.sleep(10)
             
     async def create_order(self, symbol: str, timeframe: TimeFrame, threshold: float):
-        """Create and store a new order"""
+        """Create and store an order with improved futures support"""
         try:
-            order = await self.binance_client.place_limit_buy_order(
-                symbol=symbol,
-                amount=self.config['trading']['order_amount'],
-                threshold=threshold,
-                timeframe=timeframe
+            # Get current price for the signal
+            ticker = await self.active_client.get_symbol_ticker(symbol=symbol)
+            signal_price = float(ticker['price'])
+
+            # Check if this should be a futures order
+            is_futures = (
+                self.futures_client and 
+                symbol in self.config['trading'].get('futures_settings', {}).get('allowed_pairs', [])
             )
             
-            await self.mongo_client.insert_order(order)
-            await self.telegram_bot.send_order_notification(order)
+            order = None
+            if is_futures:
+                # Use futures client for futures orders
+                order = await self.futures_client.place_futures_order(
+                    symbol=symbol,
+                    amount=self.config['trading']['order_amount'],
+                    direction=TradeDirection.LONG,
+                    leverage=self.config['trading']['futures_settings']['default_leverage'],
+                    margin_type=self.config['trading']['futures_settings']['margin_type'],
+                    signal_price=signal_price,
+                    threshold=threshold,
+                    timeframe=timeframe
+                )
+            else:
+                # Use spot client for spot orders
+                order = await self.binance_client.place_limit_buy_order(
+                    symbol=symbol,
+                    amount=self.config['trading']['order_amount'],
+                    threshold=threshold,
+                    timeframe=timeframe
+                )
+            
+            if order:
+                logger.info(f"Order created: {order.order_id} ({order.order_type.value})")
+                await self.mongo_client.insert_order(order)
+                await self.telegram_bot.send_order_notification(order)
+            else:
+                logger.error(f"Failed to create order for {symbol}")
+                return  # Return without raising error
             
         except Exception as e:
-            logger.error(f"Failed to create order: {e}")
-            
+            logger.error(f"Error creating order: {e}")
+            return  # Return without raising error
+
     async def monitor_orders(self):
-        """Monitor and update status of pending orders"""
+        """Monitor both spot and futures orders"""
         try:
             pending_orders = await self.mongo_client.get_pending_orders()
             cancel_after = timedelta(hours=self.config['trading']['cancel_after_hours'])
             
             for order in pending_orders:
-                # Check if order should be cancelled due to time
+                # Handle futures orders
+                if order.order_type == OrderType.FUTURES:
+                    if self.futures_client:
+                        # Get position info
+                        positions = await self.futures_client.get_open_positions()
+                        if order.symbol in positions:
+                            position_data = positions[order.symbol]
+                            # Check if position should be closed
+                            if datetime.utcnow() - order.created_at > cancel_after:
+                                closing_order = await self.futures_client.close_position(
+                                    order.symbol,
+                                    position_data
+                                )
+                                if closing_order:
+                                    await self.mongo_client.update_order_status(
+                                        order.order_id,
+                                        OrderStatus.FILLED,
+                                        filled_at=datetime.utcnow()
+                                    )
+                                    await self.telegram_bot.send_roar(closing_order)
+                    continue
+                
+                # Handle spot orders
                 if datetime.utcnow() - order.created_at > cancel_after:
                     if await self.binance_client.cancel_order(order.symbol, order.order_id):
                         order.status = OrderStatus.CANCELLED
@@ -278,3 +412,76 @@ class OrderManager:
 
         except Exception as e:
             logger.error(f"Error monitoring orders: {e}", exc_info=True)
+
+    async def check_futures_positions(self):
+        """Monitor open futures positions"""
+        if not self.futures_client:
+            return
+            
+        try:
+            positions = await self.futures_client.get_open_positions()
+            account_info = await self.futures_client.get_account_info()
+            
+            # Log positions and account info
+            logger.info(f"Open Futures Positions: {len(positions)}")
+            logger.info(f"Account Balance: ${float(account_info['totalWalletBalance']):,.2f}")
+            logger.info(f"Unrealized PNL: ${float(account_info['totalUnrealizedProfit']):,.2f}")
+            
+            # Check for position updates
+            for symbol, position in positions.items():
+                # Process position updates
+                # Add your position management logic here
+                pass
+                
+        except Exception as e:
+            logger.error(f"Error checking futures positions: {e}")
+
+    async def switch_client(self, client_type: str):
+        """Switch between spot and futures clients with improved error handling"""
+        try:
+            if client_type == self.client_type:
+                return
+
+            if (client_type == "futures"):
+                if not self.futures_client:
+                    logger.error("Futures client not initialized")
+                    return
+                self.active_client = self.futures_client
+                self.client_type = "futures"
+                logger.debug("Switched to futures client")
+            elif client_type == "spot":
+                self.active_client = self.binance_client
+                self.client_type = "spot"
+                logger.debug("Switched to spot client")
+            else:
+                logger.error(f"Invalid client type: {client_type}")
+                raise ValueError(f"Invalid client type: {client_type}")
+
+        except Exception as e:
+            logger.error(f"Error switching client: {e}")
+            raise
+
+    async def monitor_futures_positions(self):
+        """Monitor and manage futures positions"""
+        if not self.futures_client:
+            return
+            
+        try:
+            positions = await self.futures_client.get_open_positions()
+            for symbol, position in positions.items():
+                # Update position in database
+                await self.mongo_client.update_futures_position(position)
+                
+                # Check position age
+                created_at = datetime.fromtimestamp(float(position['updateTime']) / 1000)
+                age = datetime.utcnow() - created_at
+                
+                # Close old positions
+                if age > timedelta(hours=self.config['trading']['cancel_after_hours']):
+                    closing_order = await self.futures_client.close_position(symbol, position)
+                    if closing_order:
+                        await self.mongo_client.insert_order(closing_order)
+                        await self.telegram_bot.send_roar(closing_order)
+                        
+        except Exception as e:
+            logger.error(f"Error monitoring futures positions: {e}")

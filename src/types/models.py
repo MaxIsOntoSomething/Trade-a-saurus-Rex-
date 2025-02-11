@@ -22,6 +22,10 @@ class TradeDirection(Enum):
     LONG = "long"
     SHORT = "short"
 
+class MarginType(Enum):
+    ISOLATED = 'ISOLATED'
+    CROSSED = 'CROSSED'
+
 @dataclass
 class Order:
     symbol: str
@@ -39,5 +43,43 @@ class Order:
     cancelled_at: Optional[datetime] = None
     fees: Decimal = Decimal('0')
     fee_asset: str = 'USDT'
-    threshold: Optional[float] = None  # Add optional threshold field
-    is_manual: bool = False  # Add this field
+    threshold: Optional[float] = None
+    is_manual: bool = False
+    margin_type: Optional[MarginType] = None
+    metadata: dict = None
+    balance_change: Optional[Decimal] = None
+    realized_pnl: Optional[Decimal] = None
+    unrealized_pnl: Optional[Decimal] = None
+
+    def __post_init__(self):
+        # Convert numeric strings to Decimal
+        if isinstance(self.price, (str, float)):
+            self.price = Decimal(str(self.price))
+        if isinstance(self.quantity, (str, float)):
+            self.quantity = Decimal(str(self.quantity))
+        if isinstance(self.fees, (str, float)):
+            self.fees = Decimal(str(self.fees))
+        
+        # Initialize metadata if None
+        if self.metadata is None:
+            self.metadata = {
+                'inserted_at': datetime.utcnow(),
+                'last_checked': datetime.utcnow(),
+                'check_count': 0,
+                'error_count': 0
+            }
+
+    @property
+    def total_value(self) -> Decimal:
+        """Calculate total value in quote currency"""
+        return self.price * self.quantity
+
+    @property
+    def is_futures(self) -> bool:
+        """Check if this is a futures order"""
+        return self.order_type == OrderType.FUTURES
+
+    @property
+    def age(self) -> float:
+        """Get order age in hours"""
+        return (datetime.utcnow() - self.created_at).total_seconds() / 3600

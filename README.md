@@ -63,6 +63,106 @@ This bot watches for significant price drops in cryptocurrencies and automatical
    - Copy `config/config_template.json` to `config/config.json`
    - Add your API keys and settings
 
+
+## 📝 Configuration Guide
+
+### Environment Settings
+```json
+"environment": {
+    "testnet": true,          // Use testnet (true) or mainnet (false)
+    "trading_mode": "futures" // "spot" or "futures"
+}
+```
+
+### API Configuration
+```json
+"binance": {
+    "mainnet": {
+        "api_key": "your_mainnet_api_key",
+        "api_secret": "your_mainnet_api_secret"
+    },
+    "testnet_spot": {
+        "api_key": "your_testnet_spot_key",
+        "api_secret": "your_testnet_spot_secret"
+    },
+    "testnet_futures": {
+        "api_key": "your_testnet_futures_key",
+        "api_secret": "your_testnet_futures_secret"
+    }
+}
+```
+
+### Trading Settings
+```json
+"trading": {
+    "base_currency": "USDT",          // Base currency for trading
+    "order_amount": 100,              // Amount per order in USDT
+    "cancel_after_hours": 8,          // Cancel unfilled orders after X hours
+    "reserve_balance": 500,           // Minimum balance to maintain
+    "pairs": ["BTCUSDT", "ETHUSDT"], // Trading pairs
+    "thresholds": {                   // Price drop thresholds
+        "daily": [1, 2, 5],          // Trigger at 1%, 2%, 5% drops
+        "weekly": [5, 10, 15],       // Weekly thresholds
+        "monthly": [10, 20, 30]      // Monthly thresholds
+    },
+    "futures_settings": {             // Futures-specific settings
+        "enabled": true,              // Enable futures trading
+        "default_leverage": 5,        // 1-125x leverage
+        "margin_type": "ISOLATED",    // "ISOLATED" or "CROSSED"
+        "position_mode": "ONE_WAY",   // "ONE_WAY" or "HEDGE"
+        "allowed_pairs": [            // Pairs allowed for futures
+            "BTCUSDT",
+            "ETHUSDT"
+        ]
+    }
+}
+```
+
+### MongoDB Settings
+```json
+"mongodb": {
+    "uri": "mongodb://localhost:27017",
+    "database": "tradeasaurus"
+}
+```
+
+### Telegram Settings
+```json
+"telegram": {
+    "bot_token": "your_telegram_bot_token",
+    "allowed_users": [123456789]      // List of allowed Telegram user IDs
+}
+```
+
+## 🔧 Settings Explained
+
+### Thresholds
+- Thresholds trigger buy orders when price drops by specified percentages
+- Each timeframe (daily/weekly/monthly) maintains separate thresholds
+- Lower thresholds trigger first (e.g., 1% before 2%)
+- Thresholds reset at their respective intervals
+
+### Futures Settings
+- `default_leverage`: Trading leverage (1-125x)
+- `margin_type`: 
+  - ISOLATED: Risk limited to position margin
+  - CROSSED: Shared margin across positions
+- `position_mode`:
+  - ONE_WAY: Single position per symbol
+  - HEDGE: Allow both long/short positions
+
+### Reserve Balance
+- Maintains minimum USDT balance
+- Prevents trading when balance would drop below reserve
+- Trading auto-resumes when balance recovers
+- Set to 0 to disable
+
+### Cancel Timer
+- Automatically cancels unfilled orders
+- Prevents stale orders
+- Time set in hours
+- Applies to both spot and futures orders
+
 ## Telegram Commands
 
 - `/balance` - Current portfolio balance

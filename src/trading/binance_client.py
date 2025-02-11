@@ -13,7 +13,8 @@ from ..utils.chart_generator import ChartGenerator
 logger = logging.getLogger(__name__)
 
 class BinanceClient:
-    def __init__(self, api_key: str, api_secret: str, testnet: bool = True):
+    def __init__(self, api_key: str, api_secret: str, testnet: bool = True,
+                 base_currency: str = None, reserve_balance: float = None):
         self.api_key = api_key
         self.api_secret = api_secret
         self.testnet = testnet
@@ -34,13 +35,24 @@ class BinanceClient:
         logger.setLevel(logging.DEBUG)
         self.telegram_bot = None
         self.chart_generator = ChartGenerator()
-        # Initialize these as None
-        self.reserve_balance = None
-        self.base_currency = None
+        
+        # Initialize with provided values
+        self.base_currency = base_currency or 'USDT'
+        self.reserve_balance = float(reserve_balance) if reserve_balance is not None else 0
+        
+        logger.info(f"[INIT] Initializing with base currency: {self.base_currency}")
+        logger.info(f"[INIT] Reserve balance set to: ${self.reserve_balance:,.2f}")
+        
+        # Add MongoDB client reference for threshold tracking
+        self.mongo_client = None
 
     def set_telegram_bot(self, bot):
         """Set telegram bot for notifications"""
         self.telegram_bot = bot
+
+    def set_mongo_client(self, mongo_client):
+        """Set MongoDB client for threshold tracking"""
+        self.mongo_client = mongo_client
         
     async def check_initial_balance(self) -> bool:
         """Check if current balance is above reserve requirement"""
@@ -264,14 +276,12 @@ class BinanceClient:
             raise
             
     async def check_thresholds(self, symbol: str, thresholds: Dict[str, List[float]]) -> Optional[tuple]:
-        """Check price against thresholds and return (timeframe, threshold) if triggered"""
+        """Check price against thresholds with MongoDB tracking"""
         try:
-            await self.rate_limiter.acquire()
             ticker = await self.client.get_symbol_ticker(symbol=symbol)
             current_price = float(ticker['price'])
             
             for timeframe in TimeFrame:
-                # Skip if timeframe not in thresholds
                 if timeframe.value not in thresholds:
                     continue
 
@@ -285,13 +295,28 @@ class BinanceClient:
                 price_change = ((ref_price - current_price) / ref_price) * 100
                 logger.debug(f"{symbol} {timeframe.value} price change: {price_change:.2f}%")
                 
+                # Get triggered thresholds from MongoDB
+                triggered = await self.mongo_client.get_triggered_thresholds(
+                    symbol, timeframe.value
+                ) if self.mongo_client else []
+                
                 # Check thresholds from lowest to highest
                 for threshold in sorted(thresholds[timeframe.value]):
-                    if (price_change >= threshold and 
-                        threshold not in self.triggered_thresholds[symbol][timeframe]):
+                    if (price_change >= threshold and threshold not in triggered):
                         logger.info(f"Threshold triggered for {symbol}: {threshold}% on {timeframe.value}")
                         
-                        # Send threshold notification before updating triggered list
+                        # Store triggered threshold in MongoDB
+                        if self.mongo_client:
+                            await self.mongo_client.add_triggered_threshold(
+                                symbol=symbol,
+                                timeframe=timeframe.value,
+                                threshold=threshold,
+                                price=current_price,
+                                reference_price=ref_price,
+                                price_change=price_change
+                            )
+                        
+                        # Send threshold notification
                         if self.telegram_bot:
                             await self.telegram_bot.send_threshold_notification(
                                 symbol=symbol,
@@ -302,7 +327,6 @@ class BinanceClient:
                                 price_change=price_change
                             )
                         
-                        self.triggered_thresholds[symbol][timeframe].append(threshold)
                         return timeframe, threshold
                         
             return None
@@ -614,7 +638,10 @@ class BinanceClient:
             if not candles:
                 return None
                 
-            ref_price = self.reference_prices.get(order.symbol, {}).get(order.timeframe)
+            # Get reference price from stored prices
+            ref_price = None
+            if order.symbol in self.reference_prices:
+                ref_price = self.reference_prices[order.symbol].get(order.timeframe)
             
             return await self.chart_generator.generate_trade_chart(
                 candles,
@@ -625,3 +652,16 @@ class BinanceClient:
         except Exception as e:
             logger.error(f"Failed to generate trade chart: {e}")
             return None
+
+    async def get_symbol_ticker(self, symbol: str) -> Dict:
+        """Get current price for symbol"""
+        try:
+            await self.rate_limiter.acquire()
+            ticker = await self.client.get_symbol_ticker(symbol=symbol)
+            return {
+                'symbol': symbol,
+                'price': ticker['price']
+            }
+        except Exception as e:
+            logger.error(f"Failed to get ticker for {symbol}: {e}")
+            raise
