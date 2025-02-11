@@ -208,19 +208,23 @@ MIT License
 - ✅ **Reset Updates Send**  
 - ✅ **MongoDB Integration**  
 - ✅ **Migrating from SQLite**  
-- ✅ **Docker Support**
+- ✅ **Docker Support**  
 
 ### 📌 Planned  
 - 📌 **Weekly & Monthly Summary (Optional)**  
-- 📌 **Hyperliquid Integration**
-- 📌 **Backtest Option to Test Performance**
-- 📌 **Report with real Balance 5k+**
-- 📌 **More Detailed Explanation of Config Readme**
-- 📌 **Take Profit and Stop Lose for Future Trades**
-- 📌 **Add Coins and delete them trough Telegram**
-- 📌 **Chart Generation , Equitiy Curve and Buys Marked**
-## Analysis
+- 📌 **Hyperliquid Integration**  
+- 📌 **Backtest Option to Test Performance**  
+- 📌 **Report with real Balance 5k+**  
+- 📌 **More Detailed Explanation of Config Readme**  
+- 📌 **Take Profit and Stop Lose for Future Trades**  
+- 📌 **Add Coins and delete them through Telegram**  
+- 📌 **Chart Generation, Equity Curve, and Buys Marked**  
 
-![Drop Analysis Daily Candles](src/img/data1.png)
-![Drop Analysis Weekly Candles](src/img/data2.png)
-![Drop Analysis Monthly Candles](src/img/data3.png)
+### ⚠️ Known Issues  
+- 🛑 **Telegram not working with Futures**  
+
+## Analysis  
+
+![Drop Analysis Daily Candles](src/img/data1.png)  
+![Drop Analysis Weekly Candles](src/img/data2.png)  
+![Drop Analysis Monthly Candles](src/img/data3.png)  
