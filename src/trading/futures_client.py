@@ -47,6 +47,22 @@ class FuturesClient:
         self.timeframe_reset = {}  # Add this line
         self.chart_generator = ChartGenerator()  # Initialize chart generator
         
+        # Properly read reserve balance from config
+        self._reserve_balance = None  # Initialize private attribute first
+        
+        # Read reserve balance in priority order
+        if 'reserve_balance' in network_config:
+            self.reserve_balance = float(network_config['reserve_balance'])
+        elif 'trading' in network_config and 'reserve_balance' in network_config['trading']:
+            self.reserve_balance = float(network_config['trading']['reserve_balance'])
+        elif 'env' in network_config and network_config['env'].get('TRADING_RESERVE_BALANCE'):
+            self.reserve_balance = float(network_config['env']['TRADING_RESERVE_BALANCE'])
+        else:
+            self.reserve_balance = 500  # Default to 500 instead of 0
+            logger.info("[INIT] No reserve balance configured, using default: $500.00")
+
+        logger.info(f"[INIT] Reserve balance set to: ${self.reserve_balance:,.2f}")
+        
         # Add missing attributes for threshold tracking
         self.triggered_thresholds = {}
         self.last_reset = {tf: datetime.utcnow() for tf in TimeFrame}
@@ -55,15 +71,16 @@ class FuturesClient:
         # Add timestamp offset tracking
         self.time_offset = 0
         self.last_timestamp = 0
-        self.recv_window = 5000  # Default to 5000ms recvWindow
-
-        # Update timestamp settings
-        self.time_offset = 0
-        self.last_sync = 0
-        self.sync_interval = 30  # Sync every 30 seconds
-        self.recv_window = 10000  # Increase from 5000 to 10000ms
-        self.max_retries = 3
+        self.recv_window = 60000  # Increased from 5000 to 60000
+        self.sync_interval = 30   # Decreased from 60 to 30 for more frequent syncs
+        self.max_retries = 5
         self.retry_delay = 1
+        self.max_delay = 30  # Maximum delay between retries
+
+        self.tp_enabled = network_config.get('tp_enabled', False)
+        self.sl_enabled = network_config.get('sl_enabled', False)
+        self.default_tp_percent = float(network_config.get('default_tp_percent', 50))
+        self.default_sl_percent = float(network_config.get('default_sl_percent', 10))
 
     def set_telegram_bot(self, bot):
         """Set telegram bot for notifications"""
@@ -74,77 +91,78 @@ class FuturesClient:
         return int(time.time() * 1000 + self.time_offset)
 
     async def _sync_time(self, force: bool = False) -> bool:
-        """Synchronize time with Binance server with retries"""
+        """Synchronize time with Binance server with improved retries"""
         now = time.time()
         
-        # Only sync if forced or interval elapsed
-        if not force and (now - self.last_sync) < self.sync_interval:
+        # Sync more frequently and always sync if last sync was more than 30 seconds ago
+        if not force and (now - self.last_sync) < 30:
             return True
             
+        retry_delay = self.retry_delay
         for attempt in range(self.max_retries):
             try:
-                # Get server time
-                start_time = time.time() * 1000
-                server_time = self.client.time()['serverTime']
-                end_time = time.time() * 1000
+                server_time = await asyncio.get_event_loop().run_in_executor(
+                    None, 
+                    lambda: self.client.time()['serverTime']
+                )
                 
-                # Calculate network latency
-                latency = (end_time - start_time) / 2
-                
-                # Only use response if latency is acceptable
-                if latency < 100:  # Less than 100ms latency
-                    self.time_offset = int(server_time - ((start_time + end_time) / 2))
-                    self.last_sync = now
-                    logger.debug(f"Time sync successful - Offset: {self.time_offset}ms, Latency: {latency:.2f}ms")
-                    return True
-                    
-                # Add jitter to retry delay
-                await asyncio.sleep(self.retry_delay * (1 + random.random()))
-                self.retry_delay *= 2  # Exponential backoff
+                self.time_offset = server_time - int(now * 1000)
+                self.last_sync = now
+                logger.info(f"Time sync successful - Offset: {self.time_offset}ms")
+                return True
                 
             except Exception as e:
                 logger.warning(f"Time sync attempt {attempt + 1} failed: {e}")
-                await asyncio.sleep(self.retry_delay)
-                self.retry_delay *= 2
-                
+            
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, self.max_delay)
+            
         logger.error("Failed to synchronize time after max retries")
         return False
 
     async def _make_request(self, method: str, **kwargs) -> Any:
-        """Make API request with automatic time sync and retries"""
+        """Make API request with improved error handling"""
+        retry_delay = self.retry_delay
+        
         for attempt in range(self.max_retries):
             try:
-                # Ensure time is synced
-                if not await self._sync_time():
-                    raise Exception("Time synchronization failed")
-                    
-                # Add timestamp and recvWindow to all requests
-                kwargs.update({
-                    'timestamp': self._get_timestamp(),
-                    'recvWindow': self.recv_window
-                })
+                # Only sync time before critical operations that need timestamp
+                if method not in ['exchange_info', 'ping', 'time']:  # Add exceptions for methods that don't need timestamp
+                    if not await self._sync_time():
+                        raise Exception("Time synchronization failed")
+                    # Add timestamp and increased recvWindow only for methods that need it
+                    kwargs.update({
+                        'timestamp': self._get_timestamp(),
+                        'recvWindow': self.recv_window
+                    })
                 
-                # Make request
-                return getattr(self.client, method)(**kwargs)
+                # Convert synchronous client methods to async
+                client_method = getattr(self.client, method)
+                response = await asyncio.get_event_loop().run_in_executor(
+                    None, 
+                    lambda: client_method(**kwargs)
+                )
+                return response
                 
             except BinanceAPIException as e:
                 if e.code == -1021:  # Timestamp error
-                    logger.warning(f"Timestamp error on attempt {attempt + 1}, resyncing time")
+                    # Force time sync on timestamp error
                     await self._sync_time(force=True)
                     continue
                 raise
                 
-            except Exception as e:
-                logger.error(f"Request failed: {e}")
+            except (asyncio.TimeoutError, Exception) as e:
+                logger.error(f"Request failed (attempt {attempt + 1}): {e}")
                 if attempt == self.max_retries - 1:
                     raise
                     
-            # Add jitter to retry delay
-            await asyncio.sleep(self.retry_delay * (1 + random.random()))
-            self.retry_delay *= 2
+                # Add jitter to retry delay
+                jittered_delay = retry_delay * (1 + random.random())
+                await asyncio.sleep(jittered_delay)
+                retry_delay = min(retry_delay * 2, self.max_delay)
 
     async def initialize(self):
-        """Initialize futures client with improved time sync"""
+        """Initialize futures client with improved error handling"""
         try:
             self.client = UMFutures(
                 key=self.api_key,
@@ -152,25 +170,37 @@ class FuturesClient:
                 base_url="https://testnet.binancefuture.com" if self.testnet else "https://fapi.binance.com"
             )
 
-            # Initial time sync
+            # Initial time sync with retries
             if not await self._sync_time(force=True):
                 logger.error("Failed to synchronize time during initialization")
                 return False
-
-            # Rest of initialization using _make_request
-            exchange_info = await self._make_request('exchange_info')
-            for symbol in exchange_info['symbols']:
-                self.symbol_info[symbol['symbol']] = {
-                    'quantityPrecision': symbol['quantityPrecision'],
-                    'pricePrecision': symbol['pricePrecision'],
-                    'filters': {f['filterType']: f for f in symbol['filters']}
-                }
-
-            logger.info(
-                f"Initialized Futures {'Testnet' if self.testnet else 'Mainnet'}\n"
-                f"Position Mode: {self.position_mode}"
-            )
-            return True
+                
+            # Get exchange info with retries - wrap sync call in async
+            try:
+                exchange_info = await asyncio.get_event_loop().run_in_executor(
+                    None, self.client.exchange_info
+                )
+                
+                # Process and store symbol info
+                for symbol in exchange_info['symbols']:
+                    self.symbol_info[symbol['symbol']] = {
+                        'quantityPrecision': symbol['quantityPrecision'],
+                        'pricePrecision': symbol['pricePrecision'],
+                        'filters': {f['filterType']: f for f in symbol['filters']}
+                    }
+                
+                # Set reserve balance from constructor
+                logger.info(f"[INIT] Reserve balance set to: ${self.reserve_balance:,.2f}")
+                
+                logger.info(
+                    f"Initialized Futures {'Testnet' if self.testnet else 'Mainnet'}\n"
+                    f"Position Mode: {self.position_mode}"
+                )
+                return True
+                
+            except Exception as e:
+                logger.error(f"Failed to get exchange info: {e}")
+                return False
 
         except Exception as e:
             logger.error(f"Failed to initialize futures client: {e}")
@@ -276,14 +306,77 @@ class FuturesClient:
             logger.error(f"Error adjusting price to tick size: {e}")
             return price
 
+    async def check_reserve_balance(self, order_amount: float) -> bool:
+        """Check if placing a futures order would violate reserve balance"""
+        try:
+            logger.info("[RESERVE CHECK] Starting futures reserve balance check...")
+            
+            # Get current futures account info
+            account = await self._make_request('account')
+            
+            # Get current available balance (this is the real usable margin)
+            available_balance = Decimal(str(account['availableBalance']))
+            total_margin = Decimal(str(account.get('totalMarginBalance', '0')))
+            unrealized_pnl = Decimal(str(account.get('totalUnrealizedProfit', '0')))
+            
+            # Validate reserve balance is set
+            if self.reserve_balance <= 0:
+                logger.warning("[RESERVE CHECK] Reserve balance is not set or invalid, using 0")
+                self.reserve_balance = 0
+            
+            # Log all balance components
+            logger.info(f"[RESERVE CHECK] Available Balance: ${float(available_balance):,.2f}")
+            logger.info(f"[RESERVE CHECK] Total Margin Balance: ${float(total_margin):,.2f}")
+            logger.info(f"[RESERVE CHECK] Unrealized P/L: ${float(unrealized_pnl):,.2f}")
+            logger.info(f"[RESERVE CHECK] Reserve Required: ${float(self.reserve_balance):,.2f}")
+            
+            # Calculate margin required for new position with leverage consideration
+            leverage = self.default_leverage
+            margin_required = Decimal(str(order_amount)) / Decimal(str(leverage))
+            
+            # Calculate remaining balance after new position
+            remaining_after_order = float(available_balance - margin_required)
+            
+            logger.info(f"[RESERVE CHECK] New Position Margin Required: ${float(margin_required):,.2f}")
+            logger.info(f"[RESERVE CHECK] Remaining After Order: ${remaining_after_order:,.2f}")
+
+            # Check if remaining balance would be above reserve
+            is_valid = remaining_after_order >= self.reserve_balance
+            
+            if not is_valid:
+                logger.warning(
+                    f"[RESERVE CHECK] Order would violate reserve balance:\n"
+                    f"Required Balance: ${self.reserve_balance:,.2f}\n"
+                    f"Remaining Balance: ${remaining_after_order:,.2f}"
+                )
+                
+                # Send alert through telegram if available
+                if self.telegram_bot:
+                    await self.telegram_bot.send_reserve_alert(
+                        current_balance=available_balance,
+                        reserve_balance=self.reserve_balance,
+                        pending_value=margin_required
+                    )
+
+            return is_valid
+
+        except Exception as e:
+            logger.error(f"[RESERVE CHECK] Error checking futures reserve balance: {e}")
+            return False
+
     async def place_futures_order(self, symbol: str, amount: float, direction: TradeDirection,
                                 leverage: Optional[int] = None,
                                 margin_type: Optional[str] = None,
                                 signal_price: Optional[float] = None,
                                 threshold: Optional[float] = None,
                                 timeframe: Optional[TimeFrame] = None) -> Optional[Order]:
-        """Place a futures order with proper position side handling"""
+        """Place a futures order with TP/SL support"""
         try:
+            # Check reserve balance first
+            if not await self.check_reserve_balance(amount):
+                logger.error("Order would violate reserve balance")
+                return None
+
             # Only allow LONG orders
             if direction == TradeDirection.SHORT:
                 logger.warning("SHORT orders are currently disabled")
@@ -294,16 +387,19 @@ class FuturesClient:
             if not setup_success:
                 logger.warning(f"Symbol setup had issues for {symbol}, attempting order anyway")
 
-            # Get current market price
+            # Get current market price and convert to Decimal
             ticker = self.client.ticker_price(symbol=symbol)
-            current_price = Decimal(ticker['price'])
+            current_price = Decimal(str(ticker['price']))
 
             # Use signal price if provided, otherwise use current price
             limit_price = Decimal(str(signal_price)) if signal_price else current_price
             
+            # Convert amount and leverage to Decimal for calculations
+            dec_amount = Decimal(str(amount))
+            dec_leverage = Decimal(str(leverage or self.default_leverage))
+            
             # Calculate quantity based on USDT amount and leverage
-            leverage = leverage or self.default_leverage
-            quantity = (Decimal(str(amount)) * Decimal(str(leverage))) / limit_price
+            quantity = (dec_amount * dec_leverage) / limit_price
             
             # Adjust quantity precision
             quantity = self._adjust_quantity_precision(symbol, quantity)
@@ -315,30 +411,103 @@ class FuturesClient:
                 Decimal(str(round(float(limit_price), precision)))
             )
 
+            # Convert values to float for Binance API
+            float_quantity = float(quantity)
+            float_price = float(limit_price)
+
             # Prepare order parameters
             order_params = {
                 "symbol": symbol,
                 "side": "BUY" if direction == TradeDirection.LONG else "SELL",
                 "type": "LIMIT",
                 "timeInForce": "GTC",
-                "quantity": float(quantity),
-                "price": float(limit_price),
+                "quantity": float_quantity,
+                "price": float_price,
                 'timestamp': self._get_timestamp(),
                 'recvWindow': self.recv_window
             }
 
-            # Add position side based on position mode
+            # Determine position side based on position mode
+            position_side = None
             if self.position_mode == "HEDGE":
-                order_params["positionSide"] = "LONG" if direction == TradeDirection.LONG else "SHORT"
-            
-            # Place the order with position side
-            try:
-                order_response = self.client.new_order(**order_params)
-            except BinanceAPIException as e:
-                logger.error(f"Failed to place order: {e}")
-                return None
+                position_side = "LONG" if direction == TradeDirection.LONG else "SHORT"
+                order_params["positionSide"] = position_side
 
-            # Create Order object
+            # Place the main order
+            order_response = self.client.new_order(**order_params)
+            main_order_id = str(order_response['orderId'])
+
+            # Initialize TP/SL variables
+            tp_order_id = None
+            sl_order_id = None
+            tp_price = None
+            sl_price = None
+
+            # Place TP order if enabled
+            if self.tp_enabled:
+                tp_percent = Decimal(str(self.default_tp_percent)) / Decimal('100')
+                tp_price = limit_price * (Decimal('1') + tp_percent)
+                tp_price = self._adjust_price_to_tick_size(symbol, tp_price)
+                
+                tp_params = {
+                    "symbol": symbol,
+                    "side": "SELL" if direction == TradeDirection.LONG else "BUY",
+                    "type": "TAKE_PROFIT_MARKET",
+                    "stopPrice": float(tp_price),
+                    "quantity": float_quantity,
+                    "timestamp": self._get_timestamp(),
+                    "recvWindow": self.recv_window,
+                    "workingType": "MARK_PRICE"
+                }
+
+                # Only add reduceOnly if not in HEDGE mode
+                if self.position_mode != "HEDGE":
+                    tp_params["reduceOnly"] = True
+
+                # Add position side for HEDGE mode
+                if position_side:
+                    tp_params["positionSide"] = position_side
+
+                try:
+                    tp_response = self.client.new_order(**tp_params)
+                    tp_order_id = str(tp_response['orderId'])
+                    logger.info(f"Take Profit order placed at ${float(tp_price):,.2f} ({self.default_tp_percent}%)")
+                except Exception as e:
+                    logger.error(f"Failed to place TP order: {e}")
+
+            # Place SL order if enabled
+            if self.sl_enabled:
+                sl_percent = Decimal(str(self.default_sl_percent)) / Decimal('100')
+                sl_price = limit_price * (Decimal('1') - sl_percent)
+                sl_price = self._adjust_price_to_tick_size(symbol, sl_price)
+                
+                sl_params = {
+                    "symbol": symbol,
+                    "side": "SELL" if direction == TradeDirection.LONG else "BUY",
+                    "type": "STOP_MARKET",
+                    "stopPrice": float(sl_price),
+                    "quantity": float_quantity,
+                    "timestamp": self._get_timestamp(),
+                    "recvWindow": self.recv_window,
+                    "workingType": "MARK_PRICE"
+                }
+
+                # Only add reduceOnly if not in HEDGE mode
+                if self.position_mode != "HEDGE":
+                    sl_params["reduceOnly"] = True
+
+                # Add position side for HEDGE mode
+                if position_side:
+                    sl_params["positionSide"] = position_side
+
+                try:
+                    sl_response = self.client.new_order(**sl_params)
+                    sl_order_id = str(sl_response['orderId'])
+                    logger.info(f"Stop Loss order placed at ${float(sl_price):,.2f} ({self.default_sl_percent}%)")
+                except Exception as e:
+                    logger.error(f"Failed to place SL order: {e}")
+
+            # Create order object with position side
             order = Order(
                 symbol=symbol,
                 status=OrderStatus.PENDING,
@@ -347,14 +516,19 @@ class FuturesClient:
                 quantity=quantity,
                 timeframe=timeframe or TimeFrame.DAILY,
                 threshold=threshold,
-                order_id=str(order_response['orderId']),
+                order_id=main_order_id,
                 created_at=datetime.utcnow(),
                 updated_at=datetime.utcnow(),
                 filled_at=None,
-                leverage=leverage,
+                leverage=int(dec_leverage),
                 direction=direction,
                 fee_asset='USDT',
-                margin_type=margin_type or self.default_margin_type
+                margin_type=margin_type or self.default_margin_type,
+                tp_order_id=tp_order_id,
+                sl_order_id=sl_order_id,
+                tp_price=float(tp_price) if tp_price else None,
+                sl_price=float(sl_price) if sl_price else None,
+                position_side=position_side
             )
 
             logger.info(
@@ -363,7 +537,7 @@ class FuturesClient:
                 f"Position Side: {order_params.get('positionSide', 'ONE_WAY')}\n"
                 f"Signal Price: ${float(limit_price):.2f}\n"
                 f"Quantity: {float(quantity):.8f}\n"
-                f"Leverage: {leverage}x"
+                f"Leverage: {float(dec_leverage)}x"
             )
             return order
 
@@ -436,8 +610,17 @@ class FuturesClient:
             return Decimal('0'), 'USDT'
 
     async def close_position(self, symbol: str, position_data: Dict) -> Optional[Order]:
-        """Close an open futures position"""
+        """Close an open futures position and cancel any associated TP/SL orders"""
         try:
+            # Cancel any existing TP/SL orders first
+            try:
+                open_orders = self.client.get_open_orders(symbol=symbol)
+                for order in open_orders:
+                    if order['reduceOnly']:  # This identifies TP/SL orders
+                        await self.cancel_order(symbol, order['orderId'])
+            except Exception as e:
+                logger.warning(f"Error cancelling TP/SL orders: {e}")
+
             quantity = abs(float(position_data['positionAmt']))
             direction = TradeDirection.SHORT if float(position_data['positionAmt']) > 0 else TradeDirection.LONG
             
@@ -530,39 +713,46 @@ class FuturesClient:
     async def get_symbol_ticker(self, symbol: str) -> Dict:
         """Get futures market price for symbol"""
         try:
-            # Use ticker_price instead of mark_price for consistency
-            ticker = self.client.ticker_price(symbol=symbol)
+            # Use mark price instead of ticker_price for futures
+            ticker = self.client.mark_price(symbol=symbol)
             return {
                 'symbol': symbol,
-                'price': ticker['price']
+                'price': ticker['markPrice']
             }
         except Exception as e:
             logger.error(f"Failed to get futures ticker: {e}")
             raise
 
     async def get_account_info(self) -> Dict:
-        """Get futures account information"""
+        """Get futures account information with proper error handling"""
         try:
             account = self.client.account()
+            # Add proper field checks and defaults
             return {
-                'totalWalletBalance': Decimal(account['totalWalletBalance']),
-                'totalUnrealizedProfit': Decimal(account['totalUnrealizedProfit']),
-                'availableBalance': Decimal(account['availableBalance']),
-                'positions': {
-                    pos['symbol']: {
-                        'amount': Decimal(pos['positionAmt']),
-                        'entryPrice': Decimal(pos['entryPrice']),
-                        'unrealizedProfit': Decimal(pos['unrealizedProfit']),
-                        'leverage': int(pos['leverage']),
-                        'marginType': pos['marginType']
+                'totalWalletBalance': float(account.get('totalWalletBalance', 0)),
+                'totalUnrealizedProfit': float(account.get('totalUnrealizedProfit', 0)),
+                'availableBalance': float(account.get('availableBalance', 0)),
+                'positions': [
+                    {
+                        'symbol': pos['symbol'],
+                        'positionAmt': float(pos.get('positionAmt', 0)),
+                        'entryPrice': float(pos.get('entryPrice', 0)),
+                        'unrealizedProfit': float(pos.get('unrealizedProfit', 0)),
+                        'leverage': int(pos.get('leverage', 1)),
+                        'marginType': pos.get('marginType', 'ISOLATED')
                     }
-                    for pos in account['positions']
-                    if float(pos['positionAmt']) != 0
-                }
+                    for pos in account.get('positions', [])
+                    if abs(float(pos.get('positionAmt', 0))) > 0
+                ]
             }
         except Exception as e:
             logger.error(f"Failed to get account info: {e}")
-            return {}
+            return {
+                'totalWalletBalance': 0,
+                'totalUnrealizedProfit': 0,
+                'availableBalance': 0,
+                'positions': []
+            }
 
     async def cleanup(self):
         """Cleanup futures client"""
@@ -631,62 +821,111 @@ class FuturesClient:
             return None
 
     async def check_timeframe_reset(self, timeframe: TimeFrame) -> bool:
-        """Check if timeframe needs reset for futures"""
+        """Check if timeframe needs reset for futures with proper UTC handling"""
         now = datetime.utcnow()
+        last_reset = self.last_reset.get(timeframe)
         
-        # Get interval duration from FUTURES_INTERVALS
-        interval = self.intervals.get(timeframe.value.upper())
-        if not interval:
-            logger.error(f"Invalid timeframe: {timeframe}")
-            return False
+        if not last_reset:
+            self.last_reset[timeframe] = now
+            return True
             
-        try:
-            if now - self.last_reset[timeframe] >= interval:
-                logger.info(f"Resetting {timeframe.value} thresholds")
-                self.last_reset[timeframe] = now
-                
-                # Clear triggered thresholds for this timeframe
-                for symbol in self.triggered_thresholds:
-                    self.triggered_thresholds[symbol][timeframe] = []
+        # Get current time components for precise reset checks
+        current_hour = now.hour
+        current_minute = now.minute
+        current_weekday = now.weekday()  # Monday is 0
+        current_day = now.day
+        
+        # Check reset conditions based on timeframe
+        reset_needed = False
+        
+        if timeframe == TimeFrame.DAILY:
+            # Reset at UTC 00:00
+            if current_hour == 0 and current_minute == 0:
+                if (now - last_reset).total_seconds() >= 60:
+                    reset_needed = True
                     
-                return True
-                
-            return False
+        elif timeframe == TimeFrame.WEEKLY:
+            # Reset Monday at UTC 00:00
+            if current_weekday == 0 and current_hour == 0 and current_minute == 0:
+                if (now - last_reset).total_seconds() >= 60:
+                    reset_needed = True
+                    
+        elif timeframe == TimeFrame.MONTHLY:
+            # Reset 1st of month at UTC 00:00
+            if current_day == 1 and current_hour == 0 and current_minute == 0:
+                if (now - last_reset).total_seconds() >= 60:
+                    reset_needed = True
+        
+        if reset_needed:
+            logger.info(f"Resetting futures {timeframe.value} thresholds at {now}")
+            self.last_reset[timeframe] = now
             
+            # Clear triggered thresholds for all symbols for this timeframe
+            for symbol in list(self.triggered_thresholds.keys()):
+                if timeframe in self.triggered_thresholds[symbol]:
+                    self.triggered_thresholds[symbol][timeframe] = []
+                
+            # Send reset notification with price info
+            if self.telegram_bot:
+                prices_info = []
+                for symbol in self.reference_prices:
+                    current = await self.get_current_price(symbol)
+                    ref = self.reference_prices[symbol].get(timeframe)
+                    if current and ref:
+                        change = ((current - ref) / ref) * 100
+                        prices_info.append({
+                            "symbol": symbol,
+                            "current_price": current,
+                            "reference_price": ref,
+                            "price_change": change
+                        })
+                
+                await self.telegram_bot.send_timeframe_reset_notification({
+                    "timeframe": timeframe,
+                    "prices": prices_info
+                })
+            
+            return True
+            
+        return False
+
+    async def get_current_price(self, symbol: str) -> Optional[float]:
+        """Get current futures price with error handling"""
+        try:
+            ticker = self.client.ticker_price(symbol=symbol)
+            return float(ticker['price'])
         except Exception as e:
-            logger.error(f"Error checking timeframe reset: {e}")
-            return False
+            logger.error(f"Error getting futures price for {symbol}: {e}")
+            return None
 
     async def check_thresholds(self, symbol: str, thresholds: Dict[str, List[float]]) -> Optional[tuple]:
-        """Check price against thresholds for futures market"""
+        """Check futures price against thresholds with cooldown"""
         try:
-            # Use ticker_price instead of futures_symbol_ticker
-            ticker = self.client.ticker_price(symbol=symbol)
-            current_price = float(ticker['price'])
-            
+            current_price = await self.get_current_price(symbol)
+            if not current_price:
+                return None
+                
             for timeframe in TimeFrame:
-                # Skip if timeframe not in thresholds
                 if timeframe.value not in thresholds:
                     continue
 
-                if symbol not in self.reference_prices:
-                    continue
-                    
-                ref_price = self.reference_prices[symbol].get(timeframe)
+                ref_price = self.reference_prices.get(symbol, {}).get(timeframe)
                 if not ref_price:
                     continue
                     
-                # We only want to trigger orders when price drops (for LONG)
                 price_change = ((ref_price - current_price) / ref_price) * 100
-                logger.debug(f"{symbol} {timeframe.value} price change: {price_change:.2f}%")
+                logger.debug(f"Futures {symbol} {timeframe.value} change: {price_change:.2f}%")
                 
                 # Check thresholds from lowest to highest
                 for threshold in sorted(thresholds[timeframe.value]):
+                    # Only trigger if not already triggered
                     if (price_change >= threshold and 
                         threshold not in self.triggered_thresholds[symbol][timeframe]):
-                        logger.info(f"Threshold triggered for {symbol}: {threshold}% on {timeframe.value}")
                         
-                        # Send threshold notification before updating triggered list
+                        logger.info(f"Futures threshold triggered for {symbol}: {threshold}% on {timeframe.value}")
+                        self.triggered_thresholds[symbol][timeframe].append(threshold)
+                        
+                        # Send notification if bot is set
                         if self.telegram_bot:
                             await self.telegram_bot.send_threshold_notification(
                                 symbol=symbol,
@@ -697,13 +936,12 @@ class FuturesClient:
                                 price_change=price_change
                             )
                         
-                        self.triggered_thresholds[symbol][timeframe].append(threshold)
                         return timeframe, threshold
                         
             return None
             
         except Exception as e:
-            logger.error(f"Error checking thresholds for {symbol}: {e}", exc_info=True)
+            logger.error(f"Error checking futures thresholds for {symbol}: {e}")
             return None
 
     async def ping(self):
@@ -765,14 +1003,29 @@ class FuturesClient:
     # Add reserve balance property
     @property
     def reserve_balance(self) -> float:
-        return getattr(self, '_reserve_balance', 0)
+        """Get reserve balance with proper default"""
+        return self._reserve_balance if self._reserve_balance is not None else 500
 
     @reserve_balance.setter
-    def reserve_balance(self, value: float):
-        self._reserve_balance = float(value)
+    def reserve_balance(self, value: Optional[float]) -> None:
+        """Set reserve balance with validation"""
+        try:
+            if value is None:
+                self._reserve_balance = 500  # Default to 500 if None
+                logger.info("[INIT] Reserve balance defaulting to $500.00")
+            else:
+                parsed_value = float(value)
+                if parsed_value < 0:
+                    self._reserve_balance = 500
+                    logger.warning("[INIT] Negative reserve balance not allowed, using default $500.00")
+                else:
+                    self._reserve_balance = parsed_value
+        except (TypeError, ValueError) as e:
+            self._reserve_balance = 500
+            logger.warning(f"[INIT] Invalid reserve balance value: {e}, using default $500.00")
 
     async def get_candles_for_chart(self, symbol: str, timeframe: TimeFrame, count: int = 15) -> List[Dict]:
-        """Get candles for chart generation"""
+        """Get candles for chart generation with improved logging"""
         try:
             interval_map = {
                 TimeFrame.DAILY: '1d',
@@ -781,33 +1034,47 @@ class FuturesClient:
             }
             
             interval = interval_map[timeframe]
+            logger.info(f"Fetching {count} {interval} candles for {symbol}")
             
+            # Get klines with proper parameters
             klines = self.client.klines(
                 symbol=symbol,
                 interval=interval,
                 limit=count
             )
             
+            logger.info(f"Received {len(klines)} klines from Binance")
+            logger.debug(f"First kline sample: {klines[0] if klines else None}")
+            
             if not klines:
-                logger.error(f"No candles returned for {symbol} {timeframe.value}")
+                logger.error(f"No candles returned for {symbol}")
                 return []
                 
             # Convert klines to candle format
             candles = []
             for k in klines:
-                candles.append({
-                    'timestamp': k[0],
-                    'open': float(k[1]),
-                    'high': float(k[2]),
-                    'low': float(k[3]),
-                    'close': float(k[4]),
-                    'volume': float(k[5])
-                })
-                
+                try:
+                    timestamp = int(k[0])  # Binance timestamp is in milliseconds
+                    candle = {
+                        'timestamp': timestamp,
+                        'open': float(k[1]),
+                        'high': float(k[2]),
+                        'low': float(k[3]),
+                        'close': float(k[4]),
+                        'volume': float(k[5])
+                    }
+                    candles.append(candle)
+                except (ValueError, IndexError) as e:
+                    logger.error(f"Error processing kline: {e}, Data: {k}")
+                    continue
+            
+            logger.info(f"Successfully processed {len(candles)} candles")
+            logger.debug(f"First processed candle: {candles[0] if candles else None}")
+            
             return candles
             
         except Exception as e:
-            logger.error(f"Failed to get candles for chart: {e}")
+            logger.error(f"Failed to get futures candles: {e}", exc_info=True)
             return []
 
     async def generate_trade_chart(self, order: Order) -> Optional[bytes]:
@@ -836,4 +1103,80 @@ class FuturesClient:
             logger.error(f"Failed to generate futures trade chart: {e}")
             return None
 
-    # ...rest of existing code...
+    async def set_leverage(self, symbol: str, leverage: int) -> bool:
+        """Set leverage with improved error handling"""
+        try:
+            await self._make_request('change_leverage', 
+                symbol=symbol,
+                leverage=leverage
+            )
+            logger.info(f"Successfully set leverage for {symbol} to {leverage}x")
+            return True
+        except BinanceAPIException as e:
+            if e.code == -4046:  # "No need to change leverage"
+                logger.info(f"Leverage already set to {leverage}x for {symbol}")
+                return True
+            logger.error(f"Failed to set leverage: {e}")
+            return False
+
+    async def set_margin_type(self, symbol: str, margin_type: str) -> bool:
+        """Set margin type with improved error handling"""
+        try:
+            await self._make_request('change_margin_type',
+                symbol=symbol,
+                marginType=margin_type
+            )
+            logger.info(f"Successfully set margin type for {symbol} to {margin_type}")
+            return True
+        except BinanceAPIException as e:
+            if e.code == -4046:  # "No need to change margin type"
+                logger.info(f"Margin type already set to {margin_type}")
+                return True
+            logger.error(f"Failed to set margin type: {e}")
+            return False
+
+    async def get_position_mode(self) -> str:
+        """Get current position mode with error handling"""
+        try:
+            result = await self._make_request('get_position_mode')
+            mode = 'HEDGE' if result.get('dualSidePosition') else 'ONE_WAY'
+            logger.info(f"Current position mode: {mode}")
+            return mode
+        except Exception as e:
+            logger.error(f"Failed to get position mode: {e}")
+            return 'ONE_WAY'  # Default to ONE_WAY mode
+
+    async def set_position_mode(self, mode: str) -> bool:
+        """Set position mode with improved error handling"""
+        try:
+            dual_side = mode == 'HEDGE'
+            await self._make_request('change_position_mode',
+                dualSidePosition=dual_side
+            )
+            logger.info(f"Successfully set position mode to {mode}")
+            return True
+        except BinanceAPIException as e:
+            if e.code == -4059:  # "No need to change position side"
+                logger.info(f"Position mode already set to {mode}")
+                return True
+            logger.error(f"Failed to set position mode: {e}")
+            return False
+
+    async def close_all_positions(self) -> bool:
+        """Close all open positions when switching modes"""
+        try:
+            positions = await self.get_open_positions()
+            success = True
+            
+            for symbol, pos in positions.items():
+                if abs(float(pos['positionAmt'])) > 0:
+                    result = await self.close_position(symbol, pos)
+                    if not result:
+                        success = False
+                        logger.error(f"Failed to close position for {symbol}")
+                        
+            return success
+            
+        except Exception as e:
+            logger.error(f"Error closing all positions: {e}")
+            return False

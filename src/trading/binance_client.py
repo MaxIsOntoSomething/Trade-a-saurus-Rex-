@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 class BinanceClient:
     def __init__(self, api_key: str, api_secret: str, testnet: bool = True,
-                 base_currency: str = None, reserve_balance: float = None):
+                 base_currency: str = None, reserve_balance: float = None, config: dict = None):  # Add config parameter
         self.api_key = api_key
         self.api_secret = api_secret
         self.testnet = testnet
@@ -36,15 +36,28 @@ class BinanceClient:
         self.telegram_bot = None
         self.chart_generator = ChartGenerator()
         
-        # Initialize with provided values
-        self.base_currency = base_currency or 'USDT'
-        self.reserve_balance = float(reserve_balance) if reserve_balance is not None else 0
-        
-        logger.info(f"[INIT] Initializing with base currency: {self.base_currency}")
-        logger.info(f"[INIT] Reserve balance set to: ${self.reserve_balance:,.2f}")
+        # Initialize with provided values - improved reserve balance handling
+        self.base_currency = base_currency
+        self.reserve_balance = None
         
         # Add MongoDB client reference for threshold tracking
         self.mongo_client = None
+        self.config = config  # Store config directly
+        
+        # Set configuration values from passed config with better reserve balance handling
+        if config:
+            self.base_currency = config['trading'].get('base_currency', 'USDT')
+            self.reserve_balance = float(config['trading'].get('reserve_balance', 0))
+            logger.info(f"[INIT] Loaded from config:")
+            logger.info(f"[INIT] Base Currency: {self.base_currency}")
+            logger.info(f"[INIT] Reserve Balance: ${self.reserve_balance:,.2f}")
+        else:
+            # Use passed values or defaults
+            self.base_currency = base_currency or 'USDT'
+            self.reserve_balance = float(reserve_balance) if reserve_balance is not None else 0
+            logger.info(f"[INIT] Using direct parameters:")
+            logger.info(f"[INIT] Base Currency: {self.base_currency}")
+            logger.info(f"[INIT] Reserve Balance: ${self.reserve_balance:,.2f}")
 
     def set_telegram_bot(self, bot):
         """Set telegram bot for notifications"""
@@ -78,7 +91,7 @@ class BinanceClient:
 
             logger.info(
                 f"Initial balance check passed:\n"
-                f"Current Balance: ${float(current_balance):.2f}\n"
+                f"Current Balance: ${float(current_balance):,.2f}\n"
                 f"Reserve Balance: ${self.reserve_balance:.2f}"
             )
             return True
@@ -95,19 +108,6 @@ class BinanceClient:
             testnet=self.testnet
         )
 
-        # Validate configuration
-        if not self.base_currency:
-            logger.warning("[INIT] No base currency configured, using USDT")
-            self.base_currency = 'USDT'
-            
-        if self.reserve_balance is None:
-            logger.warning("[INIT] No reserve balance configured, using 0")
-            self.reserve_balance = 0
-            
-        # Log configuration status
-        logger.info(f"[INIT] Base Currency: {self.base_currency}")
-        logger.info(f"[INIT] Reserve Balance: ${self.reserve_balance:,.2f}")
-
         # Get exchange info for precision
         exchange_info = await self.client.get_exchange_info()
         for symbol in exchange_info['symbols']:
@@ -117,65 +117,90 @@ class BinanceClient:
                 'filters': {f['filterType']: f for f in symbol['filters']}
             }
             
-        # Set reserve balance directly from config with debug logging
-        if self.telegram_bot and self.telegram_bot.config:
-            self.reserve_balance = float(self.telegram_bot.config['trading'].get('reserve_balance', 0))
-            self.base_currency = self.telegram_bot.config['trading']['base_currency']
-            logger.info(f"[CRITICAL] Reserve balance set to: ${self.reserve_balance:,.2f} {self.base_currency}")
-        else:
-            self.reserve_balance = 0  # Set default value instead of None
-            logger.warning("[CRITICAL] No config found for reserve balance!")
-            
-            # Add initial balance check
-            await self.check_initial_balance()
+        # Check initial balance after initialization
+        await self.check_initial_balance()
         
     async def close(self):
         if self.client:
             await self.client.close_connection()
             
     async def check_timeframe_reset(self, timeframe: TimeFrame) -> bool:
-        """Check if timeframe needs to be reset and return True if reset occurred"""
+        """Check if timeframe needs reset with proper UTC handling"""
         now = datetime.utcnow()
-        interval = TIMEFRAME_INTERVALS[timeframe.value.upper()]
+        last_reset = self.last_reset.get(timeframe)
         
-        if now - self.last_reset[timeframe] >= interval:
-            logger.info(f"Resetting {timeframe.value} thresholds")
+        if not last_reset:
+            self.last_reset[timeframe] = now
+            return True
             
-            # Prepare reset data
-            reset_data = {
-                "timeframe": timeframe,
-                "prices": []
-            }
-            
-            # Get opening prices for all symbols
-            for symbol in self.reference_prices.keys():
-                ticker = await self.client.get_symbol_ticker(symbol=symbol)
-                current_price = float(ticker['price'])
-                ref_price = await self.get_reference_price(symbol, timeframe)
-                
-                price_data = {
-                    "symbol": symbol,
-                    "current_price": current_price,
-                    "reference_price": ref_price,
-                    "price_change": ((current_price - ref_price) / ref_price * 100) if ref_price else 0
-                }
-                reset_data["prices"].append(price_data)
-                
-                self.reference_prices[symbol][timeframe] = ref_price or current_price
-                
-                # Clear triggered thresholds
-                if symbol in self.triggered_thresholds:
-                    self.triggered_thresholds[symbol][timeframe] = []
+        # Get current time components
+        current_hour = now.hour
+        current_minute = now.minute
+        current_weekday = now.weekday()  # Monday is 0
+        current_day = now.day
+        
+        # Check reset conditions based on timeframe
+        reset_needed = False
+        
+        if timeframe == TimeFrame.DAILY:
+            # Reset at UTC 00:00
+            if current_hour == 0 and current_minute == 0:
+                if (now - last_reset).total_seconds() >= 60:
+                    reset_needed = True
                     
+        elif timeframe == TimeFrame.WEEKLY:
+            # Reset Monday at UTC 00:00
+            if current_weekday == 0 and current_hour == 0 and current_minute == 0:
+                if (now - last_reset).total_seconds() >= 60:
+                    reset_needed = True
+                    
+        elif timeframe == TimeFrame.MONTHLY:
+            # Reset 1st of month at UTC 00:00
+            if current_day == 1 and current_hour == 0 and current_minute == 0:
+                if (now - last_reset).total_seconds() >= 60:
+                    reset_needed = True
+        
+        if reset_needed:
+            logger.info(f"Resetting {timeframe.value} thresholds at {now}")
             self.last_reset[timeframe] = now
             
-            # Send notification via telegram bot if available
+            # Clear triggered thresholds for all symbols for this timeframe
+            for symbol in list(self.triggered_thresholds.keys()):
+                if timeframe in self.triggered_thresholds[symbol]:
+                    self.triggered_thresholds[symbol][timeframe] = []
+                
+            # Send reset notification with price info
             if self.telegram_bot:
-                await self.telegram_bot.send_timeframe_reset_notification(reset_data)
+                prices_info = []
+                async for symbol in self.reference_prices:
+                    current = await self.get_current_price(symbol)
+                    ref = self.reference_prices.get(symbol, {}).get(timeframe)
+                    if current and ref:
+                        change = ((current - ref) / ref) * 100
+                        prices_info.append({
+                            "symbol": symbol,
+                            "current_price": current,
+                            "reference_price": ref,
+                            "price_change": change
+                        })
+                
+                await self.telegram_bot.send_timeframe_reset_notification({
+                    "timeframe": timeframe,
+                    "prices": prices_info
+                })
             
             return True
             
         return False
+
+    async def get_current_price(self, symbol: str) -> float:
+        """Get current price with error handling"""
+        try:
+            ticker = await self.client.get_symbol_ticker(symbol=symbol)
+            return float(ticker['price'])
+        except Exception as e:
+            logger.error(f"Error getting current price for {symbol}: {e}")
+            return None
 
     async def get_reference_timestamp(self, timeframe: TimeFrame) -> int:
         """Get the reference timestamp for a timeframe"""
@@ -188,22 +213,22 @@ class BinanceClient:
                 reference -= timedelta(days=1)
         
         elif timeframe == TimeFrame.WEEKLY:
-            # Get last Monday midnight UTC
+            # Get previous week's Monday at midnight UTC
             days_since_monday = now.weekday()
             reference = now.replace(hour=0, minute=0, second=0, microsecond=0)
-            reference -= timedelta(days=days_since_monday)
-            if now.weekday() == 0 and now.hour == 0 and now.minute < 1:
-                reference -= timedelta(days=7)
+            # Subtract days to get to Monday, then subtract an additional week
+            reference -= timedelta(days=days_since_monday + 7)
         
         elif timeframe == TimeFrame.MONTHLY:
-            # Get 1st of current month midnight UTC
-            reference = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-            if now.day == 1 and now.hour == 0 and now.minute < 1:
-                # If within first minute of new month, use last month
-                if now.month == 1:
-                    reference = reference.replace(year=now.year-1, month=12)
-                else:
-                    reference = reference.replace(month=now.month-1)
+            # Fix: Get previous month's 1st day midnight UTC
+            if now.month == 1:
+                # If January, go to December of previous year
+                reference = now.replace(year=now.year-1, month=12, day=1,
+                                     hour=0, minute=0, second=0, microsecond=0)
+            else:
+                # Go to 1st of previous month
+                reference = now.replace(month=now.month-1, day=1,
+                                     hour=0, minute=0, second=0, microsecond=0)
         
         return int(reference.timestamp() * 1000)  # Convert to milliseconds
 
@@ -228,7 +253,7 @@ class BinanceClient:
                 limit=1  # Just get the current candle
             )
             
-            if klines and len(klines) > 0:
+            if (klines and len(klines) > 0):
                 ref_price = float(klines[0][1])  # Current candle's open price
                 logger.info(f"    {timeframe.value} reference: ${ref_price:,.2f}")
                 return ref_price
@@ -262,7 +287,7 @@ class BinanceClient:
                     logger.info(f"  ▶ Getting {timeframe.value} reference price")
                     ref_price = await self.get_reference_price(symbol, timeframe)
                     
-                    if ref_price is not None:
+                    if (ref_price is not None):
                         self.reference_prices[symbol][timeframe] = ref_price
                     else:
                         logger.warning(f"    Using current price as {timeframe.value} reference")
@@ -276,7 +301,7 @@ class BinanceClient:
             raise
             
     async def check_thresholds(self, symbol: str, thresholds: Dict[str, List[float]]) -> Optional[tuple]:
-        """Check price against thresholds with MongoDB tracking"""
+        """Check price against thresholds"""
         try:
             ticker = await self.client.get_symbol_ticker(symbol=symbol)
             current_price = float(ticker['price'])
@@ -284,39 +309,22 @@ class BinanceClient:
             for timeframe in TimeFrame:
                 if timeframe.value not in thresholds:
                     continue
-
-                if symbol not in self.reference_prices:
-                    continue
                     
-                ref_price = self.reference_prices[symbol].get(timeframe)
+                ref_price = self.reference_prices.get(symbol, {}).get(timeframe)
                 if not ref_price:
                     continue
                     
                 price_change = ((ref_price - current_price) / ref_price) * 100
-                logger.debug(f"{symbol} {timeframe.value} price change: {price_change:.2f}%")
                 
-                # Get triggered thresholds from MongoDB
-                triggered = await self.mongo_client.get_triggered_thresholds(
-                    symbol, timeframe.value
-                ) if self.mongo_client else []
-                
-                # Check thresholds from lowest to highest
+                # Check against thresholds
                 for threshold in sorted(thresholds[timeframe.value]):
-                    if (price_change >= threshold and threshold not in triggered):
+                    if (price_change >= threshold and 
+                        threshold not in self.triggered_thresholds[symbol][timeframe]):
+                        
                         logger.info(f"Threshold triggered for {symbol}: {threshold}% on {timeframe.value}")
+                        self.triggered_thresholds[symbol][timeframe].append(threshold)
                         
-                        # Store triggered threshold in MongoDB
-                        if self.mongo_client:
-                            await self.mongo_client.add_triggered_threshold(
-                                symbol=symbol,
-                                timeframe=timeframe.value,
-                                threshold=threshold,
-                                price=current_price,
-                                reference_price=ref_price,
-                                price_change=price_change
-                            )
-                        
-                        # Send threshold notification
+                        # Send notification
                         if self.telegram_bot:
                             await self.telegram_bot.send_threshold_notification(
                                 symbol=symbol,
@@ -332,7 +340,7 @@ class BinanceClient:
             return None
             
         except Exception as e:
-            logger.error(f"Error checking thresholds for {symbol}: {e}", exc_info=True)
+            logger.error(f"Error checking thresholds for {symbol}: {e}")
             return None
             
     def _get_quantity_precision(self, symbol: str) -> int:
@@ -407,31 +415,48 @@ class BinanceClient:
         try:
             logger.info("[RESERVE CHECK] Starting reserve balance check...")
             
-            if self.reserve_balance is None or self.reserve_balance <= 0:
-                logger.warning("[RESERVE CHECK] No valid reserve balance set!")
-                return True
-
             # Get current balance in base currency (USDT)
             current_balance = await self.get_balance(self.base_currency)
             logger.info(f"[RESERVE CHECK] Current balance: ${float(current_balance):,.2f}")
             logger.info(f"[RESERVE CHECK] Reserve balance: ${float(self.reserve_balance):,.2f}")
             
-            # Get sum of pending orders
+            # Get sum of pending orders - only if mongo client is available
             pending_orders_value = Decimal('0')
-            cursor = self.telegram_bot.mongo_client.orders.find({"status": "pending"})
-            async for order in cursor:
-                pending_orders_value += (Decimal(str(order['price'])) * Decimal(str(order['quantity'])))
+            if hasattr(self, 'mongo_client') and self.mongo_client:
+                try:
+                    cursor = self.mongo_client.orders.find({"status": "pending"})
+                    async for order in cursor:
+                        pending_orders_value += (Decimal(str(order['price'])) * Decimal(str(order['quantity'])))
+                except Exception as e:
+                    logger.warning(f"[RESERVE CHECK] Could not get pending orders: {e}")
 
-            # Calculate remaining balance after pending orders
+            # Calculate remaining balance after pending orders and new order
             available_balance = float(current_balance - pending_orders_value)
             remaining_after_order = available_balance - order_amount
 
             logger.info(f"[RESERVE CHECK] Available after pending: ${available_balance:,.2f}")
+            logger.info(f"[RESERVE CHECK] Order amount: ${order_amount:,.2f}")
             logger.info(f"[RESERVE CHECK] Remaining after order: ${remaining_after_order:,.2f}")
-            logger.info(f"[RESERVE CHECK] Required reserve: ${float(self.reserve_balance):,.2f}")
 
             # Check if remaining balance would be above reserve
-            return remaining_after_order >= self.reserve_balance
+            is_valid = remaining_after_order >= self.reserve_balance
+
+            if not is_valid:
+                logger.warning(
+                    f"[RESERVE CHECK] Order would violate reserve balance:\n"
+                    f"Required Balance: ${self.reserve_balance:,.2f}\n"
+                    f"Remaining Balance: ${remaining_after_order:,.2f}"
+                )
+                
+                # Send alert through telegram if available
+                if self.telegram_bot:
+                    await self.telegram_bot.send_reserve_alert(
+                        current_balance=Decimal(str(current_balance)),
+                        reserve_balance=Decimal(str(self.reserve_balance)),
+                        pending_value=Decimal(str(order_amount))
+                    )
+
+            return is_valid
 
         except Exception as e:
             logger.error(f"[RESERVE CHECK] Error checking reserve balance: {e}")
@@ -567,61 +592,85 @@ class BinanceClient:
             return current_balance - previous_balance
         return None
 
-    async def get_candles_for_chart(self, symbol: str, timeframe: TimeFrame, count: int = 15) -> List[Dict]:
-        """Get historical candles for chart generation with proper alignment"""
+    async def get_candles_for_chart(self, symbol: str, timeframe: TimeFrame, count: int = 8) -> List[Dict]:
+        """Get historical candles with proper timeframe alignment"""
         try:
-            # Get reference timestamp first
-            ref_timestamp = await self.get_reference_timestamp(timeframe)
-            
-            # Map timeframes to intervals and milliseconds
+            # Define interval and period mapping for each timeframe
             interval_map = {
-                TimeFrame.DAILY: ('1d', 24 * 60 * 60 * 1000),
-                TimeFrame.WEEKLY: ('1w', 7 * 24 * 60 * 60 * 1000),
-                TimeFrame.MONTHLY: ('1M', 30 * 24 * 60 * 60 * 1000)
+                TimeFrame.DAILY: ('1d', timedelta(days=1)),
+                TimeFrame.WEEKLY: ('1w', timedelta(weeks=1)),
+                TimeFrame.MONTHLY: ('1M', timedelta(days=30))
             }
             
-            interval, ms_per_candle = interval_map[timeframe]
+            interval, period = interval_map[timeframe]
             
-            # Calculate start and end times
-            end_time = ref_timestamp + ms_per_candle  # Include the reference candle
-            start_time = end_time - (count * ms_per_candle)
+            # Calculate proper start and end times based on timeframe
+            now = datetime.utcnow()
+            end_time = now
+
+            if timeframe == TimeFrame.DAILY:
+                # Get exactly 8 days of data
+                start_time = end_time - timedelta(days=8)
             
-            # Get candles with specific time range
+            elif timeframe == TimeFrame.WEEKLY:
+                # Get exactly 8 weeks of data, aligned to Monday
+                days_since_monday = end_time.weekday()
+                end_time = end_time - timedelta(days=days_since_monday)
+                start_time = end_time - timedelta(weeks=8)
+            
+            elif timeframe == TimeFrame.MONTHLY:
+                # Get exactly 8 months of data, aligned to 1st of month
+                if now.month > 8:
+                    start_time = now.replace(month=now.month - 8, day=1)
+                else:
+                    # Handle year boundary
+                    months_in_prev_year = 8 - now.month
+                    start_time = now.replace(year=now.year - 1,
+                                          month=12 - months_in_prev_year + 1,
+                                          day=1)
+                end_time = now.replace(day=1)
+
+            # Convert to milliseconds for Binance API
+            start_ms = int(start_time.timestamp() * 1000)
+            end_ms = int(end_time.timestamp() * 1000)
+            
+            # Get candles from Binance
             await self.rate_limiter.acquire()
             klines = await self.client.get_klines(
                 symbol=symbol,
                 interval=interval,
-                startTime=start_time,
-                endTime=end_time,
-                limit=count + 2  # Get extra candles to ensure coverage
+                startTime=start_ms,
+                endTime=end_ms,
+                limit=8
             )
             
             if not klines:
-                logger.error(f"No candles returned for {symbol} {timeframe.value}")
+                logger.error(f"No candles returned for {symbol}")
                 return []
             
-            # Process and validate candles
+            # Format candles with proper timestamps
             candles = []
             for k in klines:
-                candle_time = k[0]
-                if start_time <= candle_time <= end_time:
-                    candles.append({
-                        'timestamp': candle_time,
-                        'open': float(k[1]),
-                        'high': float(k[2]),
-                        'low': float(k[3]),
-                        'close': float(k[4]),
-                        'volume': float(k[5])
-                    })
+                dt = datetime.fromtimestamp(k[0] / 1000)
+                
+                # Format timestamp based on timeframe
+                if timeframe == TimeFrame.MONTHLY:
+                    formatted_time = dt.strftime("%Y-%m")  # YYYY-MM
+                elif timeframe == TimeFrame.WEEKLY:
+                    formatted_time = dt.strftime("%Y-%m-%d")  # Show Monday date
+                else:
+                    formatted_time = dt.strftime("%Y-%m-%d")  # Full date for daily
+                
+                candles.append({
+                    'timestamp': formatted_time,
+                    'open': float(k[1]),
+                    'high': float(k[2]),
+                    'low': float(k[3]),
+                    'close': float(k[4]),
+                    'volume': float(k[5])
+                })
             
-            # Ensure we have the right number of candles
-            candles = candles[-count:] if len(candles) > count else candles
-            
-            # Log candle alignment info
-            logger.info(f"Got {len(candles)} candles for {symbol} {timeframe.value}")
-            logger.info(f"Time range: {datetime.fromtimestamp(start_time/1000)} to {datetime.fromtimestamp(end_time/1000)}")
-            
-            return candles
+            return candles[-8:]  # Ensure exactly 8 candles
             
         except Exception as e:
             logger.error(f"Failed to get candles for chart: {e}")
@@ -665,3 +714,48 @@ class BinanceClient:
         except Exception as e:
             logger.error(f"Failed to get ticker for {symbol}: {e}")
             raise
+
+    async def set_leverage(self, symbol: str, leverage: int) -> bool:
+        """Set leverage for futures trading"""
+        try:
+            await self.client.futures_change_leverage(
+                symbol=symbol, 
+                leverage=leverage
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Failed to set leverage: {e}")
+            return False
+
+    async def set_margin_type(self, symbol: str, margin_type: str) -> bool:
+        """Set margin type for futures trading"""
+        try:
+            await self.client.futures_change_margin_type(
+                symbol=symbol,
+                marginType=margin_type
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Failed to set margin type: {e}")
+            return False
+
+    async def get_position_mode(self) -> str:
+        """Get current position mode"""
+        try:
+            result = await self.client.futures_get_position_mode()
+            return 'HEDGE' if result['dualSidePosition'] else 'ONE_WAY'
+        except Exception as e:
+            logger.error(f"Failed to get position mode: {e}")
+            return 'ONE_WAY'
+
+    async def set_position_mode(self, mode: str) -> bool:
+        """Set position mode for futures trading"""
+        try:
+            dual_side = mode == 'HEDGE'
+            await self.client.futures_change_position_mode(
+                dualSidePosition=dual_side
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Failed to set position mode: {e}")
+            return False

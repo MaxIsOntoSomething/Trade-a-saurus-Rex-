@@ -64,9 +64,9 @@ class TelegramBot:
         self._update_id = 0
         self.temp_trade_data = {}
         self.keyboard = [
-            [KeyboardButton("/balance"), KeyboardButton("/stats"), KeyboardButton("/profits")],
-            [KeyboardButton("/power"), KeyboardButton("/add"), KeyboardButton("/thresholds")],  # Changed /trading to /power
-            [KeyboardButton("/history"), KeyboardButton("/viz"), KeyboardButton("/menu")]
+            [KeyboardButton("/menu"), KeyboardButton("/power")],
+            [KeyboardButton("/add"), KeyboardButton("/balance")],
+            [KeyboardButton("/positions"), KeyboardButton("/mode")]
         ]
         self.markup = ReplyKeyboardMarkup(self.keyboard, resize_keyboard=True)
         self.startup_message = f"""
@@ -84,9 +84,17 @@ Status: Ready to ROAR! 🦖
         # Add environment info
         self.env_info = (
             "📍 Environment: "
-            f"{'Testnet' if config['binance']['testnet'] else 'Mainnet'} | "
+            f"{'Testnet' if config.get('environment', {}).get('testnet', True) else 'Mainnet'} | "
             f"{config['trading']['base_currency']}"
         )
+        # Add menu callback patterns
+        self.MENU_PATTERNS = {
+            'main': 'menu_main',
+            'account': 'menu_account',
+            'trading': 'menu_trading',
+            'analysis': 'menu_analysis',
+            'settings': 'menu_settings'
+        }
 
     async def initialize(self):
         """Initialize the Telegram bot"""
@@ -114,7 +122,7 @@ Status: Ready to ROAR! 🦖
         # Register command handlers
         self.app.add_handler(CommandHandler("start", self.start_command))
         self.app.add_handler(CommandHandler("power", self.toggle_trading))  # Change command name
-        self.app.add_handler(CommandHandler("balance", self.get_balance))
+        self.app.add_handler(CommandHandler("balance", self.get_balance_command))
         self.app.add_handler(CommandHandler("stats", self.get_stats))
         self.app.add_handler(CommandHandler("history", self.get_order_history))
         self.app.add_handler(CommandHandler("profits", self.show_profits))
@@ -123,6 +131,36 @@ Status: Ready to ROAR! 🦖
         self.app.add_handler(CommandHandler("viz", self.show_viz_menu))
         self.app.add_handler(CallbackQueryHandler(self.handle_viz_selection, pattern="^(daily_volume|profit_distribution|order_types|hourly_activity)$"))
         
+        # Add mode switching handler
+        self.app.add_handler(CommandHandler("mode", self.switch_mode))
+        self.app.add_handler(CallbackQueryHandler(self.handle_mode_switch, pattern="^switch_mode_"))
+        
+        # Add futures-specific command handlers
+        self.app.add_handler(CommandHandler("leverage", self.set_leverage))
+        self.app.add_handler(CommandHandler("margin", self.set_margin_type))
+        self.app.add_handler(CommandHandler("hedge", self.toggle_hedge_mode))
+        
+        # Add menu handlers
+        self.app.add_handler(CommandHandler("menu", self.show_main_menu))
+        self.app.add_handler(CallbackQueryHandler(self.handle_menu_callback, 
+                                                pattern='^menu_'))
+
+        # Add test command
+        self.app.add_handler(CommandHandler("test", self.test_commands))
+
+        # Add submenu handler
+        self.app.add_handler(CallbackQueryHandler(self.handle_submenu_callback, pattern='^submenu_'))
+
+        # Set up persistent menu for each authorized user
+        for user_id in self.allowed_users:
+            try:
+                await self.app.bot.set_chat_menu_button(
+                    chat_id=user_id,
+                    menu_button={"type": "default"}
+                )
+            except Exception as e:
+                logger.error(f"Failed to set menu for {user_id}: {e}")
+
         await self.app.initialize()
         await self.app.start()
 
@@ -206,29 +244,40 @@ Status: Ready to ROAR! 🦖
             await update.message.reply_text("⛔ Unauthorized access")
             return
             
-        welcome_message = """
-🦖 Trade-a-saurus Rex is ready!
+        current_mode = self.config['environment']['trading_mode'].upper()
+        menu_text = f"""
+🦖 Trade-a-saurus Rex is Ready!
 
-Available commands:
+Current Mode: {current_mode} 🔄
+/mode - Switch between SPOT/FUTURES
 
-Trading Controls:
-/power - Toggle trading on/off  # Updated command name here
-
-Trading Information:
-/balance - Check current balance
+Account Info:
+/balance - Show {current_mode} balance
+/positions - Show open positions
 /stats - View trading statistics
-/profits - View portfolio profits
-/history - View recent order history
-/thresholds - Show threshold status
+/profits - View profit/loss
 
 Trading Actions:
-/add - Add a manual trade
+/add - Add new trade
+/power - Toggle trading on/off
 
-Menu:
-/menu - Show all commands
+Market Analysis:
+/viz - Data visualizations
+/thresholds - Show threshold status
+/history - Order history
 """
+
+        # Add futures-specific commands
+        if current_mode == "FUTURES":
+            menu_text += """
+Futures Settings:
+/leverage - Set leverage per pair
+/margin - Set margin type (ISOLATED/CROSSED)
+/hedge - Toggle hedge mode (ONE-WAY/HEDGE)
+"""
+
         await update.message.reply_text(
-            welcome_message,
+            menu_text,
             reply_markup=self.markup
         )
 
@@ -282,22 +331,65 @@ Menu:
             reply_markup=status_keyboard
         )
 
-    async def get_balance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Get current balance"""
+    async def get_balance_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Command handler for balance checking with futures support"""
         if not self._is_authorized(update.effective_user.id):
             await update.message.reply_text("⛔ Unauthorized access")
             return
             
         try:
-            account = await self.binance_client.client.get_account()
-            balances = [
-                f"{asset['asset']}: {asset['free']}"
-                for asset in account['balances']
-                if float(asset['free']) > 0
-            ]
-            message = "💰 Current Balance:\n" + "\n".join(balances)
-            await update.message.reply_text(message)
+            current_mode = self.config['environment']['trading_mode'].upper()
+            response = [f"💰 Balance Overview ({current_mode} Mode)"]
+            
+            # Get balance based on mode
+            if current_mode == "FUTURES":
+                account = await self.binance_client.get_account_info()
+                
+                # Add balance information
+                total_margin = float(account['totalWalletBalance'])
+                unrealized_pnl = float(account['totalUnrealizedProfit'])
+                available_balance = float(account['availableBalance'])
+                
+                response.extend([
+                    f"\n📈 Futures Account:",
+                    f"Total Margin: ${total_margin:.2f}",
+                    f"Available Balance: ${available_balance:.2f}",
+                    f"Unrealized P/L: ${unrealized_pnl:+.2f}"
+                ])
+                
+                # Add position information
+                positions = account.get('positions', [])
+                if positions:
+                    response.append("\nOpen Positions:")
+                    for pos in positions:
+                        amt = float(pos['positionAmt'])
+                        if amt != 0:
+                            direction = "LONG" if amt > 0 else "SHORT"
+                            size = abs(amt)
+                            entry = float(pos['entryPrice'])
+                            response.append(
+                                f"\n{pos['symbol']}:\n"
+                                f"• {direction} {size:.4f} @ ${entry:.2f}\n"
+                                f"• Leverage: {pos['leverage']}x"
+                            )
+            else:
+                # Existing spot balance code
+                spot_balance = await self.binance_client.get_balance()
+                response.extend([
+                    f"\n💱 Spot Balance:",
+                    f"• USDT: ${float(spot_balance):.2f}"
+                ])
+
+            # Add reserve balance info
+            response.extend([
+                f"\n📝 Reserve Balance: ${self.binance_client.reserve_balance:.2f}",
+                f"Trading Status: {'Paused ⏸' if self.is_paused else 'Active ▶️'}"
+            ])
+                
+            await update.message.reply_text("\n".join(response))
+            
         except Exception as e:
+            logger.error(f"Error getting balance: {e}")
             await update.message.reply_text(f"❌ Error getting balance: {str(e)}")
 
     async def get_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -386,7 +478,7 @@ Menu:
         )
 
         if status == OrderStatus.FILLED:
-            message += f"\nFees: ${float(order.fees):.4f} {order.fee_asset}"
+            message += f"\nFees: ${float(order.fees)::.4f} {order.fee_asset}"
             
         if status == OrderStatus.CANCELLED and order.cancelled_at:
             duration = order.cancelled_at - order.created_at
@@ -416,15 +508,17 @@ Menu:
     async def send_trade_chart(self, order: Order):
         """Send trade chart to users"""
         try:
-            # Get reference price and convert to Decimal
-            ref_price = self.binance_client.reference_prices.get(
-                order.symbol, {}
-            ).get(order.timeframe)
-            
-            if ref_price is not None:
-                ref_price = Decimal(str(ref_price))
-            
-            chart_data = await self.binance_client.generate_trade_chart(order)
+            ref_price = None
+            if order.symbol in self.binance_client.reference_prices:
+                ref_price = self.binance_client.reference_prices[order.symbol].get(order.timeframe)
+
+            # Get chart data from appropriate client
+            chart_data = None
+            if order.order_type == OrderType.FUTURES and hasattr(self.binance_client, 'futures_client'):
+                chart_data = await self.binance_client.futures_client.generate_trade_chart(order)
+            else:
+                chart_data = await self.binance_client.generate_trade_chart(order)
+
             if not chart_data:
                 logger.error("Failed to generate chart data")
                 # Send text-only notification as fallback
@@ -432,36 +526,28 @@ Menu:
                     try:
                         await self.app.bot.send_message(
                             chat_id=user_id,
-                            text=self.binance_client.chart_generator.format_info_text(
-                                order,
-                                ref_price
-                            )
+                            text=self._format_trade_info(order)
                         )
                     except Exception as e:
                         logger.error(f"Failed to send fallback message to {user_id}: {e}")
                 return
-                
+
             # Attempt to send chart with caption
+            caption = self._format_trade_info(order)  # Use consistent formatting
+            
             for user_id in self.allowed_users:
                 try:
                     await self.app.bot.send_photo(
                         chat_id=user_id,
                         photo=chart_data,
-                        caption=self.binance_client.chart_generator.format_info_text(
-                            order,
-                            ref_price
-                        )
+                        caption=caption
                     )
                 except Exception as e:
                     logger.error(f"Failed to send chart to {user_id}: {e}")
-                    # Try sending text-only notification as fallback
                     try:
                         await self.app.bot.send_message(
                             chat_id=user_id,
-                            text=self.binance_client.chart_generator.format_info_text(
-                                order,
-                                ref_price
-                            )
+                            text=caption
                         )
                     except Exception as e2:
                         logger.error(f"Failed to send fallback message to {user_id}: {e2}")
@@ -496,7 +582,7 @@ Menu:
             # Send notification with or without chart
             for user_id in self.allowed_users:
                 try:
-                    if chart_data:
+                    if (chart_data):
                         await self.app.bot.send_photo(
                             chat_id=user_id,
                             photo=chart_data,
@@ -523,35 +609,117 @@ Menu:
             logger.error(f"Failed to send roar: {e}")
 
     async def show_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show all available commands with descriptions"""
+        """Show main menu with submenus"""
         if not self._is_authorized(update.effective_user.id):
             await update.message.reply_text("⛔ Unauthorized access")
             return
             
-        menu_text = """
+        current_mode = self.config['environment']['trading_mode'].upper()
+        
+        menu_text = f"""
 🦖 Trade-a-saurus Rex Commands:
 
-Trading Controls:
-/start - Start the bot and show welcome message
-/power - Toggle trading on/off  # Updated command name here
+Current Mode: {current_mode} 🔄
+/mode - Switch between SPOT/FUTURES
 
-Trading Information:
-/balance - Check current balance
+Account Info:
+/balance - Show {current_mode} balance
+/positions - Show open positions
 /stats - View trading statistics
-/history - View recent order history
-/thresholds - Show threshold status and resets
-/viz - Show data visualizations 📊
+/profits - View profit/loss
 
 Trading Actions:
-/add - Add a manual trade (interactive)
+/add - Add new trade
+/power - Toggle trading on/off
 
-Menu:
-/menu - Show this command list
+Market Analysis:
+/viz - Data visualizations
+/thresholds - Show threshold status
+/history - Order history
 """
-        await update.message.reply_text(menu_text)
+
+        # Add futures-specific commands
+        if current_mode == "FUTURES":
+            menu_text += """
+Futures Settings:
+/leverage - Set leverage per pair
+/margin - Set margin type (ISOLATED/CROSSED)
+/hedge - Toggle hedge mode (ONE-WAY/HEDGE)
+"""
+
+        keyboard = [
+            [InlineKeyboardButton("👤 Account Info", callback_data="menu_account")],
+            [InlineKeyboardButton("📈 Trading Actions", callback_data="menu_trading")],
+            [InlineKeyboardButton("📊 Market Analysis", callback_data="menu_analysis")],
+            [InlineKeyboardButton("🔄 Switch Mode", callback_data="menu_switch_mode")]
+        ]
+
+        await update.message.reply_text(
+            menu_text,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    async def handle_menu_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle menu callback queries with submenus"""
+        query = update.callback_query
+        await query.answer()
+        
+        current_mode = self.config['environment']['trading_mode'].upper()
+        
+        menus = {
+            "menu_account": {
+                "title": "👤 Account Info Menu",
+                "buttons": [
+                    [InlineKeyboardButton("💰 Balance", callback_data="action_balance")],
+                    [InlineKeyboardButton("📊 Portfolio Stats", callback_data="action_stats")],
+                    [InlineKeyboardButton("💵 Profits & Loss", callback_data="action_profits")],
+                    [InlineKeyboardButton("📜 Trade History", callback_data="action_history")],
+                    [InlineKeyboardButton("« Back to Main Menu", callback_data="menu_main")]
+                ]
+            },
+            "menu_trading": {
+                "title": "📈 Trading Actions Menu",
+                "buttons": [
+                    [InlineKeyboardButton("➕ New Manual Trade", callback_data="action_add")],
+                    [InlineKeyboardButton("⏯️ Toggle Auto-Trading", callback_data="action_power")],
+                    [InlineKeyboardButton("« Back to Main Menu", callback_data="menu_main")]
+                ]
+            },
+            "menu_analysis": {
+                "title": "📊 Market Analysis Menu",
+                "buttons": [
+                    [InlineKeyboardButton("📈 Price Charts", callback_data="action_viz")],
+                    [InlineKeyboardButton("🎯 Current Thresholds", callback_data="action_thresholds")],
+                    [InlineKeyboardButton("📜 Order History", callback_data="action_history")],
+                    [InlineKeyboardButton("« Back to Main Menu", callback_data="menu_main")]
+                ]
+            }
+        }
+
+        # Add futures-specific buttons if in futures mode
+        if current_mode == "FUTURES":
+            menus["menu_trading"]["buttons"].insert(-1, [
+                InlineKeyboardButton("⚙️ Set Leverage", callback_data="action_leverage"),
+                InlineKeyboardButton("⚡ Set Margin", callback_data="action_margin")
+            ])
+            menus["menu_trading"]["buttons"].insert(-1, [
+                InlineKeyboardButton("🔄 Toggle Hedge Mode", callback_data="action_hedge")
+            ])
+
+        if query.data in menus:
+            menu = menus[query.data]
+            await query.edit_message_text(
+                f"{menu['title']}\n\nCurrent Mode: {current_mode}",
+                reply_markup=InlineKeyboardMarkup(menu["buttons"])
+            )
+        elif query.data == "menu_main":
+            await self.show_menu(update, context)
+        elif query.data.startswith("action_"):
+            action = query.data.replace("action_", "")
+            await self.handle_menu_action(action, update, context)
 
     async def show_thresholds(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show detailed threshold information"""
+        """Show detailed threshold information with futures support"""
         if not self._is_authorized(update.effective_user.id):
             await update.message.reply_text("⛔ Unauthorized access")
             return
@@ -574,7 +742,7 @@ Menu:
                     next_reset = now.replace(hour=0, minute=0, second=0, microsecond=0)
                     if days_until_monday == 0 and now >= next_reset:
                         days_until_monday = 7
-                    next_reset += timedelta(days=days_until_monday)
+                    next_reset += timedelta(days_until_monday)
 
                 else:  # MONTHLY
                     # For monthly, next reset is 1st of next month UTC midnight
@@ -606,9 +774,15 @@ Menu:
                     # Get current and reference prices
                     ref_price = self.binance_client.reference_prices.get(symbol, {}).get(timeframe)
                     
-                    # Get current price
-                    ticker = await self.binance_client.client.get_symbol_ticker(symbol=symbol)
-                    current_price = float(ticker['price'])
+                    # Get current price based on mode
+                    current_mode = self.config['environment']['trading_mode'].upper()
+                    if current_mode == "FUTURES":
+                        ticker = await self.binance_client.get_symbol_ticker(symbol)
+                        current_price = float(ticker['price'])
+                    else:
+                        # Existing spot price check
+                        ticker = await self.binance_client.client.get_symbol_ticker(symbol=symbol)
+                        current_price = float(ticker['price'])
                     
                     # Calculate price change if reference price exists
                     if (ref_price):
@@ -655,6 +829,28 @@ Menu:
             reply_markup=markup
         )
         return SYMBOL
+
+    async def add_trade_symbol(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle symbol input"""
+        symbol = update.message.text.upper()
+        if symbol not in self.config['trading']['pairs']:
+            await update.message.reply_text("Invalid symbol. Please select from the list.")
+            return SYMBOL
+            
+        user_data = self.temp_trade_data[update.effective_user.id]
+        user_data['symbol'] = symbol
+        
+        keyboard = [
+            [KeyboardButton("SPOT")],
+            [KeyboardButton("FUTURES")]
+        ]
+        markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True)
+        
+        await update.message.reply_text(
+            "What type of trade was this?",
+            reply_markup=markup
+        )
+        return ORDER_TYPE
 
     async def add_trade_order_type(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle order type input (SPOT/FUTURES)"""
@@ -751,7 +947,7 @@ Menu:
             return PRICE
 
     async def add_trade_final(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Complete trade creation with fees"""
+        """Complete trade creation with chart generation"""
         try:
             fees = Decimal(update.message.text)
             if fees < 0:
@@ -783,11 +979,19 @@ Menu:
             # Save to database
             await self.mongo_client.insert_manual_trade(order)
             
-            # Send confirmation
+            # Generate chart for manual trade - Fix spot/futures chart generation
+            chart_data = None
+            if order.order_type == OrderType.FUTURES and hasattr(self.binance_client, 'futures_client'):
+                chart_data = await self.binance_client.futures_client.generate_trade_chart(order)
+            else:
+                # For spot trades, use the binance_client directly
+                chart_data = await self.binance_client.generate_trade_chart(order)
+
+            # Send confirmation with chart if available
             direction_info = f"\nDirection: {order.direction.value}" if order.direction else ""
             leverage_info = f"\nLeverage: {order.leverage}x" if order.leverage else ""
             
-            await update.message.reply_text(
+            message = (
                 f"✅ Manual trade added:\n"
                 f"Symbol: {order.symbol}\n"
                 f"Type: {order.order_type.value}"
@@ -796,10 +1000,21 @@ Menu:
                 f"Amount: {float(order.quantity):.8f}\n"
                 f"Price: ${float(order.price):.2f}\n"
                 f"Fees: ${float(order.fees):.2f}\n"
-                f"Total Value: ${float(order.price * order.quantity):.2f}",  # Fixed double colon here
-                reply_markup=self.markup  # Restore original keyboard
+                f"Total Value: ${float(order.price * order.quantity)::.2f}"
             )
-            
+
+            if chart_data:
+                await update.message.reply_photo(
+                    photo=chart_data,
+                    caption=message,
+                    reply_markup=self.markup
+                )
+            else:
+                await update.message.reply_text(
+                    message,
+                    reply_markup=self.markup
+                )
+
             # Cleanup
             del self.temp_trade_data[update.effective_user.id]
             return ConversationHandler.END
@@ -832,242 +1047,127 @@ Menu:
             return
 
         try:
-            # Get positions from MongoDB for configured pairs only
-            allowed_symbols = set(self.config['trading']['pairs'])
-            positions = await self.mongo_client.get_position_stats(allowed_symbols)
+            current_mode = self.config['environment']['trading_mode'].upper()
             
-            if not positions:
-                await update.message.reply_text("No filled orders found.")
-                return
-
-            # Initialize portfolio totals
-            portfolio_stats = {
-                "total_cost": Decimal('0'),
-                "total_value": Decimal('0'),
-                "total_profit": Decimal('0'),
-                "total_tax": Decimal('0')
-            }
-
-            # Calculate profits for each position
-            response = ["📊 Portfolio Analysis:\n"]
-
-            # First show USDT balance
-            try:
-                usdt_balance = await self.binance_client.get_balance('USDT')
-                response.append(f"💵 USDT Balance: ${usdt_balance:.2f}\n")
-            except Exception as e:
-                logger.error(f"Failed to get USDT balance: {e}")
-                response.append("💵 USDT Balance: Unable to fetch\n")
-
-            # Process each configured symbol
-            for symbol in sorted(allowed_symbols):
-                position = positions.get(symbol)
-                if not position:
-                    continue
-
-                # Get current price
-                ticker = await self.binance_client.client.get_symbol_ticker(symbol=symbol)
-                current_price = Decimal(ticker['price'])
+            if current_mode == "FUTURES":
+                # Use futures specific profit calculation
+                positions = await self.binance_client.futures_client.get_open_positions()
+                response = ["📊 Futures Portfolio Analysis:\n"]
                 
-                # Calculate profits
-                profit_data = self.mongo_client.calculate_profit_loss(position, current_price)
+                total_pnl = 0
+                for symbol, pos in positions.items():
+                    amt = float(pos['positionAmt'])
+                    if amt != 0:
+                        entry_price = float(pos['entryPrice'])
+                        unrealized_pnl = float(pos['unrealizedProfit'])
+                        leverage = int(pos['leverage'])
+                        
+                        response.extend([
+                            f"\n{symbol}:",
+                            f"Position Size: {abs(amt):.4f}",
+                            f"Entry Price: ${entry_price:.2f}",
+                            f"Leverage: {leverage}x",
+                            f"Unrealized P/L: ${unrealized_pnl:+.2f}"
+                        ])
+                        total_pnl += unrealized_pnl
                 
-                # Update portfolio totals
-                portfolio_stats["total_cost"] += position["total_cost"]
-                portfolio_stats["total_value"] += profit_data["current_value"]
-                portfolio_stats["total_profit"] += profit_data["absolute_pl"]
-                portfolio_stats["total_tax"] += profit_data["tax_amount"]
+                response.extend([
+                    f"\nTotal Unrealized P/L: ${total_pnl:+.2f}"
+                ])
+            else:
+                # Use existing spot profit calculation
+                # Get positions from MongoDB for configured pairs only
+                allowed_symbols = set(self.config['trading']['pairs'])
+                positions = await self.mongo_client.get_position_stats(allowed_symbols)
                 
-                # Generate position message
-                position_msg = [
-                    f"\n🔸 {symbol}:",
-                    f"Quantity: {position['total_quantity']:.8f}",
-                    f"Avg Entry: ${position['avg_entry_price']:.2f}",
-                    f"Current: ${current_price:.2f}",
-                    f"Value: ${profit_data['current_value']:.2f}",
-                    f"P/L: ${profit_data['absolute_pl']:.2f} ({profit_data['percentage_pl']:+.2f}%)",
+                if not positions:
+                    await update.message.reply_text("No filled orders found.")
+                    return
+
+                # Initialize portfolio totals
+                portfolio_stats = {
+                    "total_cost": Decimal('0'),
+                    "total_value": Decimal('0'),
+                    "total_profit": Decimal('0'),
+                    "total_tax": Decimal('0')
+                }
+
+                # Calculate profits for each position
+                response = ["📊 Portfolio Analysis:\n"]
+
+                # First show USDT balance
+                try:
+                    usdt_balance = await self.binance_client.get_balance('USDT')
+                    response.append(f"💵 USDT Balance: ${usdt_balance:.2f}\n")
+                except Exception as e:
+                    logger.error(f"Failed to get USDT balance: {e}")
+                    response.append("💵 USDT Balance: Unable to fetch\n")
+
+                # Process each configured symbol
+                for symbol in sorted(allowed_symbols):
+                    position = positions.get(symbol)
+                    if not position:
+                        continue
+
+                    # Get current price
+                    ticker = await self.binance_client.client.get_symbol_ticker(symbol=symbol)
+                    current_price = Decimal(ticker['price'])
+                    
+                    # Calculate profits
+                    profit_data = self.mongo_client.calculate_profit_loss(position, current_price)
+                    
+                    # Update portfolio totals
+                    portfolio_stats["total_cost"] += position["total_cost"]
+                    portfolio_stats["total_value"] += profit_data["current_value"]
+                    portfolio_stats["total_profit"] += profit_data["absolute_pl"]
+                    portfolio_stats["total_tax"] += profit_data["tax_amount"]
+                    
+                    # Generate position message
+                    position_msg = [
+                        f"\n🔸 {symbol}:",
+                        f"Quantity: {position['total_quantity']:.8f}",
+                        f"Avg Entry: ${position['avg_entry_price']:.2f}",
+                        f"Current: ${current_price:.2f}",
+                        f"Value: ${profit_data['current_value']:.2f}",
+                        f"P/L: ${profit_data['absolute_pl']:.2f} ({profit_data['percentage_pl']:+.2f}%)",
+                    ]
+
+                    if profit_data['tax_amount'] > 0:
+                        position_msg.append(f"Tax: ${profit_data['tax_amount']:.2f}")
+
+                    # Generate diagram
+                    diagram = self.mongo_client.generate_profit_diagram(position, current_price)
+                    position_msg.append(diagram)
+                    
+                    response.extend(position_msg)
+
+                # Add portfolio summary
+                portfolio_pl_percentage = (
+                    (portfolio_stats["total_value"] - portfolio_stats["total_cost"]) / 
+                    portfolio_stats["total_cost"] * 100 if portfolio_stats["total_cost"] > 0 else Decimal('0')
+                )
+
+                summary = [
+                    "\n📈 Portfolio Summary:",
+                    f"Total Cost: ${portfolio_stats['total_cost']:.2f}",
+                    f"Total Value: ${portfolio_stats['total_value']:.2f}",
+                    f"Total P/L: ${portfolio_stats['total_profit']:.2f} ({portfolio_pl_percentage:+.2f}%)"
                 ]
 
-                if profit_data['tax_amount'] > 0:
-                    position_msg.append(f"Tax: ${profit_data['tax_amount']:.2f}")
+                if portfolio_stats["total_tax"] > 0:
+                    net_profit = portfolio_stats["total_profit"] - portfolio_stats["total_tax"]
+                    summary.extend([
+                        f"Total Tax: ${portfolio_stats['total_tax']:.2f}",
+                        f"Net P/L: ${net_profit:.2f}"
+                    ])  # Close the extend() call properly
 
-                # Generate diagram
-                diagram = self.mongo_client.generate_profit_diagram(position, current_price)
-                position_msg.append(diagram)
-                
-                response.extend(position_msg)
+                response.extend(summary)
 
-            # Add portfolio summary
-            portfolio_pl_percentage = (
-                (portfolio_stats["total_value"] - portfolio_stats["total_cost"]) / 
-                portfolio_stats["total_cost"] * 100 if portfolio_stats["total_cost"] > 0 else Decimal('0')
-            )
-
-            summary = [
-                "\n📈 Portfolio Summary:",
-                f"Total Cost: ${portfolio_stats['total_cost']:.2f}",
-                f"Total Value: ${portfolio_stats['total_value']:.2f}",
-                f"Total P/L: ${portfolio_stats['total_profit']:.2f} ({portfolio_pl_percentage:+.2f}%)"
-            ]
-
-            if portfolio_stats["total_tax"] > 0:
-                net_profit = portfolio_stats["total_profit"] - portfolio_stats["total_tax"]
-                summary.extend([
-                    f'Total Tax: ${portfolio_stats["total_tax"]:.2f}',  # Changed double quotes to single quotes
-                    f"Net P/L: ${net_profit:.2f}"
-                ])
-
-            response.extend(summary)
-            
-            # Send response
             await update.message.reply_text("\n".join(response))
-            
+
         except Exception as e:
-            logger.error(f"Error calculating profits: {e}", exc_info=True)
-            await update.message.reply_text(f"❌ Error calculating profits: {str(e)}")
-
-    def _get_timeframe_value(self, timeframe) -> str:
-        """Safely get timeframe value, handling both enum and string cases"""
-        if hasattr(timeframe, 'value'):
-            return timeframe.value
-        return str(timeframe)
-
-    async def add_trade_symbol(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle symbol input"""
-        if not self._is_authorized(update.effective_user.id):
-            await update.message.reply_text("⛔ Unauthorized access")
-            return ConversationHandler.END
-
-        symbol = update.message.text.upper()
-        if symbol not in self.config['trading']['pairs']:
-            await update.message.reply_text(f"Invalid symbol. Please choose from: {', '.join(self.config['trading']['pairs'])}")
-            return SYMBOL
-            
-        self.temp_trade_data[update.effective_user.id] = {'symbol': symbol}
-        
-        keyboard = [
-            [KeyboardButton("SPOT")],
-            [KeyboardButton("FUTURES")]
-        ]
-        markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True)
-        
-        await update.message.reply_text(
-            "What type of trade is this?",
-            reply_markup=markup
-        )
-        return ORDER_TYPE
-
-    async def add_trade_price(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle price input"""
-        try:
-            direction = update.message.text.upper()
-            user_data = self.temp_trade_data[update.effective_user.id]
-            
-            if user_data.get('order_type') == OrderType.FUTURES:
-                user_data['direction'] = TradeDirection(direction.lower())
-            
-            await update.message.reply_text(
-                "What was your entry price? (e.g., 42000.50)"
-            )
-            return PRICE
-            
-        except ValueError:
-            await update.message.reply_text("Please enter a valid direction (LONG/SHORT)")
-            return DIRECTION
-
-    async def add_trade_fees(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle fees input and create the trade"""
-        try:
-            price = Decimal(update.message.text)
-            if price <= 0:
-                raise ValueError("Price must be positive")
-                
-            user_data = self.temp_trade_data[update.effective_user.id]
-            user_data['price'] = price
-            
-            await update.message.reply_text(
-                "What were the trading fees? (in USDT, e.g., 0.25)"
-            )
-            return FEES
-            
-        except ValueError as e:
-            await update.message.reply_text(f"Please enter a valid price: {str(e)}")
-            return PRICE
-
-    async def add_trade_final(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Complete trade creation with fees"""
-        try:
-            fees = Decimal(update.message.text)
-            if fees < 0:
-                raise ValueError("Fees cannot be negative")
-                
-            user_data = self.temp_trade_data[update.effective_user.id]
-            
-            # Generate unique order ID
-            order_id = f"MANUAL_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
-            
-            # Create order object
-            order = Order(
-                symbol=user_data['symbol'],
-                status=OrderStatus.FILLED,
-                order_type=user_data['order_type'],
-                price=user_data['price'],
-                quantity=user_data['amount'] / user_data['price'],
-                timeframe=TimeFrame.DAILY,  # Default to daily for manual trades
-                order_id=order_id,
-                created_at=datetime.utcnow(),
-                updated_at=datetime.utcnow(),
-                filled_at=datetime.utcnow(),
-                leverage=user_data.get('leverage'),
-                direction=user_data.get('direction'),
-                fees=fees,
-                fee_asset='USDT'
-            )
-            
-            # Save to database using manual trade method
-            if await self.mongo_client.insert_manual_trade(order):
-                direction_info = f"\nDirection: {order.direction.value}" if order.direction else ""
-                leverage_info = f"\nLeverage: {order.leverage}x" if order.leverage else ""
-                
-                await update.message.reply_text(
-                    f"✅ Manual trade added:\n"
-                    f"Symbol: {order.symbol}\n"
-                    f"Type: {order.order_type.value}"
-                    f"{direction_info}"
-                    f"{leverage_info}\n"
-                    f"Amount: {float(order.quantity):.8f}\n"
-                    f"Price: ${float(order.price):.2f}\n"
-                    f"Fees: ${float(order.fees):.2f}\n"
-                    f"Total Value: ${float(order.price * order.quantity)::.2f}",  # Fixed double colon here
-                    reply_markup=self.markup  # Restore original keyboard
-                )
-            else:
-                await update.message.reply_text("❌ Failed to save trade")
-            
-            # Cleanup
-            del self.temp_trade_data[update.effective_user.id]
-            return ConversationHandler.END
-            
-        except ValueError as e:
-            await update.message.reply_text(f"Please enter valid fees: {str(e)}")
-            return FEES
-        except Exception as e:
-            logger.error(f"Error creating manual trade: {e}")
-            await update.message.reply_text(
-                f"❌ Error creating trade: {str(e)}",
-                reply_markup=self.markup  # Restore original keyboard even on error
-            )
-            return ConversationHandler.END
-
-    async def add_trade_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Cancel the trade addition process"""
-        if update.effective_user.id in self.temp_trade_data:
-            del self.temp_trade_data[update.effective_user.id]
-        await update.message.reply_text(
-            "Trade creation cancelled",
-            reply_markup=self.markup  # Restore original keyboard
-        )
-        return ConversationHandler.END
+            logger.error(f"Error getting profits: {e}")
+            await update.message.reply_text(f"❌ Error getting profits: {str(e)}")
 
     async def show_viz_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show data visualization options"""
@@ -1173,45 +1273,52 @@ Menu:
         return "\n".join(response)
 
     async def send_timeframe_reset_notification(self, reset_data: dict):
-        """Send notification when a timeframe resets with price information"""
-        emoji_map = {
-            TimeFrame.DAILY: "📅",
-            TimeFrame.WEEKLY: "📆",
-            TimeFrame.MONTHLY: "📊"
-        }
-        
-        timeframe = reset_data["timeframe"]
-        message_parts = [
-            f"{emoji_map.get(timeframe, '🔄')} {timeframe.value.title()} Reset",
-            f"\nOpening Prices:"
-        ]
-        
-        # Add price information for each symbol
-        for price_data in reset_data["prices"]:
-            symbol = price_data["symbol"]
-            current = price_data["current_price"]
-            reference = price_data["reference_price"]
-            change = price_data["price_change"]
+        """Send detailed timeframe reset notification"""
+        try:
+            timeframe = reset_data["timeframe"]
+            emoji_map = {
+                TimeFrame.DAILY: "📅",
+                TimeFrame.WEEKLY: "📆",
+                TimeFrame.MONTHLY: "📊"
+            }
             
-            message_parts.append(
-                f"\n{symbol}:"
-                f"\nOpening: ${reference:,.2f}"
-                f"\nCurrent: ${current:,.2f}"
-                f"\nChange: {change:+.2f}%"
-            )
-        
-        message_parts.append(f"\n\nAll {timeframe.value} thresholds have been reset.")
-        
-        # Send to all authorized users
-        for user_id in self.allowed_users:
-            try:
-                await self.app.bot.send_message(
-                    chat_id=user_id,
-                    text="\n".join(message_parts),
-                    reply_markup=self.markup
+            message_parts = [
+                f"{self.env_info}\n",
+                f"{emoji_map.get(timeframe, '🔄')} {timeframe.value.title()} Timeframe Reset\n",
+                f"Reset Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC\n",
+                "\nPrice Summary:"
+            ]
+            
+            # Add price information for each symbol
+            for price_data in reset_data["prices"]:
+                symbol = price_data["symbol"]
+                current = price_data["current_price"]
+                reference = price_data["reference_price"]
+                change = price_data["price_change"]
+                
+                message_parts.append(
+                    f"\n{symbol}:"
+                    f"\n• Previous Open: ${reference:,.2f}"
+                    f"\n• Current Price: ${current:,.2f}"
+                    f"\n• Change: {change:+.2f}%"
                 )
-            except Exception as e:
-                logger.error(f"Failed to send reset notification to {user_id}: {e}")
+            
+            message_parts.append(f"\n\nAll {timeframe.value} thresholds have been reset.")
+            message_parts.append("\nUse /thresholds to see new tracking status.")
+            
+            # Send to all authorized users
+            for user_id in self.allowed_users:
+                try:
+                    await self.app.bot.send_message(
+                        chat_id=user_id,
+                        text="\n".join(message_parts),
+                        reply_markup=self.markup
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to send reset notification to {user_id}: {e}")
+                    
+        except Exception as e:
+            logger.error(f"Error sending timeframe reset notification: {e}")
 
     async def send_threshold_notification(self, symbol: str, timeframe: TimeFrame, 
                                        threshold: float, current_price: float,
@@ -1283,5 +1390,427 @@ Menu:
             except Exception as e:
                 logger.error(f"Failed to send initial balance alert to {user_id}: {e}")
 
-    # ...rest of existing code...
+    async def switch_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Switch between spot and futures trading modes"""
+        if not self._is_authorized(update.effective_user.id):
+            await update.message.reply_text("⛔ Unauthorized access")
+            return
+            
+        current_mode = self.config['environment']['trading_mode']
+        new_mode = 'futures' if current_mode == 'spot' else 'spot'
+        
+        keyboard = [
+            [InlineKeyboardButton(f"Confirm switch to {new_mode.upper()}", 
+                                callback_data=f"switch_mode_{new_mode}")],
+            [InlineKeyboardButton("Cancel", callback_data="switch_mode_cancel")]
+        ]
+        
+        await update.message.reply_text(
+            f"🔄 Current mode: {current_mode.upper()}\n"
+            f"Switch to {new_mode.upper()} mode?\n\n"
+            "⚠️ This will close all open positions",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
 
+    async def handle_mode_switch(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle mode switch confirmation"""
+        query = update.callback_query
+        await query.answer()
+        
+        if query.data == "switch_mode_cancel":
+            await query.edit_message_text("Mode switch cancelled")
+            return
+            
+        new_mode = query.data.split('_')[-1]
+        try:
+            # Only cancel pending orders, don't close positions
+            if self.binance_client:
+                # Get pending orders first
+                pending_orders = await self.mongo_client.get_pending_orders()
+                for order in pending_orders:
+                    await self.binance_client.cancel_order(order.symbol, order.order_id)
+                
+                # Update config
+                self.config['environment']['trading_mode'] = new_mode
+                
+                # Send notification
+                await query.edit_message_text(
+                    f"✅ Switching to {new_mode.upper()} mode\n"
+                    "All pending orders have been cancelled.\n"
+                    "Bot will restart with new mode..."
+                )
+                
+                # Restart the bot
+                await self.stop()
+                await self.initialize()
+                await self.start()
+                
+        except Exception as e:
+            await query.edit_message_text(f"❌ Failed to switch mode: {str(e)}")
+
+    async def set_leverage(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Set leverage for a trading pair"""
+        if not self._is_authorized(update.effective_user.id):
+            await update.message.reply_text("⛔ Unauthorized access")
+            return
+            
+        if self.config['environment']['trading_mode'] != 'futures':
+            await update.message.reply_text("❌ This command is only available in futures mode")
+            return
+            
+        args = context.args
+        if len(args) != 2:
+            await update.message.reply_text(
+                "⚠️ Usage: /leverage SYMBOL LEVERAGE\n"
+                "Example: /leverage BTCUSDT 10"
+            )
+            return
+            
+        symbol, leverage = args[0].upper(), args[1]
+        try:
+            leverage = int(leverage)
+            if not 1 <= leverage <= 125:
+                raise ValueError("Leverage must be between 1 and 125")
+                
+            result = await self.binance_client.set_leverage(symbol, leverage)
+            if result:
+                await update.message.reply_text(
+                    f"✅ Leverage set for {symbol}:\n"
+                    f"Leverage: {leverage}x"
+                )
+            else:
+                await update.message.reply_text("❌ Failed to set leverage")
+                
+        except ValueError as e:
+            await update.message.reply_text(f"❌ Invalid leverage: {str(e)}")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error: {str(e)}")
+
+    async def set_margin_type(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Set margin type for a trading pair"""
+        if not self._is_authorized(update.effective_user.id):
+            await update.message.reply_text("⛔ Unauthorized access")
+            return
+            
+        if self.config['environment']['trading_mode'] != 'futures':
+            await update.message.reply_text("❌ This command is only available in futures mode")
+            return
+            
+        args = context.args
+        if len(args) != 2:
+            await update.message.reply_text(
+                "⚠️ Usage: /margin SYMBOL TYPE\n"
+                "Example: /margin BTCUSDT ISOLATED\n"
+                "Types: ISOLATED, CROSSED"
+            )
+            return
+            
+        symbol, margin_type = args[0].upper(), args[1].upper()
+        if margin_type not in ['ISOLATED', 'CROSSED']:
+            await update.message.reply_text("❌ Margin type must be ISOLATED or CROSSED")
+            return
+            
+        try:
+            result = await self.binance_client.set_margin_type(symbol, margin_type)
+            if result:
+                await update.message.reply_text(
+                    f"✅ Margin type set for {symbol}:\n"
+                    f"Type: {margin_type}"
+                )
+            else:
+                await update.message.reply_text("❌ Failed to set margin type")
+                
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error: {str(e)}")
+
+    async def toggle_hedge_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Toggle hedge mode for futures trading"""
+        if not self._is_authorized(update.effective_user.id):
+            await update.message.reply_text("⛔ Unauthorized access")
+            return
+            
+        if self.config['environment']['trading_mode'] != 'futures':
+            await update.message.reply_text("❌ This command is only available in futures mode")
+            return
+            
+        try:
+            current_mode = await self.binance_client.get_position_mode()
+            new_mode = 'HEDGE' if current_mode == 'ONE_WAY' else 'ONE_WAY'
+            
+            result = await self.binance_client.set_position_mode(new_mode)
+            if result:
+                await update.message.reply_text(
+                    f"✅ Position mode changed:\n"
+                    f"New mode: {new_mode}"
+                )
+            else:
+                await update.message.reply_text("❌ Failed to change position mode")
+                
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error: {str(e)}")
+
+    def _get_timeframe_value(self, timeframe: TimeFrame) -> str:
+        """Convert TimeFrame enum to display string"""
+        if not timeframe:
+            return "N/A"
+            
+        display_map = {
+            TimeFrame.DAILY: "Daily",
+            TimeFrame.WEEKLY: "Weekly",
+            TimeFrame.MONTHLY: "Monthly"
+        }
+        return display_map.get(timeframe, str(timeframe))
+
+    async def show_main_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show interactive main menu"""
+        if not self._is_authorized(update.effective_user.id):
+            return
+        
+        # Handle both message and callback query updates
+        message = update.message or update.callback_query.message
+        if not message:
+            return
+            
+        current_mode = self.config['environment']['trading_mode'].upper()
+        keyboard = [
+            [InlineKeyboardButton("👤 Account Info", callback_data="menu_account"),
+             InlineKeyboardButton("📈 Trading", callback_data="menu_trading")],
+            [InlineKeyboardButton("📊 Analysis", callback_data="menu_analysis"),
+             InlineKeyboardButton("⚙️ Settings", callback_data="menu_settings")],
+            [InlineKeyboardButton("🔄 Switch Mode", callback_data="menu_switch_mode")]
+        ]
+
+        menu_text = (
+            f"🦖 Trade-a-saurus Rex Menu\n\n"
+            f"Current Mode: {current_mode}\n"
+            f"Trading Status: {'Paused ⏸' if self.is_paused else 'Active ▶️'}\n\n"
+            f"Select a category:"
+        )
+
+        if update.callback_query:
+            await update.callback_query.edit_message_text(
+                menu_text,
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        else:
+            await message.reply_text(
+                menu_text,
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+
+    async def handle_menu_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle menu callback queries"""
+        query = update.callback_query
+        await query.answer()
+        
+        current_mode = self.config['environment']['trading_mode'].upper()
+        
+        if query.data == "menu_account":
+            keyboard = [
+                [InlineKeyboardButton("💰 Balance", callback_data="action_balance"),
+                 InlineKeyboardButton("📊 Stats", callback_data="action_stats")],
+                [InlineKeyboardButton("💵 Profits", callback_data="action_profits"),
+                 InlineKeyboardButton("📜 History", callback_data="action_history")]
+            ]
+            if current_mode == "FUTURES":
+                keyboard.append([InlineKeyboardButton("📈 Positions", callback_data="action_positions")])
+            keyboard.append([InlineKeyboardButton("« Back", callback_data="menu_main")])
+            
+            await query.edit_message_text(
+                f"👤 Account Menu ({current_mode})\n"
+                "Select an option:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+
+        elif query.data == "menu_trading":
+            # Trading menu with clear distinction for futures settings
+            keyboard = [
+                [InlineKeyboardButton("➕ Add Manual Trade", callback_data="action_add"),
+                 InlineKeyboardButton("⏯️ Toggle Auto Trading", callback_data="action_power")]
+            ]
+            if current_mode == "FUTURES":
+                keyboard.extend([
+                    [InlineKeyboardButton("═ Active Trade Settings ═", callback_data="none")],
+                    [InlineKeyboardButton("Set Trade Leverage", callback_data="action_leverage"),
+                     InlineKeyboardButton("Set Trade Margin", callback_data="action_margin")],
+                ])
+            keyboard.append([InlineKeyboardButton("« Back", callback_data="menu_main")])
+            
+            await query.edit_message_text(
+                f"📈 Trading Menu ({current_mode})\n"
+                "Select an option:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+
+        elif query.data == "menu_analysis":
+            keyboard = [
+                [InlineKeyboardButton("📊 Visualizations", callback_data="action_viz"),
+                 InlineKeyboardButton("🎯 Thresholds", callback_data="action_thresholds")],
+                [InlineKeyboardButton("📈 Market Data", callback_data="action_market")],
+                [InlineKeyboardButton("« Back", callback_data="menu_main")]
+            ]
+            
+            await query.edit_message_text(
+                f"📊 Analysis Menu ({current_mode})\n"
+                "Select an option:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+
+        elif query.data == "menu_settings":
+            # Settings menu with clear distinction for futures defaults
+            keyboard = [
+                [InlineKeyboardButton("⚙️ Trading Mode", callback_data="action_mode")]
+            ]
+            if current_mode == "FUTURES":
+                keyboard.extend([
+                    [InlineKeyboardButton("═ Futures Default Settings ═", callback_data="none")],
+                    [InlineKeyboardButton("Default Leverage", callback_data="action_def_leverage")],
+                    [InlineKeyboardButton("Default Margin Type", callback_data="action_def_margin")],
+                    [InlineKeyboardButton("Position Mode (ONE-WAY/HEDGE)", callback_data="action_pos_mode")]
+                ])
+            keyboard.append([InlineKeyboardButton("« Back", callback_data="menu_main")])
+            
+            await query.edit_message_text(
+                f"⚙️ Settings Menu ({current_mode})\n\n"
+                f"Current Settings:\n"
+                f"• Mode: {current_mode}\n"
+                + (f"• Default Leverage: {self.config['trading']['futures_settings']['default_leverage']}x\n"
+                   f"• Default Margin: {self.config['trading']['futures_settings']['margin_type']}\n"
+                   f"• Position Mode: {self.config['trading']['futures_settings']['position_mode']}"
+                   if current_mode == "FUTURES" else ""),
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+
+        elif query.data == "menu_main":
+            # Return to main menu
+            await self.show_main_menu(update, context)
+
+        elif query.data.startswith("action_"):
+            # Handle action callbacks
+            action = query.data.replace("action_", "")
+            await self.handle_menu_action(action, update, context)
+
+    async def handle_menu_action(self, action: str, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle menu action callbacks"""
+        query = update.callback_query
+        
+        # Map actions to existing command handlers
+        action_map = {
+            'balance': self.get_balance_command,
+            'stats': self.get_stats,
+            'profits': self.show_profits,
+            'history': self.get_order_history,
+            'add': self.add_trade_start,
+            'power': self.toggle_trading,
+            'leverage': self.set_leverage,
+            'margin': self.set_margin_type,
+            'hedge': self.toggle_hedge_mode,
+            'viz': self.show_viz_menu,
+            'thresholds': self.show_thresholds,
+            'mode': self.switch_mode
+        }
+        
+        if action in action_map:
+            # Create a dummy message update for command handlers
+            dummy_message = query.message
+            dummy_message.text = f"/{action}"
+            dummy_update = Update(update.update_id, message=dummy_message)
+            
+            # Call the corresponding handler
+            await action_map[action](dummy_update, context)
+        else:
+            await query.edit_message_text(
+                f"Action '{action}' not implemented yet.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("« Back", callback_data="menu_main")]
+                ])
+            )
+
+    async def get_balance(self):
+        """Get balance with proper client handling"""
+        try:
+            # Check if we're in futures mode
+            if self.config['environment']['trading_mode'] == 'futures':
+                if not hasattr(self.binance_client, 'futures_client'):
+                    raise AttributeError("Futures client not available")
+                return await self.binance_client.futures_client.get_balance()
+            else:
+                # Use regular spot client
+                return await self.binance_client.get_balance(self.config['trading']['base_currency'])
+        except Exception as e:
+            logger.error(f"Error getting balance: {e}")
+            return Decimal('0')
+
+    def _format_trade_info(self, order: Order) -> str:
+        """Format trade info for text messages"""
+        base_info = (
+            f"Trade Details:\n"
+            f"Symbol: {order.symbol}\n"
+            f"Type: {order.order_type.value}\n"
+            f"Price: ${float(order.price):.2f}\n"
+            f"Amount: {float(order.quantity):.8f}\n"
+            f"Total Value: ${float(order.price * order.quantity):.2f}"
+        )
+        
+        if order.order_type == OrderType.FUTURES:
+            base_info += (
+                f"\nLeverage: {order.leverage}x\n"
+                f"Direction: {order.direction.value if order.direction else 'N/A'}"
+            )
+        
+        return base_info
+
+    async def test_commands(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Test all available commands for current mode"""
+        if not self._is_authorized(update.effective_user.id):
+            await update.message.reply_text("⛔ Unauthorized access")
+            return
+
+        current_mode = self.config['environment']['trading_mode'].upper()
+        
+        await update.message.reply_text(f"🧪 Starting command test for {current_mode} mode...")
+
+        try:
+            # Test basic commands
+            commands = [
+                ("Menu Command", self.show_menu),
+                ("Balance Check", self.get_balance_command),  # Changed this line
+                ("Stats Check", self.get_stats),
+                ("Profit Analysis", self.show_profits),
+                ("Order History", self.get_order_history),
+                ("Threshold Status", self.show_thresholds),
+                ("Visualization Menu", self.show_viz_menu)
+            ]
+
+            # Add futures-specific commands if in futures mode
+            if (current_mode == "FUTURES"):
+                commands.extend([
+                    ("Leverage Test", lambda u, c: self.set_leverage(u, ["BTCUSDT", "10"])),
+                    ("Margin Type Test", lambda u, c: self.set_margin_type(u, ["BTCUSDT", "ISOLATED"])),
+                    ("Hedge Mode Test", self.toggle_hedge_mode)
+                ])
+
+            # Execute each command with status reporting
+            for test_name, command in commands:
+                try:
+                    await update.message.reply_text(f"Testing: {test_name}...")
+                    await command(update, context)
+                    await asyncio.sleep(1)  # Add delay between commands
+                except Exception as e:
+                    await update.message.reply_text(f"❌ {test_name} failed: {str(e)}")
+                    continue
+
+            await update.message.reply_text(
+                "✅ Command test completed!\n\n"
+                "Note: Some commands may have produced their own output above."
+            )
+
+        except Exception as e:
+            await update.message.reply_text(f"❌ Test sequence failed: {str(e)}")
+
+    def handle_submenu_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        query.answer()
+        data = query.data
+        # TODO: Process submenu actions based on 'data'
+        logger.info(f"Submenu action: {data}")
