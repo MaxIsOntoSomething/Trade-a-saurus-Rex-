@@ -198,17 +198,21 @@ MIT License
 ## ✅ TODO  
 
 ### 🚀 Work in Progress  
-- ⚙️ **Futures Integration** ⏳ (In Progress)  
-- 🔗 **Bitget Integration** ⏳ (In Progress)  
+- ⚙️ **Chart Generation**
+- ⚙️ **ADD Coins and delete them through Telegram**
+- ⚙️ **Adjust Margin and Leverage through Telegram**
+- ⚙️ **Chart Generation, Equity Curve, and Buys Marked**  
 
 ### ✅ Finished  
 - ✅ **Telegram - Open Orders Command**  
 - ✅ **Reserve Balance**  
-- ✅ **Chart Generation**  
 - ✅ **Reset Updates Send**  
 - ✅ **MongoDB Integration**  
 - ✅ **Migrating from SQLite**  
 - ✅ **Docker Support**  
+- ✅ **Future Trading**
+- ✅ **TP and Stop Lose**
+
 
 ### 📌 Planned  
 - 📌 **Weekly & Monthly Summary (Optional)**  
@@ -216,12 +220,9 @@ MIT License
 - 📌 **Backtest Option to Test Performance**  
 - 📌 **Report with real Balance 5k+**  
 - 📌 **More Detailed Explanation of Config Readme**  
-- 📌 **Take Profit and Stop Lose for Future Trades**  
-- 📌 **Add Coins and delete them through Telegram**  
-- 📌 **Chart Generation, Equity Curve, and Buys Marked**  
 
 ### ⚠️ Known Issues  
-- 🛑 **Telegram not working with Futures**  
+- 🛑 **Telegram not working with Chart Generation**  
 
 ## Analysis  
 
