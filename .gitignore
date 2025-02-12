@@ -7,3 +7,4 @@ src/trading/pycache/*
 src/types/pycache/*
 src/utils/pycache/*
 **/__pycache__/ 
+.github/copilot-instructions.md
