@@ -106,7 +106,17 @@ class MongoClient:
                     "last_checked": datetime.utcnow(),
                     "check_count": 0,
                     "error_count": 0
-                }
+                },
+                # Add TP/SL tracking fields
+                "tp_order_id": order.tp_order_id,
+                "sl_order_id": order.sl_order_id,
+                "tp_price": float(order.tp_price) if order.tp_price else None,
+                "sl_price": float(order.sl_price) if order.sl_price else None,
+                "tp_status": "PENDING" if order.tp_order_id else None,
+                "sl_status": "PENDING" if order.sl_order_id else None,
+                "exit_type": None,  # Will be updated to 'TP' or 'SL' when triggered
+                "exit_price": None,  # Will store actual exit price
+                "realized_pnl": None  # Will store PnL after position close
             }
             
             result = await self.orders.insert_one(order_dict)
@@ -841,6 +851,39 @@ class MongoClient:
             return True
         except Exception as e:
             logger.error(f"Error resetting thresholds: {e}")
+            return False
+
+    async def update_tp_sl_status(self, order_id: str, 
+                                tp_status: Optional[str] = None,
+                                sl_status: Optional[str] = None,
+                                exit_type: Optional[str] = None,
+                                exit_price: Optional[float] = None,
+                                realized_pnl: Optional[float] = None) -> bool:
+        """Update TP/SL order status"""
+        try:
+            update_dict = {
+                "updated_at": datetime.utcnow()
+            }
+            
+            if tp_status:
+                update_dict["tp_status"] = tp_status
+            if sl_status:
+                update_dict["sl_status"] = sl_status
+            if exit_type:
+                update_dict["exit_type"] = exit_type
+            if exit_price is not None:
+                update_dict["exit_price"] = exit_price
+            if realized_pnl is not None:
+                update_dict["realized_pnl"] = realized_pnl
+
+            result = await self.orders.update_one(
+                {"order_id": order_id},
+                {"$set": update_dict}
+            )
+            return result.modified_count > 0
+
+        except Exception as e:
+            logger.error(f"Failed to update TP/SL status: {e}")
             return False
 
     # ...rest of existing code...

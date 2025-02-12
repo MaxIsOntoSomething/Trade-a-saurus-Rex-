@@ -47,7 +47,11 @@ class ClientManager:
                     api_config = {
                         **self.config['binance']['testnet_futures'],
                         'testnet': True,  # Add testnet flag
-                        **self.config['trading'].get('futures_settings', {})  # Add futures settings
+                        'reserve_balance': self.config['trading']['reserve_balance'],  # Add reserve balance
+                        **self.config['trading'].get('futures_settings', {}),  # Add futures settings
+                        'env': {  # Add environment variables
+                            'TRADING_RESERVE_BALANCE': os.getenv('TRADING_RESERVE_BALANCE')
+                        }
                     }
                 else:
                     api_config = {
@@ -60,7 +64,7 @@ class ClientManager:
                     'testnet': False
                 }
 
-            # Initialize appropriate client
+            # Initialize appropriate client with full config
             if self.trading_mode == 'futures':
                 self.futures_client = FuturesClient(api_config)
                 await self.futures_client.initialize()
@@ -69,14 +73,19 @@ class ClientManager:
                 self.spot_client = BinanceClient(
                     api_key=api_config['api_key'],
                     api_secret=api_config['api_secret'],
-                    testnet=self.testnet
+                    testnet=self.testnet,
+                    base_currency=self.config['trading']['base_currency'],
+                    reserve_balance=self.config['trading']['reserve_balance'],
+                    config=self.config  # Pass the full config object
                 )
                 await self.spot_client.initialize()
                 self.active_client = self.spot_client
 
             logger.info(
                 f"Initialized {self.trading_mode.upper()} client "
-                f"on {'Testnet' if self.testnet else 'Mainnet'}"
+                f"on {'Testnet' if self.testnet else 'Mainnet'} "
+                f"with base currency: {self.config['trading']['base_currency']} "
+                f"and reserve: ${self.config['trading']['reserve_balance']:,.2f}"
             )
             return self.active_client
 
@@ -164,6 +173,21 @@ def validate_config(config: dict) -> bool:
             if not isinstance(config['trading']['thresholds'][timeframe], list):
                 raise ValueError(f"Thresholds for {timeframe} must be a list")
 
+        # Validate futures TP/SL settings if in futures mode
+        if config['environment']['trading_mode'] == 'futures':
+            futures_settings = config['trading'].get('futures_settings', {})
+            
+            # Validate TP/SL percentages if enabled
+            if futures_settings.get('tp_enabled', False):
+                tp_percent = futures_settings.get('default_tp_percent', 0)
+                if not (0 < tp_percent <= 500):  # Maximum 500% profit target
+                    raise ValueError("default_tp_percent must be between 0 and 500")
+                    
+            if futures_settings.get('sl_enabled', False):
+                sl_percent = futures_settings.get('default_sl_percent', 0)
+                if not (0 < sl_percent <= 100):  # Maximum 100% loss
+                    raise ValueError("default_sl_percent must be between 0 and 100")
+
         return True
         
     except Exception as e:
@@ -237,6 +261,12 @@ def load_config_from_env() -> dict:
             'allowed_pairs': os.getenv('FUTURES_ALLOWED_PAIRS', '').split(','),
             'position_mode': os.getenv('FUTURES_POSITION_MODE', 'ONE_WAY')
         }
+        config['trading']['futures'].update({
+            'tp_enabled': os.getenv('FUTURES_TP_ENABLED', 'true').lower() == 'true',
+            'sl_enabled': os.getenv('FUTURES_SL_ENABLED', 'true').lower() == 'true',
+            'default_tp_percent': float(os.getenv('FUTURES_DEFAULT_TP_PERCENT', '50')),
+            'default_sl_percent': float(os.getenv('FUTURES_DEFAULT_SL_PERCENT', '10'))
+        })
 
     return config
 
