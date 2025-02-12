@@ -485,3 +485,85 @@ class OrderManager:
                         
         except Exception as e:
             logger.error(f"Error monitoring futures positions: {e}")
+
+    async def check_order_status(self, order: Order):
+        """Check and update order status with TP/SL tracking"""
+        try:
+            # Check main order status first
+            current_status = await self.active_client.check_order_status(
+                order.symbol, 
+                order.order_id
+            )
+            
+            if current_status == OrderStatus.FILLED and order.status != OrderStatus.FILLED:
+                # Main order just filled, start monitoring TP/SL
+                await self._handle_order_fill(order)
+            
+            # If main order is filled, check TP/SL status
+            elif order.status == OrderStatus.FILLED:
+                await self._check_tp_sl_status(order)
+
+        except Exception as e:
+            logger.error(f"Error checking order status: {e}")
+
+    async def _check_tp_sl_status(self, order: Order):
+        """Monitor TP/SL orders"""
+        try:
+            # Check TP order if exists
+            if order.tp_order_id:
+                tp_status = await self.active_client.check_order_status(
+                    order.symbol, order.tp_order_id
+                )
+                if tp_status == OrderStatus.FILLED:
+                    # TP hit - update order and cancel SL
+                    await self._handle_tp_sl_trigger(order, "TP")
+                    return
+
+            # Check SL order if exists
+            if order.sl_order_id:
+                sl_status = await self.active_client.check_order_status(
+                    order.symbol, order.sl_order_id
+                )
+                if sl_status == OrderStatus.FILLED:
+                    # SL hit - update order and cancel remaining orders
+                    await self._handle_tp_sl_trigger(order, "SL")
+                    return
+
+        except Exception as e:
+            logger.error(f"Error checking TP/SL status: {e}")
+
+    async def _handle_tp_sl_trigger(self, order: Order, trigger_type: str):
+        """Handle TP or SL trigger"""
+        try:
+            # Get position info for PnL calculation
+            position_info = await self.active_client.get_position_info(order.symbol)
+            realized_pnl = float(position_info.get('realizedPnl', 0))
+            exit_price = float(order.tp_price if trigger_type == "TP" else order.sl_price)
+
+            # Update database
+            await self.mongo_client.update_tp_sl_status(
+                order_id=order.order_id,
+                tp_status="FILLED" if trigger_type == "TP" else "CANCELLED",
+                sl_status="FILLED" if trigger_type == "SL" else "CANCELLED",
+                exit_type=trigger_type,
+                exit_price=exit_price,
+                realized_pnl=realized_pnl
+            )
+
+            # Cancel other orders
+            if trigger_type == "TP" and order.sl_order_id:
+                await self.active_client.cancel_order(order.symbol, order.sl_order_id)
+            elif trigger_type == "SL" and order.tp_order_id:
+                await self.active_client.cancel_order(order.symbol, order.tp_order_id)
+
+            # Send notification
+            if self.telegram_bot:
+                await self.telegram_bot.send_tp_sl_notification(
+                    order=order,
+                    trigger_type=trigger_type,
+                    exit_price=exit_price,
+                    realized_pnl=realized_pnl
+                )
+
+        except Exception as e:
+            logger.error(f"Error handling {trigger_type} trigger: {e}")

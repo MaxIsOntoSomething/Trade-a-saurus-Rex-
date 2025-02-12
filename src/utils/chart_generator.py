@@ -1,13 +1,14 @@
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import matplotlib.ticker as ticker
-from datetime import datetime
+from datetime import datetime, timedelta  # Added timedelta import
 from decimal import Decimal
 import io
 import logging
 import pandas as pd  # Add missing pandas import
 from typing import List, Dict, Optional
 from ..types.models import Order, OrderType, TradeDirection, TimeFrame  # Added TimeFrame import
+import mplfinance as mpf
 
 logger = logging.getLogger(__name__)
 
@@ -32,34 +33,122 @@ class ChartGenerator:
             TimeFrame.WEEKLY: '%Y-%m-%d', # Show full date for weekly
             TimeFrame.MONTHLY: '%Y-%m-%d' # Show full date for monthly
         }
+        
+        # Add default widths for timeframes (in seconds)
+        self.default_widths = {
+            TimeFrame.DAILY: 3600,     # 1 hour
+            TimeFrame.WEEKLY: 86400,   # 1 day
+            TimeFrame.MONTHLY: 259200  # 3 days
+        }
+        
+        # Add minimum periods requirement
+        self.min_periods = 1  # Changed from 2 to 1
+        self.required_periods = 8
 
-    def validate_candle_data(self, candles: List[Dict]) -> bool:
-        """Validate candle data for completeness and correctness"""
-        try:
-            if not candles or len(candles) < 2:
-                logger.warning("Not enough candles for chart generation (minimum 2 required)")
-                return False
+        # Add requirements for proper chart generation
+        self.required_candles = 8
+        self.price_padding = 0.1  # 10% padding for price range
 
-            required_fields = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
-            
-            for candle in candles:
-                if not all(field in candle for field in required_fields):
-                    logger.error(f"Missing required fields in candle: {candle}")
-                    return False
+        # Chart requirements
+        self.requirements = {
+            TimeFrame.MONTHLY: {
+                'required': 8,
+                'minimum': 1,
+                'format': '%Y-%m',
+                'label': 'Month',
+                'locator': mdates.MonthLocator()
+            },
+            TimeFrame.WEEKLY: {
+                'required': 8,
+                'minimum': 1,
+                'format': '%Y-%m-%d',
+                'label': 'Week',
+                'locator': mdates.WeekdayLocator(byweekday=mdates.MO)
+            },
+            TimeFrame.DAILY: {
+                'required': 8,
+                'minimum': 1,
+                'format': '%m-%d',
+                'label': 'Day',
+                'locator': mdates.DayLocator()
+            }
+        }
+
+        # Y-axis scaling parameters
+        self.y_axis_params = {
+            'price_padding': 0.1,  # 10% padding
+            'min_price_range': 1.0,  # Minimum price range to show
+            'outlier_threshold': 3.0  # Standard deviations for outlier detection
+        }
+
+        self.style = mpf.make_mpf_style(
+            base_mpf_style='yahoo',
+            gridstyle='',
+            y_on_right=True,
+            marketcolors=mpf.make_marketcolors(
+                up='#26a69a',
+                down='#ef5350',
+                edge='inherit',
+                wick='inherit',
+                volume='in',
+                ohlc='inherit'
+            ),
+            rc={
+                'axes.labelsize': 12,
+                'axes.titlesize': 14,
+                'font.size': 12
+            }
+        )
+
+    def validate_candles(self, candles: List[Dict], timeframe: TimeFrame) -> tuple[bool, str]:
+        """Validate candle data with detailed logging"""
+        logger.info(f"Validating {len(candles) if candles else 0} candles for {timeframe.value}")
+        
+        if not candles:
+            logger.error("No candle data provided")
+            return False, "No candle data available"
+
+        # Log raw candle data for debugging
+        logger.debug(f"Raw candle data: {candles[:2]}")  # Log first 2 candles
+
+        valid_candles = []
+        for i, candle in enumerate(candles):
+            try:
+                # Log each candle's format
+                logger.debug(f"Candle {i + 1} format: {list(candle.keys())}")
+                
+                # Check timestamp format
+                timestamp = candle.get('timestamp')
+                logger.debug(f"Timestamp for candle {i + 1}: {timestamp}")
+                
+                # Check price data
+                price_fields = {
+                    'open': candle.get('open'),
+                    'high': candle.get('high'),
+                    'low': candle.get('low'),
+                    'close': candle.get('close')
+                }
+                logger.debug(f"Price data for candle {i + 1}: {price_fields}")
+                
+                # Validate price data
+                if all(isinstance(price, (int, float, str, Decimal)) for price in price_fields.values()):
+                    valid_candles.append(candle)
+                else:
+                    logger.warning(f"Invalid price data in candle {i + 1}: {price_fields}")
                     
-                if not (float(candle['low']) <= float(candle['high']) and 
-                       float(candle['open']) <= float(candle['high']) and 
-                       float(candle['close']) <= float(candle['high']) and
-                       float(candle['low']) <= float(candle['open']) and
-                       float(candle['low']) <= float(candle['close'])):
-                    logger.error(f"Invalid price relationships in candle: {candle}")
-                    return False
+            except Exception as e:
+                logger.error(f"Error validating candle {i + 1}: {e}")
+                continue
 
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error validating candle data: {e}")
-            return False
+        # Log validation results
+        logger.info(f"Found {len(valid_candles)} valid candles out of {len(candles)}")
+        
+        if len(valid_candles) < self.min_periods:
+            msg = f"Insufficient valid candles: got {len(valid_candles)}, need {self.min_periods}"
+            logger.error(msg)
+            return False, msg
+
+        return True, ""
 
     def calculate_liquidation_price(self, order: Order) -> Optional[float]:
         """Calculate liquidation price for futures orders"""
@@ -83,109 +172,218 @@ class ChartGenerator:
             logger.error(f"Error calculating liquidation price: {e}")
             return None
 
+    def get_default_width(self, timeframe: TimeFrame) -> float:
+        """Get default candle width for timeframe"""
+        return self.default_widths.get(timeframe, 3600)  # Default to 1 hour if unknown
+
+    def calculate_axis_limits(self, prices: List[float], reference_price: Optional[float] = None,
+                            entry_price: Optional[float] = None) -> tuple[float, float]:
+        """Calculate optimal Y-axis limits"""
+        if not prices:
+            return 0, 0
+
+        # Include reference and entry prices in range calculation
+        all_prices = prices.copy()
+        if reference_price:
+            all_prices.append(reference_price)
+        if entry_price:
+            all_prices.append(entry_price)
+
+        # Calculate statistics for outlier detection
+        mean_price = sum(all_prices) / len(all_prices)
+        std_dev = (sum((x - mean_price) ** 2 for x in all_prices) / len(all_prices)) ** 0.5
+        
+        # Filter outliers
+        filtered_prices = [p for p in all_prices if 
+                         abs(p - mean_price) <= self.y_axis_params['outlier_threshold'] * std_dev]
+        
+        if not filtered_prices:
+            filtered_prices = all_prices  # Use all prices if filtering removed everything
+
+        min_price = min(filtered_prices)
+        max_price = max(filtered_prices)
+        price_range = max_price - min_price
+
+        # Ensure minimum range
+        if price_range < self.y_axis_params['min_price_range']:
+            mid_price = (min_price + max_price) / 2
+            min_price = mid_price - self.y_axis_params['min_price_range'] / 2
+            max_price = mid_price + self.y_axis_params['min_price_range'] / 2
+
+        # Add padding
+        padding = price_range * self.y_axis_params['price_padding']
+        return min_price - padding, max_price + padding
+
+    def prepare_candle_data(self, candles: List[Dict]) -> pd.DataFrame:
+        """Convert candle data to pandas DataFrame with proper timestamp handling"""
+        data = []
+        for candle in candles:
+            # Handle Unix timestamp in milliseconds
+            if isinstance(candle['timestamp'], (int, float)):
+                timestamp = datetime.fromtimestamp(int(candle['timestamp']) / 1000)
+            else:
+                # Try parsing string timestamp
+                timestamp = datetime.strptime(candle['timestamp'], "%Y-%m-%d")
+
+            data.append({
+                'Date': timestamp,
+                'Open': float(candle['open']),
+                'High': float(candle['high']),
+                'Low': float(candle['low']),
+                'Close': float(candle['close']),
+                'Volume': float(candle.get('volume', 0))
+            })
+
+        df = pd.DataFrame(data)
+        df.set_index('Date', inplace=True)
+        return df
+
     async def generate_trade_chart(self, candles: List[Dict], order: Order, 
-                                 ref_price: Optional[Decimal] = None) -> Optional[bytes]:
-        """Generate clean chart with thicker candles and proper date formatting"""
+                                 reference_price: Optional[Decimal] = None) -> Optional[bytes]:
+        """Generate a candlestick chart"""
         try:
-            # Validate input data
-            if not self.validate_candle_data(candles):
-                logger.error("Invalid candle data")
+            logger.info(f"Generating chart for {order.symbol} ({order.timeframe.value})")
+            logger.info(f"Order type: {order.order_type.value}")
+            
+            # Validate data
+            is_valid, message = self.validate_candles(candles, order.timeframe)
+            if not is_valid:
+                logger.warning(f"Chart validation failed: {message}")
+                return self._generate_error_chart(message)
+
+            if not candles or len(candles) < 15:  # Require minimum 15 candles
+                logger.error("Not enough candles for chart generation")
                 return None
 
-            # Limit to last 8 candles for cleaner look
-            candles = candles[-8:]
-
-            # Create figure with black background
-            fig, ax = plt.subplots(figsize=(12, 6), facecolor='black')
-            ax.set_facecolor('black')
-
-            # Calculate candle width based on data
-            times = [datetime.fromtimestamp(c['timestamp'] / 1000) for c in candles]
-            if len(times) > 1:
-                time_diff = (times[-1] - times[0]).total_seconds()
-                width = (time_diff / len(candles)) * 0.6  # 60% of average time delta
-            else:
-                width = 43200  # 12 hours in seconds
-
-            # Plot candlesticks with thicker style
-            for candle in candles:
-                t = datetime.fromtimestamp(candle['timestamp'] / 1000)
-                o = float(candle['open'])
-                h = float(candle['high'])
-                l = float(candle['low'])
-                c = float(candle['close'])
-
-                color = self.colors['up'] if c >= o else self.colors['down']
-                
-                # Plot thicker wicks with shadow effect
-                ax.vlines(t, l, h, color=color, linewidth=2, zorder=1)
-                
-                # Plot thicker body with 3D effect
-                body_height = c - o if c >= o else o - c
-                body_bottom = min(o, c)
-                ax.bar(t, body_height, bottom=body_bottom, 
-                      width=width/86400, color=color,  # Divide by seconds in day
-                      alpha=1.0, zorder=2)
-
-            # Add entry price line
-            entry_price = float(order.price)
-            ax.axhline(y=entry_price, color=self.colors['entry'], 
-                      linestyle='--', linewidth=1.5,
-                      label=f'Entry ${entry_price:,.2f}')
-
-            # Add liquidation price for futures
-            if order.order_type == OrderType.FUTURES:
-                liq_price = self.calculate_liquidation_price(order)
-                if liq_price:
-                    liq_color = (self.colors['liq_long'] if order.direction == TradeDirection.LONG 
-                               else self.colors['liq_short'])
-                    ax.axhline(y=liq_price, color=liq_color, 
-                             linestyle=':', linewidth=1.5,
-                             label=f'Liq ${liq_price:,.2f}')
-
-            # Format axes
-            ax.grid(True, alpha=0.1, linestyle='--')
-            ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, p: f'${x:,.2f}'))
+            df = self.prepare_candle_data(candles)
             
-            # Set date format based on timeframe
-            date_format = self.timeframe_formats.get(order.timeframe, '%Y-%m-%d %H:%M')
-            ax.xaxis.set_major_formatter(mdates.DateFormatter(date_format))
-            plt.xticks(rotation=45)
+            # Validate reference price
+            ref_value = float(reference_price) if reference_price else None
+            opening_price = float(df.iloc[0]['open'])
 
-            # Add footer with timeframe info
-            footer_text = (
-                f"{order.symbol} • {order.timeframe.value.title()} Chart • "
-                f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC"
+            # Create plots
+            addplots = []
+
+            # Add entry point marker
+            entry_time = order.filled_at or order.created_at
+            if entry_time:
+                entry_series = pd.Series(index=df.index, dtype=float)
+                entry_series.loc[:] = float('nan')
+                closest_time = min(df.index, key=lambda x: abs(x - entry_time))
+                entry_series.loc[closest_time] = float(order.price)
+                addplots.append(mpf.make_addplot(
+                    entry_series,
+                    type='scatter',
+                    marker='^',
+                    markersize=100,
+                    color='lime'
+                ))
+
+            # Add reference price line
+            if ref_value and not pd.isna(ref_value):
+                ref_series = pd.Series([ref_value] * len(df), index=df.index)
+                addplots.append(mpf.make_addplot(
+                    ref_series,
+                    type='line',
+                    color='blue',
+                    linestyle='--',
+                    width=1
+                ))
+
+            # Create plot
+            buf = io.BytesIO()
+            entry_change = ((float(order.price) - opening_price) / opening_price) * 100
+            current_change = ((float(df.iloc[-1]['close']) - opening_price) / opening_price) * 100
+
+            title = (
+                f"{order.symbol} Trade Analysis ({order.timeframe.value})\n"
+                f"Open: ${opening_price:.2f} | Entry: ${float(order.price):.2f} ({entry_change:+.2f}%)\n"
+                f"Current: ${float(df.iloc[-1]['close']):.2f} ({current_change:+.2f}%)"
             )
-            plt.figtext(0.99, 0.01, footer_text, 
-                       ha='right', va='bottom', 
-                       color='gray', alpha=0.7, 
-                       fontsize=8)
 
-            # Add title
-            title = f"{order.symbol}"
-            if order.order_type == OrderType.FUTURES:
-                title += f" {order.direction.value.upper()} {order.leverage}x"
-            plt.title(title, pad=10)
+            mpf.plot(
+                df,
+                type='candle',
+                style=self.style,
+                title=title,
+                ylabel='Price (USDT)',
+                ylabel_lower='Volume',
+                volume=True,
+                figsize=(12, 8),
+                addplot=addplots,
+                savefig=dict(fname=buf, dpi=150, bbox_inches='tight')
+            )
 
-            # Add legend with better positioning
-            ax.legend(loc='upper left', bbox_to_anchor=(0.02, 0.98))
-
-            # Adjust layout
-            plt.tight_layout()
-
-            # Save with high quality
-            buffer = io.BytesIO()
-            plt.savefig(buffer, format='png', dpi=150, bbox_inches='tight')
-            buffer.seek(0)
-            plt.close()
-
-            return buffer.getvalue()
+            buf.seek(0)
+            return buf.getvalue()
 
         except Exception as e:
-            logger.error(f"Error generating chart: {e}", exc_info=True)
-            plt.close()
+            logger.error(f"Error generating chart: {e}")
             return None
+
+    def _generate_error_chart(self, message: str) -> Optional[bytes]:
+        """Generate an error message chart"""
+        try:
+            fig, ax = plt.subplots(figsize=(12, 6))
+            ax.text(0.5, 0.5, message, 
+                   ha='center', va='center',
+                   wrap=True,
+                   color='red')
+            ax.set_axis_off()
+            
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', bbox_inches='tight', dpi=100)
+            plt.close(fig)
+            buf.seek(0)
+            return buf.getvalue()
+        except Exception as e:
+            logger.error(f"Failed to generate error chart: {e}")
+            return None
+
+    def format_chart_axes(self, ax1, ax2, timeframe: TimeFrame, times):
+        """Format chart axes with proper time formatting and grid"""
+        # Format price axis
+        ax1.grid(True, alpha=0.2)
+        ax2.grid(True, alpha=0.2)
+        ax1.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, p: f'${x:,.2f}'))
+        
+        # Format dates based on timeframe
+        date_format = self.timeframe_formats.get(timeframe, '%Y-%m-%d %H:%M')
+        ax1.xaxis.set_major_formatter(mdates.DateFormatter(date_format))
+        ax2.xaxis.set_major_formatter(mdates.DateFormatter(date_format))
+        
+        # Auto-rotate and align the tick labels for better readability
+        plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45, ha='right')
+        plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45, ha='right')
+
+        # Set proper time axis limits
+        if len(times) > 1:
+            margin = 0.05  # 5% margin on each side
+            time_range = (times[-1] - times[0]).total_seconds()
+            margin_seconds = time_range * margin
+            ax1.set_xlim(
+                times[0] - timedelta(seconds=margin_seconds),
+                times[-1] + timedelta(seconds=margin_seconds)
+            )
+            ax2.set_xlim(
+                times[0] - timedelta(seconds=margin_seconds),
+                times[-1] + timedelta(seconds=margin_seconds)
+            )
+
+    def add_chart_footer(self, fig, order: Order):
+        """Add footer with trade information"""
+        footer_text = (
+            f"{order.symbol} • {order.timeframe.value.title()} • "
+            f"{order.order_type.value.upper()} • "
+            f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC"
+        )
+        if order.order_type == OrderType.FUTURES:
+            footer_text = f"{footer_text} • {order.leverage}x • {order.direction.value.upper()}"
+
+        plt.figtext(0.99, 0.01, footer_text,
+                   ha='right', va='bottom',
+                   color='gray', alpha=0.7,
+                   fontsize=8)
 
     def format_info_text(self, order: Order, reference_price: Optional[Decimal] = None) -> str:
         """Format trade information text"""

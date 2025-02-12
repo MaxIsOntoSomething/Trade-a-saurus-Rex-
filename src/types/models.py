@@ -15,12 +15,12 @@ class OrderStatus(Enum):
     CANCELLED = "cancelled"
 
 class OrderType(Enum):
-    SPOT = "spot"
-    FUTURES = "futures"
+    SPOT = 'spot'
+    FUTURES = 'futures'
 
 class TradeDirection(Enum):
-    LONG = "long"
-    SHORT = "short"
+    LONG = 'long'
+    SHORT = 'short'
 
 class MarginType(Enum):
     ISOLATED = 'ISOLATED'
@@ -50,6 +50,12 @@ class Order:
     balance_change: Optional[Decimal] = None
     realized_pnl: Optional[Decimal] = None
     unrealized_pnl: Optional[Decimal] = None
+    # Add TP/SL fields
+    tp_order_id: Optional[str] = None
+    sl_order_id: Optional[str] = None
+    tp_price: Optional[float] = None
+    sl_price: Optional[float] = None
+    position_side: Optional[str] = None  # Add position side field
 
     def __post_init__(self):
         # Convert numeric strings to Decimal
