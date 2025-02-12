@@ -202,6 +202,10 @@ MIT License
 - ⚙️ **ADD Coins and delete them through Telegram**
 - ⚙️ **Adjust Margin and Leverage through Telegram**
 - ⚙️ **Chart Generation, Equity Curve, and Buys Marked**  
+- ⚙️ **Adjust Amount per Order through Telegram**
+- ⚙️ **Use % Of Balance for Orders**
+- ⚙️ **New Telegram Menu adjusted**
+
 
 ### ✅ Finished  
 - ✅ **Telegram - Open Orders Command**  
@@ -220,6 +224,8 @@ MIT License
 - 📌 **Backtest Option to Test Performance**  
 - 📌 **Report with real Balance 5k+**  
 - 📌 **More Detailed Explanation of Config Readme**  
+- 📌 **Adjust Amount per Order through Telegram**
+- 📌 **Use % Of Balance for Orders**
 
 ### ⚠️ Known Issues  
 - 🛑 **Telegram not working with Chart Generation**  
