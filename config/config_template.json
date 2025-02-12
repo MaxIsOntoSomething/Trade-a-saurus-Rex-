@@ -40,7 +40,11 @@
             "default_leverage": 5,
             "margin_type": "ISOLATED",
             "position_mode": "ONE_WAY",
-            "allowed_pairs": ["BTCUSDT", "ETHUSDT"]
+            "allowed_pairs": ["BTCUSDT", "ETHUSDT"],
+            "tp_enabled": true,
+            "sl_enabled": true,
+            "default_tp_percent": 50,
+            "default_sl_percent": 10
         }
     }
 }
