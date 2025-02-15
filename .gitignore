@@ -1,10 +1,10 @@
 /config/config.json
 /logs/*
 .env
-src/telegram/pycache/*
-src/database/pycache/*
-src/trading/pycache/*
-src/types/pycache/*
-src/utils/pycache/*
-**/__pycache__/ 
 .github/copilot-instructions.md
+**/__pycache__/
+src/database/__pycache__/
+src/telegram/__pycache__/
+src/trading/__pycache__/
+src/types/__pycache__/
+src/utils/__pycache__/

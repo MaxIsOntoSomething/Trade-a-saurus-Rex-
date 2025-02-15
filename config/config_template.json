@@ -27,7 +27,9 @@
     },
     "trading": {
         "base_currency": "USDT",
-        "order_amount": 100,
+        "amount_type": "fixed",          // "fixed" or "percentage"
+        "fixed_amount": 100,            // Amount in USDT if type is "fixed"
+        "percentage_amount": 10,         // Percentage of balance if type is "percentage"
         "cancel_after_hours": 8,
         "pairs": ["BTCUSDT", "ETHUSDT"],
         "thresholds": {
@@ -40,7 +42,6 @@
             "default_leverage": 5,
             "margin_type": "ISOLATED",
             "position_mode": "ONE_WAY",
-            "allowed_pairs": ["BTCUSDT", "ETHUSDT"],
             "tp_enabled": true,
             "sl_enabled": true,
             "default_tp_percent": 50,
