@@ -766,6 +766,12 @@ class FuturesClient:
                 'symbol': symbol,
                 'price': ticker['markPrice']
             }
+        except BinanceAPIException as e:
+            if e.code == -1121:  # Invalid symbol
+                logger.error(f"Invalid symbol: {symbol}")
+            else:
+                logger.error(f"Failed to get futures ticker: {e}")
+            raise
         except Exception as e:
             logger.error(f"Failed to get futures ticker: {e}")
             raise
@@ -833,7 +839,7 @@ class FuturesClient:
 
                 # Use ticker_price instead of futures_symbol_ticker
                 ticker = self.client.ticker_price(symbol=symbol)
-                current_price = float(ticker['price'])
+                current_price = float(ticker.get('price', 0))
 
                 logger.info(f"\n=== Checking {symbol} ===")
                 logger.info(f"Current futures price for {symbol}: ${current_price:,.2f}")

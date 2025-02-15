@@ -146,6 +146,15 @@ class OrderManager:
                     ticker = await self.binance_client.get_symbol_ticker(symbol=symbol)
                     return float(ticker['price'])
                 raise
+        except BinanceAPIException as e:
+            if e.code == -1121:  # Invalid symbol
+                logger.error(f"Invalid symbol: {symbol}")
+            else:
+                logger.error(f"Failed to get price for {symbol}: {e}")
+            raise
+        except KeyError:
+            logger.error(f"Price key missing in ticker response for {symbol}")
+            raise
         except Exception as e:
             logger.error(f"Failed to get price for {symbol}: {e}")
             raise
@@ -167,7 +176,7 @@ class OrderManager:
             client = self.futures_client if is_futures else self.binance_client
             # Use client's get_symbol_ticker method which handles the differences
             ticker = await client.get_symbol_ticker(symbol=symbol)
-            current_price = float(ticker['price'])
+            current_price = float(ticker.get('price', 0))
             logger.info(f"Current {symbol} price: ${current_price:,.2f}")
 
             # Update reference prices using correct client
