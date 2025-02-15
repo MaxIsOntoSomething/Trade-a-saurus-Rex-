@@ -121,6 +121,9 @@ def setup_logging() -> ConfigLogger:
     root_logger.addHandler(balance_handler)
     root_logger.addHandler(config_handler)
 
+    # Exclude matplotlib font manager debug messages
+    logging.getLogger('matplotlib.font_manager').setLevel(logging.WARNING)
+
     # Create balance logger
     balance_logger = logging.getLogger('balance')
     balance_logger.setLevel(logging.INFO)
