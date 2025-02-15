@@ -1,7 +1,7 @@
 {
     "environment": {
         "testnet": true,
-        "trading_mode": "spot"  
+        "trading_mode": "futures"
     },
     "binance": {
         "mainnet": {
@@ -19,7 +19,7 @@
     },
     "telegram": {
         "bot_token": "your_bot_token",
-        "allowed_users": ["your_user_id"]
+        "allowed_users": [1234567890]
     },
     "mongodb": {
         "uri": "mongodb://localhost:27017",
@@ -27,21 +27,28 @@
     },
     "trading": {
         "base_currency": "USDT",
-        "amount_type": "fixed",          // "fixed" or "percentage"
-        "fixed_amount": 100,            // Amount in USDT if type is "fixed"
-        "percentage_amount": 10,         // Percentage of balance if type is "percentage"
+        "amount_type": "fixed",
+        "fixed_amount": 200,
+        "percentage_amount": 10,
         "cancel_after_hours": 8,
         "pairs": ["BTCUSDT", "ETHUSDT"],
         "thresholds": {
             "daily": [1, 2, 5],
             "weekly": [5, 10, 15],
-            "monthly": [13, 18, 25]
+            "monthly": [10, 20, 30]
         },
         "reserve_balance": 500,
+        "spot_settings": {
+            "tp_enabled": true,
+            "sl_enabled": true,
+            "default_tp_percent": 5,
+            "default_sl_percent": 2
+        },
         "futures_settings": {
-            "default_leverage": 5,
-            "margin_type": "ISOLATED",
-            "position_mode": "ONE_WAY",
+            "enabled": true,
+            "default_leverage": 2,
+            "margin_type": "CROSSED",
+            "position_mode": "HEDGE",
             "tp_enabled": true,
             "sl_enabled": true,
             "default_tp_percent": 50,

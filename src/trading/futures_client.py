@@ -47,19 +47,26 @@ class FuturesClient:
         self.timeframe_reset = {}  # Add this line
         self.chart_generator = ChartGenerator()  # Initialize chart generator
         
+        # Store full config for use in trading operations
+        if 'trading' not in network_config and 'config' in network_config:
+            self.config = network_config['config']  # Use nested config if available
+        else:
+            self.config = network_config  # Use direct config
+        
         # Properly read reserve balance from config
         self._reserve_balance = None  # Initialize private attribute first
         
         # Read reserve balance in priority order
+        reserve_balance = None
         if 'reserve_balance' in network_config:
-            self.reserve_balance = float(network_config['reserve_balance'])
-        elif 'trading' in network_config and 'reserve_balance' in network_config['trading']:
-            self.reserve_balance = float(network_config['trading']['reserve_balance'])
+            reserve_balance = float(network_config['reserve_balance'])
+        elif 'trading' in self.config and 'reserve_balance' in self.config['trading']:
+            reserve_balance = float(self.config['trading']['reserve_balance'])
         elif 'env' in network_config and network_config['env'].get('TRADING_RESERVE_BALANCE'):
-            self.reserve_balance = float(network_config['env']['TRADING_RESERVE_BALANCE'])
-        else:
-            self.reserve_balance = 500  # Default to 500 instead of 0
-            logger.info("[INIT] No reserve balance configured, using default: $500.00")
+            reserve_balance = float(network_config['env']['TRADING_RESERVE_BALANCE'])
+            
+        self.reserve_balance = reserve_balance or 500  # Default to 500 if None
+        logger.info(f"[INIT] Reserve balance set to: ${self.reserve_balance:,.2f}")
 
         logger.info(f"[INIT] Reserve balance set to: ${self.reserve_balance:,.2f}")
         
@@ -68,114 +75,165 @@ class FuturesClient:
         self.last_reset = {tf: datetime.utcnow() for tf in TimeFrame}
         self.intervals = FUTURES_INTERVALS
 
-        # Add timestamp offset tracking
+        # Initialize time sync variables first
         self.time_offset = 0
-        self.last_timestamp = 0
-        self.recv_window = 60000  # Increased from 5000 to 60000
-        self.sync_interval = 30   # Decreased from 60 to 30 for more frequent syncs
-        self.max_retries = 5
-        self.retry_delay = 1
-        self.max_delay = 30  # Maximum delay between retries
+        self.last_sync = None
+        self.sync_interval = timedelta(hours=1)  # Resync every hour
+        self.recv_window = 60000
+        self.last_timestamp = time.time() * 1000
 
         self.tp_enabled = network_config.get('tp_enabled', False)
         self.sl_enabled = network_config.get('sl_enabled', False)
         self.default_tp_percent = float(network_config.get('default_tp_percent', 50))
         self.default_sl_percent = float(network_config.get('default_sl_percent', 10))
 
+        # Ensure config is properly stored
+        if 'config' in network_config:
+            self.config = network_config['config']
+        elif 'trading' in network_config:
+            self.config = network_config
+        else:
+            self.config = {
+                'trading': {
+                    'amount_type': 'fixed',
+                    'fixed_amount': 100,
+                    'reserve_balance': 500
+                }
+            }
+            logger.warning("Using default configuration")
+
+        # Initialize API request parameters
+        self.max_retries = 5
+        self.retry_delay = 1
+        self.max_delay = 30
+        self.sync_interval = 30
+        self.last_timestamp = time.time() * 1000
+        self.time_offset = 0
+        self.last_sync = 0
+        self.recv_window = 60000
+
+        # Initialize configs
+        if isinstance(network_config.get('config'), dict):
+            self.config = network_config['config']
+        elif isinstance(network_config.get('trading'), dict):
+            self.config = network_config
+        else:
+            self.config = {
+                'trading': {
+                    'amount_type': 'fixed',
+                    'fixed_amount': 100,
+                    'reserve_balance': 500
+                }
+            }
+            logger.warning("[INIT] Using default configuration")
+            
+        # Log config status
+        logger.info(f"[INIT] Active config type: {'nested' if 'config' in network_config else 'direct'}")
+        logger.info(f"[INIT] Trading settings found: {bool(self.config.get('trading'))}")
+
     def set_telegram_bot(self, bot):
         """Set telegram bot for notifications"""
         self.telegram_bot = bot
 
     def _get_timestamp(self) -> int:
-        """Get current timestamp with server offset"""
-        return int(time.time() * 1000 + self.time_offset)
+        """Get current timestamp with improved precision"""
+        now = datetime.utcnow().timestamp()
+        return int((now + self.time_offset) * 1000)
 
     async def _sync_time(self, force: bool = False) -> bool:
-        """Synchronize time with Binance server with improved retries"""
-        now = time.time()
-        
-        # Sync more frequently and always sync if last sync was more than 30 seconds ago
-        if not force and (now - self.last_sync) < 30:
+        """Synchronize client time with server time"""
+        try:
+            # Check if sync is needed
+            if not force and self.last_sync:
+                if datetime.utcnow() - self.last_sync < timedelta(minutes=30):
+                    return True
+
+            # UMFutures time() method returns server time
+            server_time = await asyncio.get_event_loop().run_in_executor(
+                None, self.client.time
+            )
+            
+            if not isinstance(server_time, dict) or 'serverTime' not in server_time:
+                logger.error(f"Invalid server time response: {server_time}")
+                return False
+
+            server_ts = server_time['serverTime'] / 1000
+            local_ts = datetime.utcnow().timestamp()
+            
+            # Calculate offset
+            self.time_offset = server_ts - local_ts
+            self.last_sync = datetime.utcnow()
+            
+            logger.info(f"Time synchronized. Offset: {self.time_offset:.3f}s")
             return True
-            
-        retry_delay = self.retry_delay
-        for attempt in range(self.max_retries):
-            try:
-                server_time = await asyncio.get_event_loop().run_in_executor(
-                    None, 
-                    lambda: self.client.time()['serverTime']
-                )
-                
-                self.time_offset = server_time - int(now * 1000)
-                self.last_sync = now
-                logger.info(f"Time sync successful - Offset: {self.time_offset}ms")
-                return True
-                
-            except Exception as e:
-                logger.warning(f"Time sync attempt {attempt + 1} failed: {e}")
-            
-            await asyncio.sleep(retry_delay)
-            retry_delay = min(retry_delay * 2, self.max_delay)
-            
-        logger.error("Failed to synchronize time after max retries")
-        return False
+
+        except Exception as e:
+            logger.error(f"Failed to sync time: {e}", exc_info=True)
+            return False
 
     async def _make_request(self, method: str, **kwargs) -> Any:
-        """Make API request with improved error handling"""
-        retry_delay = self.retry_delay
-        
-        for attempt in range(self.max_retries):
-            try:
-                # Only sync time before critical operations that need timestamp
-                if method not in ['exchange_info', 'ping', 'time']:  # Add exceptions for methods that don't need timestamp
-                    if not await self._sync_time():
-                        raise Exception("Time synchronization failed")
-                    # Add timestamp and increased recvWindow only for methods that need it
-                    kwargs.update({
-                        'timestamp': self._get_timestamp(),
-                        'recvWindow': self.recv_window
-                    })
-                
-                # Convert synchronous client methods to async
-                client_method = getattr(self.client, method)
-                response = await asyncio.get_event_loop().run_in_executor(
-                    None, 
-                    lambda: client_method(**kwargs)
-                )
-                return response
-                
-            except BinanceAPIException as e:
-                if e.code == -1021:  # Timestamp error
-                    # Force time sync on timestamp error
-                    await self._sync_time(force=True)
-                    continue
-                raise
-                
-            except (asyncio.TimeoutError, Exception) as e:
-                logger.error(f"Request failed (attempt {attempt + 1}): {e}")
-                if attempt == self.max_retries - 1:
+        """Make API request with time sync and retry logic"""
+        try:
+            # Check time sync before request
+            if not self.last_sync or datetime.utcnow() - self.last_sync > timedelta(minutes=30):
+                if not await self._sync_time():
+                    raise Exception("Failed to sync time")
+
+            # Add timestamp and recvWindow to request
+            kwargs['timestamp'] = self._get_timestamp()
+            kwargs['recvWindow'] = self.recv_window
+
+            # Get the method from the client
+            method_func = getattr(self.client, method)
+            
+            # Make request with retries
+            retries = 0
+            delay = self.retry_delay
+            
+            while retries < self.max_retries:
+                try:
+                    # Execute the method
+                    if asyncio.iscoroutinefunction(method_func):
+                        result = await method_func(**kwargs)
+                    else:
+                        result = await asyncio.get_event_loop().run_in_executor(
+                            None, lambda: method_func(**kwargs)
+                        )
+                    return result
+
+                except BinanceAPIException as e:
+                    if e.code == -1021:  # Timestamp outside recvWindow
+                        if retries < self.max_retries - 1:
+                            await self._sync_time(force=True)
+                            retries += 1
+                            await asyncio.sleep(delay)
+                            delay = min(delay * 2, self.max_delay)
+                            continue
                     raise
-                    
-                # Add jitter to retry delay
-                jittered_delay = retry_delay * (1 + random.random())
-                await asyncio.sleep(jittered_delay)
-                retry_delay = min(retry_delay * 2, self.max_delay)
+                except Exception:
+                    raise
+
+        except Exception as e:
+            logger.error(f"Request failed for {method}: {e}", exc_info=True)
+            raise
 
     async def initialize(self):
-        """Initialize futures client with improved error handling"""
+        """Initialize client with improved error handling"""
         try:
+            # Set proper base URLs for testnet/mainnet
+            base_url = "https://testnet.binancefuture.com" if self.testnet else "https://fapi.binance.com"
+            
             self.client = UMFutures(
                 key=self.api_key,
                 secret=self.api_secret,
-                base_url="https://testnet.binancefuture.com" if self.testnet else "https://fapi.binance.com"
+                base_url=base_url
             )
-
-            # Initial time sync with retries
+            
+            # Initial time synchronization
             if not await self._sync_time(force=True):
-                logger.error("Failed to synchronize time during initialization")
-                return False
-                
-            # Get exchange info with retries - wrap sync call in async
+                raise ConnectionError("Failed to synchronize time with server")
+
+            # Get exchange info
             try:
                 exchange_info = await asyncio.get_event_loop().run_in_executor(
                     None, self.client.exchange_info
@@ -189,12 +247,9 @@ class FuturesClient:
                         'filters': {f['filterType']: f for f in symbol['filters']}
                     }
                 
-                # Set reserve balance from constructor
-                logger.info(f"[INIT] Reserve balance set to: ${self.reserve_balance:,.2f}")
-                
                 logger.info(
-                    f"Initialized Futures {'Testnet' if self.testnet else 'Mainnet'}\n"
-                    f"Position Mode: {self.position_mode}"
+                    f"Initialized Futures {'Testnet' if self.testnet else 'Mainnet'} "
+                    f"with {len(self.symbol_info)} symbols"
                 )
                 return True
                 
@@ -309,54 +364,40 @@ class FuturesClient:
     async def check_reserve_balance(self, order_amount: float) -> bool:
         """Check if placing a futures order would violate reserve balance"""
         try:
-            logger.info("[RESERVE CHECK] Starting futures reserve balance check...")
+            # Get current balance in base currency (USDT)
+            current_balance = await self.get_balance('USDT')
+            logger.info(f"[RESERVE CHECK] Current balance: ${float(current_balance):,.2f}")
+            logger.info(f"[RESERVE CHECK] Reserve balance: ${float(self.reserve_balance):,.2f}")
+            logger.info(f"[RESERVE CHECK] Order amount: ${float(order_amount):,.2f}")
             
-            # Get current futures account info
-            account = await self._make_request('account')
+            # Calculate actual order amount if percentage is used
+            amount_type = self.config.get('trading', {}).get('amount_type')
+            used_amount = order_amount
+            if amount_type == 'percentage':
+                used_amount = float(current_balance) * (
+                    float(self.config['trading'].get('percentage_amount', 10)) / 100
+                )
+                logger.info(f"[RESERVE CHECK] Using percentage amount: ${used_amount:,.2f}")
             
-            # Get current available balance (this is the real usable margin)
-            available_balance = Decimal(str(account['availableBalance']))
-            total_margin = Decimal(str(account.get('totalMarginBalance', '0')))
-            unrealized_pnl = Decimal(str(account.get('totalUnrealizedProfit', '0')))
-            
-            # Validate reserve balance is set
-            if self.reserve_balance <= 0:
-                logger.warning("[RESERVE CHECK] Reserve balance is not set or invalid, using 0")
-                self.reserve_balance = 0
-            
-            # Log all balance components
-            logger.info(f"[RESERVE CHECK] Available Balance: ${float(available_balance):,.2f}")
-            logger.info(f"[RESERVE CHECK] Total Margin Balance: ${float(total_margin):,.2f}")
-            logger.info(f"[RESERVE CHECK] Unrealized P/L: ${float(unrealized_pnl):,.2f}")
-            logger.info(f"[RESERVE CHECK] Reserve Required: ${float(self.reserve_balance):,.2f}")
-            
-            # Calculate margin required for new position with leverage consideration
+            # Calculate remaining balance after order considering leverage
             leverage = self.default_leverage
-            margin_required = Decimal(str(order_amount)) / Decimal(str(leverage))
-            
-            # Calculate remaining balance after new position
-            remaining_after_order = float(available_balance - margin_required)
-            
-            logger.info(f"[RESERVE CHECK] New Position Margin Required: ${float(margin_required):,.2f}")
-            logger.info(f"[RESERVE CHECK] Remaining After Order: ${remaining_after_order:,.2f}")
+            margin_required = used_amount / leverage  # Adjust amount by leverage
+            remaining_after_order = float(current_balance) - margin_required
+
+            logger.info(f"[RESERVE CHECK] Margin required: ${margin_required:,.2f}")
+            logger.info(f"[RESERVE CHECK] Remaining after order: ${remaining_after_order:,.2f}")
 
             # Check if remaining balance would be above reserve
             is_valid = remaining_after_order >= self.reserve_balance
-            
+
             if not is_valid:
                 logger.warning(
                     f"[RESERVE CHECK] Order would violate reserve balance:\n"
-                    f"Required Balance: ${self.reserve_balance:,.2f}\n"
-                    f"Remaining Balance: ${remaining_after_order:,.2f}"
+                    f"Current Balance: ${float(current_balance):,.2f}\n"
+                    f"Required Margin: ${margin_required:,.2f}\n"
+                    f"Remaining Balance: ${remaining_after_order:,.2f}\n"
+                    f"Required Reserve: ${self.reserve_balance:,.2f}"
                 )
-                
-                # Send alert through telegram if available
-                if self.telegram_bot:
-                    await self.telegram_bot.send_reserve_alert(
-                        current_balance=available_balance,
-                        reserve_balance=self.reserve_balance,
-                        pending_value=margin_required
-                    )
 
             return is_valid
 
@@ -685,14 +726,20 @@ class FuturesClient:
             return {}
 
     async def get_balance_changes(self, symbol: str = 'USDT') -> Optional[Decimal]:
-        """Get balance changes since last check"""
+        """Get balance changes since last check with proper time sync"""
         # Maintain a cache of previous balances
         if not hasattr(self, 'balance_cache'):
             self.balance_cache = {}
 
         try:
-            # Get current wallet balance from futures account
-            account = self.client.account()
+            # Ensure time is synced before request
+            await self._sync_time()
+
+            # Get current wallet balance from futures account with timestamp
+            account = self.client.account(
+                timestamp=self._get_timestamp(),
+                recvWindow=self.recv_window
+            )
             current_balance = Decimal(account['availableBalance'])
 
             # Get previous balance from cache
@@ -726,13 +773,27 @@ class FuturesClient:
     async def get_account_info(self) -> Dict:
         """Get futures account information with proper error handling"""
         try:
-            account = self.client.account()
-            # Add proper field checks and defaults
-            return {
+            # Ensure time sync before request
+            await self._sync_time(force=True)
+            
+            # Make request with proper timestamp
+            account = await self._make_request(
+                'account', 
+                timestamp=self._get_timestamp(),
+                recvWindow=self.recv_window
+            )
+
+            # Extract and convert values safely
+            response = {
                 'totalWalletBalance': float(account.get('totalWalletBalance', 0)),
                 'totalUnrealizedProfit': float(account.get('totalUnrealizedProfit', 0)),
                 'availableBalance': float(account.get('availableBalance', 0)),
-                'positions': [
+                'positions': []
+            }
+
+            # Process positions if any exist
+            if 'positions' in account:
+                response['positions'] = [
                     {
                         'symbol': pos['symbol'],
                         'positionAmt': float(pos.get('positionAmt', 0)),
@@ -741,10 +802,13 @@ class FuturesClient:
                         'leverage': int(pos.get('leverage', 1)),
                         'marginType': pos.get('marginType', 'ISOLATED')
                     }
-                    for pos in account.get('positions', [])
+                    for pos in account['positions']
                     if abs(float(pos.get('positionAmt', 0))) > 0
                 ]
-            }
+
+            logger.info(f"[ACCOUNT] Retrieved futures account info successfully")
+            return response
+
         except Exception as e:
             logger.error(f"Failed to get account info: {e}")
             return {
@@ -976,10 +1040,23 @@ class FuturesClient:
             raise
 
     async def get_balance(self, symbol: str = 'USDT') -> Decimal:
-        """Get futures wallet balance"""
+        """Get futures wallet balance with proper time sync"""
         try:
-            account = self.client.account()  # Use account() instead of balance()
-            return Decimal(str(account['availableBalance']))
+            # Always sync time before balance check
+            if not await self._sync_time():
+                raise Exception("Failed to sync time")
+
+            # Get account info with proper timestamp
+            timestamp = self._get_timestamp()
+            account = self.client.account(
+                timestamp=timestamp,
+                recvWindow=self.recv_window
+            )
+            
+            balance = account.get('availableBalance', '0')
+            logger.info(f"[BALANCE] Futures balance: ${float(balance):,.2f}")
+            return Decimal(str(balance))
+            
         except Exception as e:
             logger.error(f"Failed to get futures balance: {e}")
             return Decimal('0')
@@ -1180,3 +1257,24 @@ class FuturesClient:
         except Exception as e:
             logger.error(f"Error closing all positions: {e}")
             return False
+
+    async def calculate_trade_amount(self) -> float:
+        """Calculate trade amount based on config settings"""
+        try:
+            if not self.config or 'trading' not in self.config:
+                logger.error("Trading configuration not found")
+                return 100.0  # Default fallback amount
+                
+            amount_type = self.config['trading'].get('amount_type', 'fixed')
+            
+            if amount_type == 'fixed':
+                return float(self.config['trading'].get('fixed_amount', 100))
+            else:
+                # Get current balance and calculate percentage
+                balance = await self.get_balance()
+                percentage = float(self.config['trading'].get('percentage_amount', 10))
+                return float(balance) * (percentage / 100)
+                
+        except Exception as e:
+            logger.error(f"Error calculating trade amount: {e}")
+            return 100.0  # Default fallback amount

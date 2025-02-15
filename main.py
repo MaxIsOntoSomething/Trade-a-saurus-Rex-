@@ -24,6 +24,7 @@ from src.telegram.bot import TelegramBot, DINO_ASCII
 from src.trading.order_manager import OrderManager
 from src.utils.logger import setup_logging
 from src.trading.futures_client import FuturesClient
+from src.utils.scheduler import WeeklySummaryScheduler
 
 # Setup logging first and get config logger
 config_logger = setup_logging()
@@ -104,11 +105,27 @@ def validate_config(config: dict) -> bool:
         },
         'telegram': ['bot_token', 'allowed_users'],
         'mongodb': ['uri', 'database'],
-        'trading': ['base_currency', 'order_amount', 'cancel_after_hours', 
-                   'pairs', 'thresholds', 'reserve_balance']
+        'trading': ['base_currency', 'cancel_after_hours', 
+                   'pairs', 'thresholds', 'reserve_balance']  # Removed order_amount from required fields
     }
-    
+
     try:
+        # Validate trading amount settings
+        trading = config.get('trading', {})
+        if not any(key in trading for key in ['order_amount', 'amount_type']):
+            raise ValueError("Either 'order_amount' or 'amount_type' must be specified in trading section")
+
+        # If amount_type is specified, validate its settings
+        if 'amount_type' in trading:
+            if trading['amount_type'] not in ['fixed', 'percentage']:
+                raise ValueError("amount_type must be 'fixed' or 'percentage'")
+            
+            if trading['amount_type'] == 'fixed' and 'fixed_amount' not in trading:
+                raise ValueError("fixed_amount must be specified when amount_type is 'fixed'")
+            
+            if trading['amount_type'] == 'percentage' and 'percentage_amount' not in trading:
+                raise ValueError("percentage_amount must be specified when amount_type is 'percentage'")
+
         # Validate environment settings
         if config['environment']['trading_mode'] not in ['spot', 'futures']:
             raise ValueError("trading_mode must be 'spot' or 'futures'")
@@ -139,8 +156,7 @@ def validate_config(config: dict) -> bool:
             required_futures_fields = [
                 'default_leverage',
                 'margin_type',
-                'position_mode',
-                'allowed_pairs'
+                'position_mode'
             ]
             
             for field in required_futures_fields:
@@ -158,12 +174,6 @@ def validate_config(config: dict) -> bool:
             # Validate position mode
             if futures_settings['position_mode'] not in ['ONE_WAY', 'HEDGE']:
                 raise ValueError("position_mode must be 'ONE_WAY' or 'HEDGE'")
-                
-            # Validate allowed pairs
-            if not isinstance(futures_settings['allowed_pairs'], list):
-                raise ValueError("allowed_pairs must be a list")
-            if not all(isinstance(pair, str) for pair in futures_settings['allowed_pairs']):
-                raise ValueError("all pairs in allowed_pairs must be strings")
 
         # Validate thresholds structure
         threshold_timeframes = ['daily', 'weekly', 'monthly']
@@ -254,19 +264,17 @@ def load_config_from_env() -> dict:
     
     # Add futures configuration if needed
     if config['environment']['trading_mode'] == 'futures':
-        config['trading']['futures'] = {
+        config['trading']['futures_settings'] = {
             'enabled': True,
             'default_leverage': int(os.getenv('FUTURES_DEFAULT_LEVERAGE', '5')),
             'default_margin_type': os.getenv('FUTURES_MARGIN_TYPE', 'ISOLATED'),
-            'allowed_pairs': os.getenv('FUTURES_ALLOWED_PAIRS', '').split(','),
-            'position_mode': os.getenv('FUTURES_POSITION_MODE', 'ONE_WAY')
-        }
-        config['trading']['futures'].update({
+            'position_mode': os.getenv('FUTURES_POSITION_MODE', 'ONE_WAY'),
+            'allowed_pairs': config['trading']['pairs'],  # Fetch from trading pairs
             'tp_enabled': os.getenv('FUTURES_TP_ENABLED', 'true').lower() == 'true',
             'sl_enabled': os.getenv('FUTURES_SL_ENABLED', 'true').lower() == 'true',
             'default_tp_percent': float(os.getenv('FUTURES_DEFAULT_TP_PERCENT', '50')),
             'default_sl_percent': float(os.getenv('FUTURES_DEFAULT_SL_PERCENT', '10'))
-        })
+        }
 
     return config
 
@@ -290,6 +298,10 @@ def load_and_merge_config() -> dict:
         if not validate_config(config):
             raise ValueError("Invalid configuration")
             
+        # Ensure allowed pairs are fetched from trading pairs
+        if config['environment']['trading_mode'] == 'futures':
+            config['trading']['futures_settings']['allowed_pairs'] = config['trading']['pairs']
+        
         # Log final configuration
         config_logger.log_config(
             f"Active Configuration:\n"
@@ -407,13 +419,17 @@ async def main():
                     config=config
                 )
 
+                # Initialize scheduler
+                scheduler = WeeklySummaryScheduler(telegram_bot, mongo_client)
+                
                 # Run components with automatic recovery
                 while True:
                     try:
                         # Start both services
                         tasks = [
                             asyncio.create_task(order_manager.start()),
-                            asyncio.create_task(telegram_bot.start())
+                            asyncio.create_task(telegram_bot.start()),
+                            asyncio.create_task(scheduler.run())  # Add scheduler task
                         ]
                         
                         # Monitor tasks

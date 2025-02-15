@@ -1,3 +1,6 @@
+import matplotlib
+# Force matplotlib to use Agg backend to avoid Tkinter thread issues
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import matplotlib.ticker as ticker
@@ -9,12 +12,13 @@ import pandas as pd  # Add missing pandas import
 from typing import List, Dict, Optional
 from ..types.models import Order, OrderType, TradeDirection, TimeFrame  # Added TimeFrame import
 import mplfinance as mpf
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
 class ChartGenerator:
     def __init__(self):
-        plt.style.use('dark_background')
+        # Remove plt.style.use('dark_background') as it can cause thread issues
         self.colors = {
             'up': '#26a69a',    # Green for up candles
             'down': '#ef5350',   # Red for down candles
@@ -81,22 +85,31 @@ class ChartGenerator:
             'outlier_threshold': 3.0  # Standard deviations for outlier detection
         }
 
+        # Modify style to use dark theme without Tkinter dependencies
         self.style = mpf.make_mpf_style(
-            base_mpf_style='yahoo',
+            base_mpf_style='charles',
             gridstyle='',
-            y_on_right=True,
+            y_on_right=False,
             marketcolors=mpf.make_marketcolors(
-                up='#26a69a',
-                down='#ef5350',
+                up='#26a69a',      # Green for bullish
+                down='#ef5350',    # Red for bearish
                 edge='inherit',
                 wick='inherit',
-                volume='in',
-                ohlc='inherit'
+                volume={
+                    'up': '#26a69a55',   # Transparent green
+                    'down': '#ef535055'   # Transparent red
+                }
             ),
             rc={
-                'axes.labelsize': 12,
-                'axes.titlesize': 14,
-                'font.size': 12
+                'font.size': 8,
+                'axes.titlesize': 10,
+                'axes.labelsize': 8,
+                'figure.facecolor': '#1e1e1e',  # Dark background
+                'axes.facecolor': '#1e1e1e',    # Dark background for axes
+                'axes.edgecolor': '#666666',    # Light gray edges
+                'axes.labelcolor': '#ffffff',   # White labels
+                'xtick.color': '#ffffff',       # White ticks
+                'ytick.color': '#ffffff'        # White ticks
             }
         )
 
@@ -214,17 +227,17 @@ class ChartGenerator:
         padding = price_range * self.y_axis_params['price_padding']
         return min_price - padding, max_price + padding
 
-    def prepare_candle_data(self, candles: List[Dict]) -> pd.DataFrame:
-        """Convert candle data to pandas DataFrame with proper timestamp handling"""
+    def prepare_candle_data(self, candles: List[Dict], timeframe: TimeFrame) -> pd.DataFrame:
+        """Convert candle data to pandas DataFrame with proper aggregation"""
         data = []
         for candle in candles:
-            # Handle Unix timestamp in milliseconds
-            if isinstance(candle['timestamp'], (int, float)):
-                timestamp = datetime.fromtimestamp(int(candle['timestamp']) / 1000)
-            else:
-                # Try parsing string timestamp
-                timestamp = datetime.strptime(candle['timestamp'], "%Y-%m-%d")
-
+            timestamp = datetime.fromtimestamp(int(candle['timestamp']) / 1000)
+            
+            # For monthly view, aggregate to monthly OHLC
+            if timeframe == TimeFrame.MONTHLY:
+                # Set timestamp to first day of month
+                timestamp = timestamp.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            
             data.append({
                 'Date': timestamp,
                 'Open': float(candle['open']),
@@ -236,99 +249,240 @@ class ChartGenerator:
 
         df = pd.DataFrame(data)
         df.set_index('Date', inplace=True)
-        return df
+
+        # Aggregate data for monthly view
+        if timeframe == TimeFrame.MONTHLY:
+            df = df.groupby(pd.Grouper(freq='M')).agg({
+                'Open': 'first',
+                'High': 'max',
+                'Low': 'min',
+                'Close': 'last',
+                'Volume': 'sum'
+            })
+        elif timeframe == TimeFrame.WEEKLY:
+            df = df.groupby(pd.Grouper(freq='W-MON')).agg({
+                'Open': 'first',
+                'High': 'max',
+                'Low': 'min',
+                'Close': 'last',
+                'Volume': 'sum'
+            })
+        elif timeframe == TimeFrame.DAILY:
+            df = df.groupby(pd.Grouper(freq='D')).agg({
+                'Open': 'first',
+                'High': 'max',
+                'Low': 'min',
+                'Close': 'last',
+                'Volume': 'sum'
+            })
+            
+        return df.dropna()
 
     async def generate_trade_chart(self, candles: List[Dict], order: Order, 
                                  reference_price: Optional[Decimal] = None) -> Optional[bytes]:
-        """Generate a candlestick chart"""
+        """Generate trade chart with proper timeframe handling"""
         try:
-            logger.info(f"Generating chart for {order.symbol} ({order.timeframe.value})")
-            logger.info(f"Order type: {order.order_type.value}")
+            if not candles:
+                logger.error("No candles provided for chart generation")
+                return self._generate_error_chart("No candle data available")
+
+            # Sort and process candles
+            candles.sort(key=lambda x: x['timestamp'])
+            df = self.prepare_candle_data(candles, order.timeframe)
+
+            # Adjust buffer based on timeframe
+            buffer_sizes = {
+                TimeFrame.MONTHLY: timedelta(days=5),
+                TimeFrame.WEEKLY: timedelta(days=1),
+                TimeFrame.DAILY: timedelta(hours=1)
+            }
+            buffer_time = buffer_sizes.get(order.timeframe, timedelta(hours=1))
+
+            # Check if order time is within range (with buffer)
+            if order.created_at < df.index[0] - buffer_time or order.created_at > df.index[-1] + buffer_time:
+                error_msg = (
+                    f"Order time ({order.created_at}) outside candle data range\n"
+                    f"Data range: {df.index[0]} to {df.index[-1]}"
+                )
+                logger.error(error_msg)
+                return self._generate_error_chart(error_msg)
+
+            # Calculate percentage changes accurately using Decimal
+            current_price = Decimal(str(df['Close'].iloc[-1]))  # Changed from 'close' to 'Close'
+            entry_price = Decimal(str(order.price))
             
-            # Validate data
-            is_valid, message = self.validate_candles(candles, order.timeframe)
-            if not is_valid:
-                logger.warning(f"Chart validation failed: {message}")
-                return self._generate_error_chart(message)
-
-            if not candles or len(candles) < 15:  # Require minimum 15 candles
-                logger.error("Not enough candles for chart generation")
-                return None
-
-            df = self.prepare_candle_data(candles)
+            logger.debug(f"Available columns: {df.columns.tolist()}")  # Add debug logging
             
-            # Validate reference price
-            ref_value = float(reference_price) if reference_price else None
-            opening_price = float(df.iloc[0]['open'])
+            if reference_price:
+                ref_change = ((current_price - reference_price) / reference_price) * 100
+            else:
+                ref_change = Decimal('0')
+                
+            entry_change = ((current_price - entry_price) / entry_price) * 100
 
-            # Create plots
-            addplots = []
-
-            # Add entry point marker
-            entry_time = order.filled_at or order.created_at
-            if entry_time:
-                entry_series = pd.Series(index=df.index, dtype=float)
-                entry_series.loc[:] = float('nan')
-                closest_time = min(df.index, key=lambda x: abs(x - entry_time))
-                entry_series.loc[closest_time] = float(order.price)
-                addplots.append(mpf.make_addplot(
-                    entry_series,
-                    type='scatter',
-                    marker='^',
-                    markersize=100,
-                    color='lime'
-                ))
-
-            # Add reference price line
-            if ref_value and not pd.isna(ref_value):
-                ref_series = pd.Series([ref_value] * len(df), index=df.index)
-                addplots.append(mpf.make_addplot(
-                    ref_series,
-                    type='line',
-                    color='blue',
-                    linestyle='--',
-                    width=1
-                ))
-
-            # Create plot
-            buf = io.BytesIO()
-            entry_change = ((float(order.price) - opening_price) / opening_price) * 100
-            current_change = ((float(df.iloc[-1]['close']) - opening_price) / opening_price) * 100
-
-            title = (
-                f"{order.symbol} Trade Analysis ({order.timeframe.value})\n"
-                f"Open: ${opening_price:.2f} | Entry: ${float(order.price):.2f} ({entry_change:+.2f}%)\n"
-                f"Current: ${float(df.iloc[-1]['close']):.2f} ({current_change:+.2f}%)"
-            )
-
-            mpf.plot(
+            # Calculate volume statistics for highlighting
+            volume_mean = df['Volume'].mean()  # Changed from 'volume' to 'Volume'
+            volume_std = df['Volume'].std()
+            high_volume_threshold = volume_mean + volume_std
+            
+            # Create volume colors array
+            colors = np.where(df['Volume'] > high_volume_threshold, '#FF9800', '#78909C')
+            
+            # Enhanced plot configuration
+            fig, axes = mpf.plot(
                 df,
                 type='candle',
                 style=self.style,
-                title=title,
-                ylabel='Price (USDT)',
-                ylabel_lower='Volume',
                 volume=True,
-                figsize=(12, 8),
-                addplot=addplots,
-                savefig=dict(fname=buf, dpi=150, bbox_inches='tight')
+                returnfig=True,
+                title=f'\n{order.symbol} - {order.timeframe.value} ({order.order_type.value.upper()})',
+                figsize=(14, 9),  # Larger figure size
+                panel_ratios=(7, 2),  # Better ratio between price and volume
+                volume_panel=1,
+                addplot=[
+                    mpf.make_addplot(df['Volume'], type='bar', panel=1, 
+                                   color=colors, alpha=0.8)
+                ]
             )
 
+            # Enhanced title with better spacing and formatting
+            fig.suptitle(f'{order.symbol} - {order.timeframe.value}\n' +
+                        f'Entry: ${float(entry_price):,.2f} | Current: ${float(current_price):,.2f}\n' +
+                        f'Change: {float(entry_change):+.2f}%',
+                        y=0.95, fontsize=12, color='white')
+
+            # Add enhanced legend with background
+            legend_elements = [
+                plt.Line2D([0], [0], color='#00C853', label='Bullish', linewidth=2),
+                plt.Line2D([0], [0], color='#FF1744', label='Bearish', linewidth=2),
+                plt.Line2D([0], [0], color='#FF9800', label='High Volume', linewidth=2)
+            ]
+            legend = axes[0].legend(handles=legend_elements, 
+                                  loc='upper left',
+                                  fontsize=9,
+                                  facecolor='#2a2a2a',
+                                  edgecolor='#787878',
+                                  framealpha=0.8)
+            for text in legend.get_texts():
+                text.set_color('white')
+
+            # Enhanced price line annotations
+            self._add_price_lines(axes[0], order, entry_price, reference_price)
+
+            # Improve axes scaling and formatting
+            self._format_axes(axes[0], axes[1], df)
+
+            # Add enhanced volume analysis
+            self._add_volume_analysis(axes[1], df)
+
+            # Add trade information footer
+            self._add_enhanced_footer(fig, order)
+
+            # Fine-tune layout
+            plt.tight_layout()
+            
+            # Save with higher DPI for better quality
+            buf = io.BytesIO()
+            fig.savefig(buf, format='png', bbox_inches='tight', dpi=150,
+                       facecolor='#1a1a1a', edgecolor='none')
             buf.seek(0)
             return buf.getvalue()
 
         except Exception as e:
-            logger.error(f"Error generating chart: {e}")
-            return None
+            logger.error(f"Chart generation failed: {e}", exc_info=True)
+            return self._generate_error_chart(f"Chart generation error: {str(e)}")
+
+    def _add_price_lines(self, ax, order: Order, entry_price: Decimal, reference_price: Optional[Decimal]):
+        """Add enhanced price lines and annotations including TP/SL for futures"""
+        # Entry line with gradient effect
+        ax.axhline(y=float(entry_price), color='#4CAF50', linestyle='-', 
+                  alpha=0.3, linewidth=1.5)
+        
+        # Add entry price marker on the right side
+        ax.annotate(f'Entry ${float(entry_price):,.2f}',
+                   xy=(ax.get_xlim()[1], float(entry_price)),
+                   xytext=(5, 0),
+                   textcoords='offset points',
+                   color='#4CAF50',
+                   fontsize=9,
+                   ha='left',
+                   bbox=dict(facecolor='#2a2a2a', edgecolor='#4CAF50', alpha=0.7))
+
+        # Add current price marker at the top right corner of the chart
+        current_price = float(order.price)
+        ax.annotate(f'Current ${current_price:,.2f}',
+                   xy=(1, 1.05),  # Position at the top right
+                   xycoords='axes fraction',
+                   textcoords='offset points',
+                   color='#FFEB3B',
+                   fontsize=10,
+                   ha='right',
+                   bbox=dict(facecolor='#2a2a2a', edgecolor='#FFEB3B', alpha=0.7))
+
+        # Add reference price if available
+        if reference_price:
+            ax.axhline(y=float(reference_price), color='#2196F3', 
+                      linestyle='--', alpha=0.3, linewidth=1.5)
+            ax.annotate(f'Ref ${float(reference_price):,.2f}',
+                       xy=(ax.get_xlim()[0], float(reference_price)),
+                       xytext=(-5, 0),
+                       textcoords='offset points',
+                       color='#2196F3',
+                       fontsize=9,
+                       ha='right',
+                       bbox=dict(facecolor='#2a2a2a', edgecolor='#2196F3', alpha=0.7))
+
+        # Add TP line for futures orders
+        if order.order_type == OrderType.FUTURES and hasattr(order, 'tp_price') and order.tp_price:
+            ax.axhline(y=float(order.tp_price), color='#00C853', 
+                      linestyle=':', alpha=0.5, linewidth=1.5)
+            ax.annotate(f'TP ${float(order.tp_price):,.2f}',
+                       xy=(ax.get_xlim()[0], float(order.tp_price)),
+                       xytext=(-5, 0),
+                       textcoords='offset points',
+                       color='#00C853',
+                       fontsize=9,
+                       ha='right',
+                       bbox=dict(facecolor='#2a2a2a', edgecolor='#00C853', alpha=0.7))
+
+        # Add SL line for futures orders
+        if order.order_type == OrderType.FUTURES and hasattr(order, 'sl_price') and order.sl_price:
+            ax.axhline(y=float(order.sl_price), color='#FF1744', 
+                      linestyle=':', alpha=0.5, linewidth=1.5)
+            ax.annotate(f'SL ${float(order.sl_price):,.2f}',
+                       xy=(ax.get_xlim()[0], float(order.sl_price)),
+                       xytext=(-5, 0),
+                       textcoords='offset points',
+                       color='#FF1744',
+                       fontsize=9,
+                       ha='right',
+                       bbox=dict(facecolor='#2a2a2a', edgecolor='#FF1744', alpha=0.7))
 
     def _generate_error_chart(self, message: str) -> Optional[bytes]:
-        """Generate an error message chart"""
+        """Generate an error message chart with thread-safe configuration"""
         try:
+            # Create figure with dark theme manually
+            plt.rcParams['figure.facecolor'] = '#1e1e1e'
+            plt.rcParams['axes.facecolor'] = '#1e1e1e'
+            plt.rcParams['text.color'] = '#ffffff'
+            
             fig, ax = plt.subplots(figsize=(12, 6))
-            ax.text(0.5, 0.5, message, 
+            ax.set_facecolor('#1e1e1e')
+            
+            ax.text(0.5, 0.5, f"⚠️ {message}",
                    ha='center', va='center',
                    wrap=True,
-                   color='red')
+                   color='red',
+                   fontsize=12)
+            ax.text(0.5, 0.4, 
+                   "Please check the following:\n" +
+                   "• Data availability\n" +
+                   "• Timeframe configuration\n" +
+                   "• API connection status",
+                   ha='center', va='center',
+                   wrap=True,
+                   color='gray',
+                   fontsize=10)
             ax.set_axis_off()
             
             buf = io.BytesIO()
@@ -414,3 +568,73 @@ class ChartGenerator:
         except Exception as e:
             logger.error(f"Error formatting info text: {e}", exc_info=True)
             return "Error generating trade information"
+
+    def _format_axes(self, price_ax, volume_ax, df: pd.DataFrame):
+        """Enhanced axes formatting"""
+        # Calculate optimal price range
+        price_range = df['High'].max() - df['Low'].min()
+        margin = price_range * 0.1
+        price_ax.set_ylim(df['Low'].min() - margin, df['High'].max() + margin)
+
+        # Format price axis
+        price_ax.yaxis.set_major_formatter(ticker.FuncFormatter(
+            lambda x, p: f'${x:,.2f}'))
+        price_ax.grid(True, alpha=0.15, linestyle=':')
+
+        # Format volume axis
+        max_volume = df['Volume'].max()
+        volume_ax.set_ylim(0, max_volume * 1.1)
+        volume_ax.yaxis.set_major_formatter(ticker.FuncFormatter(
+            lambda x, p: f'{x:,.0f}'))
+
+    def _add_volume_analysis(self, ax, df: pd.DataFrame):
+        """Add enhanced volume analysis"""
+        # Calculate and plot volume moving average
+        volume_ma = df['Volume'].rolling(window=20).mean()
+        ax.plot(df.index, volume_ma, color='#FF9800', 
+                alpha=0.7, linewidth=1, label='Volume MA(20)')
+
+        # Highlight significant volume bars
+        volume_std = df['Volume'].std()
+        volume_mean = df['Volume'].mean()
+        significant_volume = df['Volume'] > (volume_mean + 2 * volume_std)
+        
+        for idx in df.index[significant_volume]:
+            ax.annotate('⚡',
+                       xy=(idx, df.loc[idx, 'Volume']),
+                       xytext=(0, 5),
+                       textcoords='offset points',
+                       ha='center',
+                       fontsize=8,
+                       alpha=0.8)
+
+    def _add_enhanced_footer(self, fig, order: Order):
+        """Add enhanced footer with trade information"""
+        # Get current mode
+        mode = "FUTURES" if order.order_type == OrderType.FUTURES else "SPOT"
+        
+        footer_text = (
+            f"{order.symbol} • {order.timeframe.value.title()} • "
+            f"{mode}"
+        )
+
+        # Add leverage and direction for futures
+        if order.order_type == OrderType.FUTURES:
+            footer_text += f" • {order.leverage}x • {order.direction.value.upper()}"
+            # Add TP/SL if present
+            if hasattr(order, 'tp_price') and order.tp_price:
+                footer_text += f" • TP: ${float(order.tp_price):.2f}"
+            if hasattr(order, 'sl_price') and order.sl_price:
+                footer_text += f" • SL: ${float(order.sl_price):.2f}"
+
+        # Add timestamp
+        footer_text += f" • Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC"
+
+        fig.text(0.99, 0.01, footer_text,
+                ha='right', va='bottom',
+                color='#787878',
+                fontsize=8,
+                bbox=dict(facecolor='#2a2a2a',
+                         edgecolor='#787878',
+                         alpha=0.7,
+                         pad=5))

@@ -338,9 +338,22 @@ class MongoClient:
         return diagram
 
     def _document_to_order(self, doc: dict) -> Optional[Order]:
-        """Convert MongoDB document to Order object with error handling"""
+        """Convert MongoDB document to Order object with safer decimal conversion"""
         try:
-            # Updated required fields list
+            # Helper function to safely convert to Decimal
+            def to_decimal(value) -> Decimal:
+                if value is None or value == "":
+                    logger.debug(f"Converting None/empty value to Decimal(0)")
+                    return Decimal('0')
+                try:
+                    if isinstance(value, (int, float)):
+                        value = str(value)
+                    return Decimal(value)
+                except (DecimalException, ValueError, TypeError) as e:
+                    logger.warning(f"Error converting {value} (type: {type(value)}) to Decimal: {e}")
+                    return Decimal('0')
+
+            # Validate required fields presence
             required_fields = ['symbol', 'status', 'price', 'quantity', 
                              'order_id', 'created_at', 'updated_at']
             
@@ -349,20 +362,20 @@ class MongoClient:
                 logger.error(f"Document missing required fields: {missing}")
                 return None
 
-            # Create order with mandatory fields
+            # Create order with mandatory fields and safe decimal conversion
             order = Order(
                 symbol=doc["symbol"],
                 status=OrderStatus(doc["status"]),
                 order_type=OrderType(doc.get("order_type", "spot")),  # Default to spot
-                price=Decimal(doc["price"]),
-                quantity=Decimal(doc["quantity"]),
+                price=to_decimal(doc["price"]),
+                quantity=to_decimal(doc["quantity"]),
                 timeframe=TimeFrame(doc.get("timeframe", "daily")),  # Default to daily
                 order_id=doc["order_id"],
                 created_at=doc["created_at"],
                 updated_at=doc["updated_at"],
                 filled_at=doc.get("filled_at"),
                 cancelled_at=doc.get("cancelled_at"),
-                fees=Decimal(doc.get("fees", "0")),
+                fees=to_decimal(doc.get("fees")),  # Use to_decimal without default value
                 fee_asset=doc.get("fee_asset", "USDT"),
                 threshold=float(doc["threshold"]) if doc.get("threshold") not in [None, "Manual"] else None
             )
@@ -373,9 +386,15 @@ class MongoClient:
             if doc.get("direction"):
                 order.direction = TradeDirection(doc["direction"])
 
+            # Add TP/SL prices if present
+            if doc.get("tp_price") is not None:
+                order.tp_price = to_decimal(doc["tp_price"])
+            if doc.get("sl_price") is not None:
+                order.sl_price = to_decimal(doc["sl_price"])
+
             return order
             
-        except (ValueError, KeyError, TypeError, DecimalException) as e:
+        except Exception as e:
             logger.error(f"Error converting document {doc.get('order_id', 'unknown')}: {e}")
             return None
 
@@ -885,5 +904,50 @@ class MongoClient:
         except Exception as e:
             logger.error(f"Failed to update TP/SL status: {e}")
             return False
+
+    async def get_order(self, order_id: str) -> Optional[Order]:
+        """Get a single order by order_id"""
+        try:
+            doc = await self.orders.find_one({"order_id": order_id})
+            if doc:
+                return self._document_to_order(doc)
+            return None
+        except Exception as e:
+            logger.error(f"Failed to get order {order_id}: {e}")
+            return None
+
+    async def get_weekly_orders(self) -> List[Order]:
+        """Get orders from the past week"""
+        try:
+            week_ago = datetime.utcnow() - timedelta(days=7)
+            cursor = self.orders.find({
+                "created_at": {"$gte": week_ago},
+                "status": OrderStatus.FILLED.value
+            })
+            
+            orders = []
+            async for doc in cursor:
+                order = self._document_to_order(doc)
+                if order:
+                    orders.append(order)
+            return orders
+            
+        except Exception as e:
+            logger.error(f"Error getting weekly orders: {e}")
+            return []
+
+    async def get_weekly_triggered_thresholds(self) -> List[Dict]:
+        """Get thresholds triggered in the past week"""
+        try:
+            week_ago = datetime.utcnow() - timedelta(days=7)
+            cursor = self.thresholds.find({
+                "triggered_at": {"$gte": week_ago},
+                "active": True
+            })
+            return await cursor.to_list(None)
+            
+        except Exception as e:
+            logger.error(f"Error getting weekly thresholds: {e}")
+            return []
 
     # ...rest of existing code...

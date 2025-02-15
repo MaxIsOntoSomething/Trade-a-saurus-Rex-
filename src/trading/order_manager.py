@@ -33,20 +33,16 @@ class OrderManager:
         self.futures_client = None
         if (config['environment']['trading_mode'] == 'futures' or 
             config['trading'].get('futures', {}).get('enabled', False)):
-            if config['environment']['testnet']:
-                api_config = {
-                    **config['binance']['testnet_futures'],
-                    'testnet': True,  # Add testnet flag
-                    **config['trading'].get('futures_settings', {})
-                }
-            else:
-                api_config = {
-                    **config['binance']['mainnet'],
-                    'testnet': False,
-                    **config['trading'].get('futures_settings', {})
-                }
-            self.futures_client = FuturesClient(api_config)
-            logger.info("Futures trading enabled")
+            futures_config = {
+                **config['binance']['testnet_futures' if config['environment']['testnet'] else 'mainnet'],
+                'testnet': config['environment']['testnet'],
+                'config': config,  # Pass the full config
+                'trading': config['trading'],  # Pass trading settings directly
+                'reserve_balance': config['trading']['reserve_balance'],
+                **config['trading'].get('futures_settings', {})
+            }
+            self.futures_client = FuturesClient(futures_config)
+            self.active_client = self.futures_client
 
         # Track active client
         self.active_client = binance_client
@@ -291,6 +287,9 @@ class OrderManager:
     async def create_order(self, symbol: str, timeframe: TimeFrame, threshold: float):
         """Create and store an order with improved futures support"""
         try:
+            # Get order amount using the new calculation method
+            amount = await self.binance_client.calculate_trade_amount()
+            
             # Get current price for the signal
             ticker = await self.active_client.get_symbol_ticker(symbol=symbol)
             signal_price = float(ticker['price'])
@@ -306,7 +305,7 @@ class OrderManager:
                 # Use futures client for futures orders
                 order = await self.futures_client.place_futures_order(
                     symbol=symbol,
-                    amount=self.config['trading']['order_amount'],
+                    amount=amount,  # Use calculated amount
                     direction=TradeDirection.LONG,
                     leverage=self.config['trading']['futures_settings']['default_leverage'],
                     margin_type=self.config['trading']['futures_settings']['margin_type'],
@@ -318,7 +317,7 @@ class OrderManager:
                 # Use spot client for spot orders
                 order = await self.binance_client.place_limit_buy_order(
                     symbol=symbol,
-                    amount=self.config['trading']['order_amount'],
+                    amount=amount,  # Use calculated amount
                     threshold=threshold,
                     timeframe=timeframe
                 )
@@ -567,3 +566,16 @@ class OrderManager:
 
         except Exception as e:
             logger.error(f"Error handling {trigger_type} trigger: {e}")
+
+    async def sync_pending_orders(self, client, db_client):
+        """
+        Check all pending orders in the database; if any are filled on the exchange, update the status to FILLED.
+        """
+        # 1) Retrieve pending orders
+        pending_orders = await db_client.get_pending_orders()
+        # 2) Check each one against the exchange
+        for order in pending_orders:
+            exchange_status = await client.get_order_status(order.symbol, order.exchange_id)
+            # 3) If order is filled on exchange, update to FILLED in DB
+            if exchange_status == 'FILLED':
+                await db_client.update_order_status(order.id, OrderStatus.FILLED)

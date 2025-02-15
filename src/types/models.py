@@ -1,5 +1,5 @@
 from enum import Enum
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from typing import Optional
@@ -41,8 +41,8 @@ class Order:
     direction: Optional[TradeDirection] = None
     filled_at: Optional[datetime] = None
     cancelled_at: Optional[datetime] = None
-    fees: Decimal = Decimal('0')
-    fee_asset: str = 'USDT'
+    fees: Optional[Decimal] = None
+    fee_asset: Optional[str] = None
     threshold: Optional[float] = None
     is_manual: bool = False
     margin_type: Optional[MarginType] = None
@@ -53,9 +53,13 @@ class Order:
     # Add TP/SL fields
     tp_order_id: Optional[str] = None
     sl_order_id: Optional[str] = None
-    tp_price: Optional[float] = None
-    sl_price: Optional[float] = None
+    tp_price: Optional[Decimal] = None
+    sl_price: Optional[Decimal] = None
     position_side: Optional[str] = None  # Add position side field
+    tp_status: Optional[str] = None
+    sl_status: Optional[str] = None
+    exit_type: Optional[str] = None  # 'TP' or 'SL'
+    exit_price: Optional[Decimal] = None
 
     def __post_init__(self):
         # Convert numeric strings to Decimal

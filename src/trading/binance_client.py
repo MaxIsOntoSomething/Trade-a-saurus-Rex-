@@ -102,23 +102,41 @@ class BinanceClient:
 
     async def initialize(self):
         """Initialize client with proper error handling for configuration"""
-        self.client = await AsyncClient.create(
-            api_key=self.api_key,
-            api_secret=self.api_secret,
-            testnet=self.testnet
-        )
+        try:
+            self.client = await AsyncClient.create(
+                api_key=self.api_key,
+                api_secret=self.api_secret,
+                testnet=self.testnet
+            )
 
-        # Get exchange info for precision
-        exchange_info = await self.client.get_exchange_info()
-        for symbol in exchange_info['symbols']:
-            self.symbol_info[symbol['symbol']] = {
-                'baseAssetPrecision': symbol['baseAssetPrecision'],
-                'quotePrecision': symbol['quotePrecision'],
-                'filters': {f['filterType']: f for f in symbol['filters']}
-            }
+            # Get exchange info for precision
+            exchange_info = await self.client.get_exchange_info()
+            for symbol in exchange_info['symbols']:
+                self.symbol_info[symbol['symbol']] = {
+                    'baseAssetPrecision': symbol['baseAssetPrecision'],
+                    'quotePrecision': symbol['quotePrecision'],
+                    'filters': {f['filterType']: f for f in symbol['filters']}
+                }
             
-        # Check initial balance after initialization
-        await self.check_initial_balance()
+            # Initialize MongoDB client if config is available
+            if self.config and 'mongodb' in self.config:
+                from ..database.mongo_client import MongoClient
+                mongo_client = MongoClient(
+                    uri=self.config['mongodb']['uri'],
+                    database=self.config['mongodb']['database']
+                )
+                await mongo_client.init_indexes()
+                self.mongo_client = mongo_client
+                logger.info("MongoDB client initialized")
+            else:
+                logger.warning("No MongoDB configuration found")
+            
+            # Check initial balance after initialization
+            await self.check_initial_balance()
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize client: {e}")
+            raise
         
     async def close(self):
         if self.client:
@@ -413,14 +431,18 @@ class BinanceClient:
     async def check_reserve_balance(self, order_amount: float) -> bool:
         """Check if placing an order would violate reserve balance"""
         try:
-            logger.info("[RESERVE CHECK] Starting reserve balance check...")
-            
             # Get current balance in base currency (USDT)
             current_balance = await self.get_balance(self.base_currency)
             logger.info(f"[RESERVE CHECK] Current balance: ${float(current_balance):,.2f}")
             logger.info(f"[RESERVE CHECK] Reserve balance: ${float(self.reserve_balance):,.2f}")
             
-            # Get sum of pending orders - only if mongo client is available
+            # Calculate actual order amount if using percentage
+            amount_type = self.config['trading'].get('amount_type', 'fixed')
+            if amount_type == 'percentage':
+                order_amount = float(current_balance) * (float(self.config['trading'].get('percentage_amount', 10)) / 100)
+                logger.info(f"[RESERVE CHECK] Calculated percentage amount: ${order_amount:,.2f}")
+            
+            # Get sum of pending orders
             pending_orders_value = Decimal('0')
             if hasattr(self, 'mongo_client') and self.mongo_client:
                 try:
@@ -430,7 +452,7 @@ class BinanceClient:
                 except Exception as e:
                     logger.warning(f"[RESERVE CHECK] Could not get pending orders: {e}")
 
-            # Calculate remaining balance after pending orders and new order
+            # Calculate remaining balance
             available_balance = float(current_balance - pending_orders_value)
             remaining_after_order = available_balance - order_amount
 
@@ -448,7 +470,6 @@ class BinanceClient:
                     f"Remaining Balance: ${remaining_after_order:,.2f}"
                 )
                 
-                # Send alert through telegram if available
                 if self.telegram_bot:
                     await self.telegram_bot.send_reserve_alert(
                         current_balance=Decimal(str(current_balance)),
@@ -466,7 +487,7 @@ class BinanceClient:
                                   threshold: Optional[float] = None,
                                   timeframe: Optional[TimeFrame] = None,
                                   is_manual: bool = False) -> Order:
-        """Place a limit buy order with reserve balance check"""
+        """Place a limit buy order with TP/SL"""
         # Check reserve balance first
         if not is_manual and not await self.check_reserve_balance(amount):
             raise ValueError("Order would violate reserve balance")
@@ -520,8 +541,20 @@ class BinanceClient:
                     price=float(price)
                 )
                 order_id = str(order_response['orderId'])
+
+            # Calculate TP/SL prices if enabled
+            tp_price = None
+            sl_price = None
             
-            # Create order object with all required fields
+            if self.config['trading'].get('spot_settings', {}).get('tp_enabled'):
+                tp_percent = self.config['trading']['spot_settings']['default_tp_percent']
+                tp_price = price * (1 + (Decimal(str(tp_percent)) / Decimal('100')))
+            
+            if self.config['trading'].get('spot_settings', {}).get('sl_enabled'):
+                sl_percent = self.config['trading']['spot_settings']['default_sl_percent']
+                sl_price = price * (1 - (Decimal(str(sl_percent)) / Decimal('100')))
+
+            # Create main order first
             order = Order(
                 symbol=symbol,
                 status=OrderStatus.PENDING if not is_manual else OrderStatus.FILLED,
@@ -535,9 +568,38 @@ class BinanceClient:
                 filled_at=datetime.utcnow() if is_manual else None,
                 fees=fees,
                 fee_asset=fee_asset,
-                threshold=threshold  # This is now handled by the Order class
+                threshold=threshold,
+                tp_price=tp_price,
+                sl_price=sl_price
             )
-            
+
+            # Place TP/SL orders if main order is filled
+            if order.status == OrderStatus.FILLED:
+                if tp_price:
+                    tp_order = await self.client.create_order(
+                        symbol=symbol,
+                        side='SELL',
+                        type='LIMIT',
+                        timeInForce='GTC',
+                        quantity=float(quantity),
+                        price=float(tp_price)
+                    )
+                    order.tp_order_id = str(tp_order['orderId'])
+                    order.tp_status = 'PENDING'
+
+                if sl_price:
+                    sl_order = await self.client.create_order(
+                        symbol=symbol,
+                        side='SELL',
+                        type='STOP_LOSS_LIMIT',
+                        timeInForce='GTC',
+                        quantity=float(quantity),
+                        price=float(sl_price),
+                        stopPrice=float(sl_price)
+                    )
+                    order.sl_order_id = str(sl_order['orderId'])
+                    order.sl_status = 'PENDING'
+
             return order
             
         except BinanceAPIException as e:
@@ -548,27 +610,87 @@ class BinanceClient:
             raise
 
     async def cancel_order(self, symbol: str, order_id: str) -> bool:
-        """Cancel an order"""
+        """Cancel order and associated TP/SL orders"""
         try:
+            # Cancel main order
             await self.client.cancel_order(symbol=symbol, orderId=order_id)
+            
+            # Get order from database
+            db_order = await self.mongo_client.get_order(order_id)
+            if db_order:
+                # Cancel TP order if exists
+                if db_order.tp_order_id:
+                    try:
+                        await self.client.cancel_order(
+                            symbol=symbol, 
+                            orderId=db_order.tp_order_id
+                        )
+                    except Exception as e:
+                        logger.error(f"Error canceling TP order: {e}")
+
+                # Cancel SL order if exists
+                if db_order.sl_order_id:
+                    try:
+                        await self.client.cancel_order(
+                            symbol=symbol, 
+                            orderId=db_order.sl_order_id
+                        )
+                    except Exception as e:
+                        logger.error(f"Error canceling SL order: {e}")
+
             return True
+
         except BinanceAPIException as e:
             logger.error(f"Failed to cancel order: {e}")
             return False
             
     async def check_order_status(self, symbol: str, order_id: str) -> Optional[OrderStatus]:
-        """Check the status of an order"""
+        """Check order status including TP/SL"""
         try:
+            # First check the main order
             order = await self.client.get_order(symbol=symbol, orderId=order_id)
+            
+            # Get order from database
+            db_order = await self.mongo_client.get_order(order_id)
+            if not db_order:
+                logger.warning(f"Order {order_id} not found in database")
+                return None
+                
+            # Check main order status first
             if order['status'] == 'FILLED':
+                # If filled, check TP/SL orders
+                if db_order.tp_order_id:
+                    try:
+                        tp_order = await self.client.get_order(
+                            symbol=symbol, 
+                            orderId=db_order.tp_order_id
+                        )
+                        if tp_order['status'] == 'FILLED':
+                            return OrderStatus.FILLED
+                    except Exception as e:
+                        logger.error(f"Error checking TP order: {e}")
+                
+                if db_order.sl_order_id:
+                    try:
+                        sl_order = await self.client.get_order(
+                            symbol=symbol, 
+                            orderId=db_order.sl_order_id
+                        )
+                        if sl_order['status'] == 'FILLED':
+                            return OrderStatus.FILLED
+                    except Exception as e:
+                        logger.error(f"Error checking SL order: {e}")
+
                 return OrderStatus.FILLED
             elif order['status'] == 'CANCELED':
                 return OrderStatus.CANCELLED
+                
             return OrderStatus.PENDING
-        except BinanceAPIException as e:
+
+        except Exception as e:
             logger.error(f"Failed to check order status: {e}")
             return None
-            
+
     async def get_balance(self, symbol: str = 'USDT') -> Decimal:
         """Get balance for a specific asset"""
         await self.rate_limiter.acquire()
@@ -595,85 +717,60 @@ class BinanceClient:
     async def get_candles_for_chart(self, symbol: str, timeframe: TimeFrame, count: int = 8) -> List[Dict]:
         """Get historical candles with proper timeframe alignment"""
         try:
-            # Define interval and period mapping for each timeframe
-            interval_map = {
-                TimeFrame.DAILY: ('1d', timedelta(days=1)),
-                TimeFrame.WEEKLY: ('1w', timedelta(weeks=1)),
-                TimeFrame.MONTHLY: ('1M', timedelta(days=30))
-            }
-            
-            interval, period = interval_map[timeframe]
-            
-            # Calculate proper start and end times based on timeframe
             now = datetime.utcnow()
-            end_time = now
-
-            if timeframe == TimeFrame.DAILY:
-                # Get exactly 8 days of data
-                start_time = end_time - timedelta(days=8)
             
+            # Calculate start time based on timeframe
+            if timeframe == TimeFrame.MONTHLY:
+                # Get data for past 8 months plus current month
+                start_time = now - timedelta(days=240)  # Approximately 8 months
+                interval = '1d'  # Use daily candles for monthly view
             elif timeframe == TimeFrame.WEEKLY:
-                # Get exactly 8 weeks of data, aligned to Monday
-                days_since_monday = end_time.weekday()
-                end_time = end_time - timedelta(days=days_since_monday)
-                start_time = end_time - timedelta(weeks=8)
-            
-            elif timeframe == TimeFrame.MONTHLY:
-                # Get exactly 8 months of data, aligned to 1st of month
-                if now.month > 8:
-                    start_time = now.replace(month=now.month - 8, day=1)
-                else:
-                    # Handle year boundary
-                    months_in_prev_year = 8 - now.month
-                    start_time = now.replace(year=now.year - 1,
-                                          month=12 - months_in_prev_year + 1,
-                                          day=1)
-                end_time = now.replace(day=1)
+                start_time = now - timedelta(weeks=8)
+                interval = '4h'
+            else:  # DAILY
+                start_time = now - timedelta(days=2)
+                interval = '15m'
 
-            # Convert to milliseconds for Binance API
+            # Convert to milliseconds timestamp
             start_ms = int(start_time.timestamp() * 1000)
-            end_ms = int(end_time.timestamp() * 1000)
-            
-            # Get candles from Binance
+            end_ms = int(now.timestamp() * 1000)
+
+            # Log time range for debugging
+            logger.debug(f"Getting candles for {symbol} {timeframe.value}")
+            logger.debug(f"Time range: {start_time} to {now}")
+            logger.debug(f"Using interval: {interval}")
+
+            # Fetch candles
             await self.rate_limiter.acquire()
-            klines = await self.client.get_klines(
+            candles = await self.client.get_klines(
                 symbol=symbol,
                 interval=interval,
                 startTime=start_ms,
                 endTime=end_ms,
-                limit=8
+                limit=500
             )
-            
-            if not klines:
-                logger.error(f"No candles returned for {symbol}")
-                return []
-            
-            # Format candles with proper timestamps
-            candles = []
-            for k in klines:
-                dt = datetime.fromtimestamp(k[0] / 1000)
-                
-                # Format timestamp based on timeframe
-                if timeframe == TimeFrame.MONTHLY:
-                    formatted_time = dt.strftime("%Y-%m")  # YYYY-MM
-                elif timeframe == TimeFrame.WEEKLY:
-                    formatted_time = dt.strftime("%Y-%m-%d")  # Show Monday date
-                else:
-                    formatted_time = dt.strftime("%Y-%m-%d")  # Full date for daily
-                
-                candles.append({
-                    'timestamp': formatted_time,
-                    'open': float(k[1]),
-                    'high': float(k[2]),
-                    'low': float(k[3]),
-                    'close': float(k[4]),
-                    'volume': float(k[5])
+
+            # Convert to proper format
+            formatted_candles = []
+            for candle in candles:
+                formatted_candles.append({
+                    'timestamp': candle[0],
+                    'open': candle[1],
+                    'high': candle[2],
+                    'low': candle[3],
+                    'close': candle[4],
+                    'volume': candle[5]
                 })
-            
-            return candles[-8:]  # Ensure exactly 8 candles
-            
+
+            logger.info(f"Fetched {len(formatted_candles)} candles for {symbol} {timeframe.value}")
+            if formatted_candles:
+                logger.debug(f"Data range: {datetime.fromtimestamp(formatted_candles[0]['timestamp']/1000)} "
+                           f"to {datetime.fromtimestamp(formatted_candles[-1]['timestamp']/1000)}")
+
+            return formatted_candles
+
         except Exception as e:
-            logger.error(f"Failed to get candles for chart: {e}")
+            logger.error(f"Failed to get candles for {symbol}: {e}")
             return []
 
     async def generate_trade_chart(self, order: Order) -> Optional[bytes]:
@@ -759,3 +856,21 @@ class BinanceClient:
         except Exception as e:
             logger.error(f"Failed to set position mode: {e}")
             return False
+
+    async def calculate_trade_amount(self) -> float:
+        """Calculate trade amount based on config settings"""
+        try:
+            amount_type = self.config['trading'].get('amount_type', 'fixed')
+            
+            if amount_type == 'fixed':
+                return float(self.config['trading'].get('fixed_amount', 100))
+            else:
+                # Get current balance and calculate percentage
+                balance = await self.get_balance()
+                percentage = float(self.config['trading'].get('percentage_amount', 10))
+                return float(balance) * (percentage / 100)
+                
+        except Exception as e:
+            logger.error(f"Error calculating trade amount: {e}")
+            # Return default amount
+            return 100
