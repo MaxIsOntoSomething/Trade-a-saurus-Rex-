@@ -2,52 +2,44 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 import logging
 from typing import Dict
+from ..telegram.Telegram import TelegramBot  # Use new Telegram.py
+from ..database.mongo_client import MongoClient
 from ..types.models import TimeFrame
 
 logger = logging.getLogger(__name__)
 
 class WeeklySummaryScheduler:
-    def __init__(self, telegram_bot, mongo_client):
-        self.telegram_bot = telegram_bot
+    def __init__(self, telegram_bot: TelegramBot, mongo_client: MongoClient):
+        self.bot = telegram_bot
         self.mongo_client = mongo_client
-        self.target_day = 6  # Sunday
-        self.target_hour = 17  # 17:00 UTC
+        self.next_summary = self._get_next_summary_time()
         self.running = True
 
-    async def run(self):
-        """Run the weekly summary scheduler"""
-        logger.info("Starting weekly summary scheduler")
+    def _get_next_summary_time(self) -> datetime:
+        """Get next summary time (Sunday at 00:00 UTC)"""
+        now = datetime.utcnow()
+        days_ahead = 6 - now.weekday()  # 6 = Sunday
+        if days_ahead <= 0:
+            days_ahead += 7
+        next_sunday = now + timedelta(days=days_ahead)
+        return next_sunday.replace(hour=0, minute=0, second=0, microsecond=0)
         
+    async def run(self):
+        """Run the scheduler"""
         while self.running:
             try:
-                now = datetime.now(timezone.utc)
-                target = self._get_next_summary_time(now)
-                delay = (target - now).total_seconds()
+                now = datetime.utcnow()
                 
-                logger.info(f"Next weekly summary scheduled for: {target}")
-                await asyncio.sleep(delay)
-                
-                if self.running:  # Check if still running after sleep
-                    await self.telegram_bot.automation_manager.generate_weekly_summary()
+                if now >= self.next_summary:
+                    await self.bot.automation_manager.generate_weekly_summary()
+                    self.next_summary = self._get_next_summary_time()
                     
+                # Sleep until next check
+                await asyncio.sleep(60)  # Check every minute
+                
             except Exception as e:
-                logger.error(f"Error in weekly summary scheduler: {e}")
+                logger.error(f"Error in scheduler: {e}")
                 await asyncio.sleep(300)  # Sleep 5 minutes on error
-
-    def _get_next_summary_time(self, current: datetime) -> datetime:
-        """Calculate next summary time"""
-        days_ahead = self.target_day - current.weekday()
-        if days_ahead <= 0:  # Target time has passed this week
-            days_ahead += 7
-            
-        next_time = current.replace(
-            hour=self.target_hour, 
-            minute=0, 
-            second=0, 
-            microsecond=0
-        ) + timedelta(days=days_ahead)
-            
-        return next_time
 
     async def stop(self):
         """Stop the scheduler"""
