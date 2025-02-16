@@ -10,6 +10,7 @@ from ..trading.binance_client import BinanceClient
 from ..database.mongo_client import MongoClient
 from ..telegram.bot import TelegramBot
 from .futures_client import FuturesClient
+from binance.exceptions import BinanceAPIException
 
 logger = logging.getLogger(__name__)
 
