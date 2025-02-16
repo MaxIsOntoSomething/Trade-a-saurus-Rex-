@@ -13,6 +13,7 @@ from typing import List, Dict, Optional
 from ..types.models import Order, OrderType, TradeDirection, TimeFrame  # Added TimeFrame import
 import mplfinance as mpf
 import numpy as np
+import seaborn as sns
 
 logger = logging.getLogger(__name__)
 
@@ -638,3 +639,111 @@ class ChartGenerator:
                          edgecolor='#787878',
                          alpha=0.7,
                          pad=5))
+
+class PortfolioVisualizer:
+    def __init__(self):
+        # Set style for all plots
+        plt.style.use('seaborn-darkgrid')
+        self.colors = sns.color_palette("husl", 8)
+
+    def generate_portfolio_timeline(self, orders: List[Dict], 
+                                  balance_history: List[Dict]) -> bytes:
+        """Generate portfolio value timeline with trade entries"""
+        try:
+            # Create figure and axis
+            fig, ax = plt.subplots(figsize=(12, 6))
+            
+            # Plot balance history
+            dates = [entry['timestamp'] for entry in balance_history]
+            values = [float(entry['balance']) for entry in balance_history]
+            ax.plot(dates, values, label='Portfolio Value', color=self.colors[0])
+
+            # Plot trade entry points
+            trade_dates = [order['created_at'] for order in orders]
+            trade_values = [float(order['price']) * float(order['quantity']) 
+                          for order in orders]
+            ax.scatter(trade_dates, trade_values, color=self.colors[1], 
+                      marker='o', label='Trades')
+
+            # Format x-axis
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+            plt.xticks(rotation=45)
+
+            # Add labels and title
+            ax.set_title('Portfolio Value Timeline')
+            ax.set_xlabel('Date')
+            ax.set_ylabel('USDT Value')
+            ax.legend()
+
+            # Save to bytes
+            buf = io.BytesIO()
+            plt.tight_layout()
+            fig.savefig(buf, format='png')
+            plt.close(fig)
+            buf.seek(0)
+            return buf.getvalue()
+
+        except Exception as e:
+            print(f"Error generating timeline: {e}")
+            return None
+
+    def generate_allocation_pie(self, spot_value: Decimal, 
+                              futures_value: Decimal) -> bytes:
+        """Generate pie chart of USDT allocation"""
+        try:
+            fig, ax = plt.subplots(figsize=(8, 8))
+            
+            # Calculate values and labels
+            values = [float(spot_value), float(futures_value)]
+            labels = ['Spot', 'Futures']
+            
+            # Create pie chart
+            ax.pie(values, labels=labels, autopct='%1.1f%%', 
+                  colors=[self.colors[0], self.colors[2]])
+            ax.set_title('USDT Allocation')
+
+            # Save to bytes
+            buf = io.BytesIO()
+            plt.tight_layout()
+            fig.savefig(buf, format='png')
+            plt.close(fig)
+            buf.seek(0)
+            return buf.getvalue()
+
+        except Exception as e:
+            print(f"Error generating allocation pie: {e}")
+            return None
+
+    def generate_fee_metrics(self, fee_data: Dict) -> bytes:
+        """Generate fee tracking visualization"""
+        try:
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+            
+            # Fee timeline
+            dates = [entry['date'] for entry in fee_data['timeline']]
+            fees = [float(entry['fees']) for entry in fee_data['timeline']]
+            ax1.plot(dates, fees, color=self.colors[3])
+            ax1.set_title('Fee Timeline')
+            ax1.set_xlabel('Date')
+            ax1.set_ylabel('Fees (USDT)')
+            ax1.tick_params(axis='x', rotation=45)
+
+            # Fee distribution by type
+            types = list(fee_data['by_type'].keys())
+            values = [float(fee_data['by_type'][t]) for t in types]
+            ax2.bar(types, values, color=self.colors)
+            ax2.set_title('Fees by Type')
+            ax2.set_ylabel('Total Fees (USDT)')
+            ax2.tick_params(axis='x', rotation=45)
+
+            # Save to bytes
+            buf = io.BytesIO()
+            plt.tight_layout()
+            fig.savefig(buf, format='png')
+            plt.close(fig)
+            buf.seek(0)
+            return buf.getvalue()
+
+        except Exception as e:
+            print(f"Error generating fee metrics: {e}")
+            return None

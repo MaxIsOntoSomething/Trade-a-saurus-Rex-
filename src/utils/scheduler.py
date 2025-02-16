@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import logging
 from typing import Dict
 from ..types.models import TimeFrame
@@ -10,17 +10,49 @@ class WeeklySummaryScheduler:
     def __init__(self, telegram_bot, mongo_client):
         self.telegram_bot = telegram_bot
         self.mongo_client = mongo_client
-        self.next_run = self._calculate_next_run()
+        self.target_day = 6  # Sunday
+        self.target_hour = 17  # 17:00 UTC
+        self.running = True
+
+    async def run(self):
+        """Run the weekly summary scheduler"""
+        logger.info("Starting weekly summary scheduler")
         
-    def _calculate_next_run(self) -> datetime:
-        """Calculate next Sunday 17:00 UTC"""
-        now = datetime.utcnow()
-        days_ahead = 6 - now.weekday()  # 6 = Sunday
-        if days_ahead <= 0:
+        while self.running:
+            try:
+                now = datetime.now(timezone.utc)
+                target = self._get_next_summary_time(now)
+                delay = (target - now).total_seconds()
+                
+                logger.info(f"Next weekly summary scheduled for: {target}")
+                await asyncio.sleep(delay)
+                
+                if self.running:  # Check if still running after sleep
+                    await self.telegram_bot.automation_manager.generate_weekly_summary()
+                    
+            except Exception as e:
+                logger.error(f"Error in weekly summary scheduler: {e}")
+                await asyncio.sleep(300)  # Sleep 5 minutes on error
+
+    def _get_next_summary_time(self, current: datetime) -> datetime:
+        """Calculate next summary time"""
+        days_ahead = self.target_day - current.weekday()
+        if days_ahead <= 0:  # Target time has passed this week
             days_ahead += 7
-        next_sunday = now + timedelta(days=days_ahead)
-        return next_sunday.replace(hour=17, minute=0, second=0, microsecond=0)
-        
+            
+        next_time = current.replace(
+            hour=self.target_hour, 
+            minute=0, 
+            second=0, 
+            microsecond=0
+        ) + timedelta(days=days_ahead)
+            
+        return next_time
+
+    async def stop(self):
+        """Stop the scheduler"""
+        self.running = False
+
     async def generate_weekly_summary(self) -> str:
         """Generate weekly trading summary"""
         try:
@@ -74,31 +106,3 @@ class WeeklySummaryScheduler:
         except Exception as e:
             logger.error(f"Error generating weekly summary: {e}")
             return "❌ Error generating weekly summary"
-
-    async def run(self):
-        """Run the scheduler"""
-        while True:
-            try:
-                now = datetime.utcnow()
-                
-                if now >= self.next_run:
-                    # Generate and send summary
-                    summary = await self.generate_weekly_summary()
-                    for user_id in self.telegram_bot.allowed_users:
-                        try:
-                            await self.telegram_bot.app.bot.send_message(
-                                chat_id=user_id,
-                                text=summary
-                            )
-                        except Exception as e:
-                            logger.error(f"Failed to send summary to {user_id}: {e}")
-                    
-                    # Calculate next run
-                    self.next_run = self._calculate_next_run()
-                    
-                # Sleep for 5 minutes
-                await asyncio.sleep(300)
-                
-            except Exception as e:
-                logger.error(f"Scheduler error: {e}")
-                await asyncio.sleep(60)

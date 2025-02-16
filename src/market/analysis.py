@@ -7,6 +7,8 @@ from typing import Dict, List, Tuple
 import logging
 import httpx
 import json
+import pandas as pd
+import talib
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +54,7 @@ class MarketAnalyzer:
             # Get interest over time
             interest_df = self.pytrends.interest_over_time()
             
-            if interest_df.empty:
+            if (interest_df.empty):
                 return {
                     "trend_score": 0,
                     "relative_interest": "Low",
@@ -197,3 +199,92 @@ class MarketAnalyzer:
         highs = np.array([max(prices[i:i+period]) for i in range(len(prices)-period+1)])
         lows = np.array([min(prices[i:i+period]) for i in range(len(prices)-period+1)])
         return (highs + lows) / 2
+
+    async def get_technical_analysis(self, symbol: str, prices: List[float]) -> Dict:
+        """Calculate technical indicators for a symbol"""
+        try:
+            prices_array = np.array(prices)
+            
+            # Calculate RSI (14 period)
+            rsi = talib.RSI(prices_array, timeperiod=14)[-1]
+            
+            # Calculate Moving Averages
+            sma_20 = talib.SMA(prices_array, timeperiod=20)[-1]
+            sma_50 = talib.SMA(prices_array, timeperiod=50)[-1]
+            
+            # Calculate MACD
+            macd, signal, hist = talib.MACD(prices_array)
+            
+            # Calculate Bollinger Bands
+            upper, middle, lower = talib.BBANDS(prices_array)
+            
+            current_price = prices_array[-1]
+            
+            # Determine trend based on MA crossover
+            trend = "Bullish" if sma_20 > sma_50 else "Bearish"
+            trend_strength = abs(sma_20 - sma_50) / sma_50 * 100
+            
+            return {
+                "rsi": float(rsi),
+                "trend": {
+                    "direction": trend,
+                    "strength": float(trend_strength)
+                },
+                "moving_averages": {
+                    "sma20": float(sma_20),
+                    "sma50": float(sma_50)
+                },
+                "macd": {
+                    "value": float(macd[-1]),
+                    "signal": float(signal[-1]),
+                    "histogram": float(hist[-1])
+                },
+                "bollinger_bands": {
+                    "upper": float(upper[-1]),
+                    "middle": float(middle[-1]),
+                    "lower": float(lower[-1])
+                },
+                "signals": {
+                    "rsi_oversold": rsi < 30,
+                    "rsi_overbought": rsi > 70,
+                    "price_above_ma": current_price > sma_20,
+                    "macd_crossover": hist[-1] > 0 and hist[-2] < 0
+                }
+            }
+        except Exception as e:
+            logger.error(f"Error calculating technical indicators: {e}")
+            return None
+
+    async def get_market_summary(self, symbol: str, prices: List[float]) -> Dict:
+        """Get comprehensive market analysis"""
+        try:
+            # Get technical analysis
+            tech_analysis = await self.get_technical_analysis(symbol, prices)
+            
+            # Get Google Trends data
+            trends = await self.get_google_trends(symbol)
+            
+            # Get Ichimoku analysis
+            ichimoku = self.calculate_ichimoku(prices)
+            
+            # Calculate volatility
+            returns = np.diff(np.log(prices))
+            volatility = np.std(returns) * np.sqrt(365) * 100  # Annualized volatility
+            
+            # Calculate price change
+            price_change_24h = ((prices[-1] - prices[-24]) / prices[-24]) * 100 if len(prices) > 24 else 0
+            
+            return {
+                "price": {
+                    "current": prices[-1],
+                    "change_24h": price_change_24h,
+                    "volatility": float(volatility)
+                },
+                "technical": tech_analysis,
+                "ichimoku": ichimoku,
+                "sentiment": trends,
+                "analysis_time": datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+            }
+        except Exception as e:
+            logger.error(f"Error getting market summary: {e}")
+            return None

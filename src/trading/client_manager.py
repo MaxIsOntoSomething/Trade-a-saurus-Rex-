@@ -95,3 +95,106 @@ class ClientManager:
     def get_client_type(self):
         """Get current client type"""
         return self.client_type
+
+    async def validate_mode_switch(self, new_mode: str) -> tuple[bool, str]:
+        """Validate if mode switch is possible"""
+        try:
+            if new_mode == 'futures':
+                # Check if futures trading is enabled
+                if not self.config['trading'].get('enable_futures', False):
+                    return False, "Futures trading is not enabled in configuration"
+
+                # Check for required futures settings
+                if 'futures_settings' not in self.config['trading']:
+                    return False, "Missing futures configuration settings"
+
+                # Verify futures API keys are set
+                if self.testnet:
+                    if not all([self.config['binance']['testnet_futures'].get(k) 
+                              for k in ['api_key', 'api_secret']]):
+                        return False, "Missing futures testnet API credentials"
+                else:
+                    if not all([self.config['binance']['mainnet'].get(k) 
+                              for k in ['futures_api_key', 'futures_api_secret']]):
+                        return False, "Missing futures mainnet API credentials"
+
+            # Check balance requirements
+            if not await self.validate_balance_requirements(new_mode):
+                return False, "Insufficient balance for mode switch"
+
+            # Check for open orders
+            open_orders = await self.get_open_orders()
+            if open_orders:
+                return False, f"Found {len(open_orders)} open orders. Cancel them first."
+
+            return True, "Mode switch validated"
+
+        except Exception as e:
+            logger.error(f"Error validating mode switch: {e}")
+            return False, f"Validation error: {str(e)}"
+
+    async def validate_balance_requirements(self, new_mode: str) -> bool:
+        """Check if balance meets requirements for mode switch"""
+        try:
+            current_balance = await self.active_client.get_balance()
+            
+            if new_mode == 'futures':
+                # Check minimum futures balance requirement
+                min_futures_balance = self.config['trading'].get('min_futures_balance', 10)
+                if float(current_balance) < min_futures_balance:
+                    return False
+            
+            # Check reserve balance requirement
+            if float(current_balance) < self.reserve_balance:
+                return False
+                
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error checking balance requirements: {e}")
+            return False
+
+    async def prepare_mode_switch(self, new_mode: str) -> bool:
+        """Prepare for mode switch by cleaning up current mode"""
+        try:
+            # Cancel all open orders
+            await self.active_client.cancel_all_orders()
+            
+            # Close all positions if switching from futures
+            if self.trading_mode == 'futures':
+                await self.active_client.close_all_positions()
+            
+            # Clear cached data
+            self.active_client.clear_cache()
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error preparing for mode switch: {e}")
+            return False
+
+    async def switch_mode(self, new_mode: str) -> bool:
+        """Switch trading mode with validation"""
+        try:
+            # Validate mode switch
+            valid, message = await self.validate_mode_switch(new_mode)
+            if not valid:
+                logger.error(f"Mode switch validation failed: {message}")
+                return False
+
+            # Prepare for switch
+            if not await self.prepare_mode_switch(new_mode):
+                return False
+
+            # Update mode
+            self.trading_mode = new_mode
+            
+            # Initialize new client
+            await self.initialize()
+            
+            logger.info(f"Successfully switched to {new_mode} mode")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error switching modes: {e}")
+            return False

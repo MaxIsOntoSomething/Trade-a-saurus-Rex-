@@ -15,6 +15,7 @@ class MongoClient:
         self.orders = self.db.orders
         self.positions = self.db.positions  # Add positions collection
         self.thresholds = self.db.thresholds  # Add thresholds collection
+        self.settings = self.db.settings  # Add settings collection
 
     async def init_indexes(self):
         await self.orders.create_index("order_id", unique=True)
@@ -36,6 +37,12 @@ class MongoClient:
             ("threshold", 1)
         ], unique=True)
         await self.thresholds.create_index("triggered_at")
+        
+        # Add settings indexes
+        await self.settings.create_index([
+            ("category", 1),
+            ("key", 1)
+        ], unique=True)
 
     def _validate_order_data(self, order: Order) -> bool:
         """Validate order data before insertion"""
@@ -127,34 +134,70 @@ class MongoClient:
             return None
 
     async def insert_manual_trade(self, order: Order) -> Optional[str]:
-        """Insert a manually executed trade"""
+        """Insert manually executed trade with consistency checks"""
         try:
-            order_dict = {
-                "symbol": order.symbol,
-                "status": OrderStatus.FILLED.value,  # Always FILLED for manual trades
-                "order_type": order.order_type.value,
-                "price": str(order.price),
-                "quantity": str(order.quantity),
-                "timeframe": order.timeframe.value,
-                "order_id": order.order_id,
-                "created_at": order.created_at,
-                "updated_at": order.updated_at,
-                "filled_at": order.filled_at,
-                "fees": str(order.fees),
-                "fee_asset": order.fee_asset,
-                "threshold": "Manual",  # Add manual threshold marker
-            }
-            
-            # Add futures-specific fields if applicable
-            if order.order_type == OrderType.FUTURES:
-                order_dict.update({
-                    "leverage": order.leverage,
-                    "direction": order.direction.value
-                })
-            
-            result = await self.orders.insert_one(order_dict)
-            return str(result.inserted_id)
-            
+            # Run validation
+            if not self._validate_order_data(order):
+                logger.error("Manual trade validation failed")
+                return None
+
+            # Start transaction
+            async with await self.client.start_session() as session:
+                async with session.start_transaction():
+                    # Check for duplicate order ID
+                    existing = await self.orders.find_one({"order_id": order.order_id})
+                    if (existing):
+                        logger.error("Duplicate order ID detected")
+                        return None
+
+                    order_dict = {
+                        "symbol": order.symbol,
+                        "status": OrderStatus.FILLED.value,
+                        "order_type": order.order_type.value,
+                        "price": str(order.price),
+                        "quantity": str(order.quantity),
+                        "timeframe": order.timeframe.value,
+                        "order_id": order.order_id,
+                        "created_at": order.created_at,
+                        "updated_at": order.updated_at,
+                        "filled_at": order.filled_at,
+                        "fees": str(order.fees),
+                        "fee_asset": order.fee_asset,
+                        "threshold": "Manual",
+                        "metadata": {
+                            "inserted_at": datetime.utcnow(),
+                            "source": "manual_entry",
+                            "version": "1.0"
+                        }
+                    }
+                    
+                    # Add futures-specific fields
+                    if order.order_type == OrderType.FUTURES:
+                        order_dict.update({
+                            "leverage": order.leverage,
+                            "direction": order.direction.value,
+                            "position_risk": {
+                                "max_loss": float(order.quantity * order.price),
+                                "liquidation_price": None  # To be calculated
+                            }
+                        })
+
+                    # Insert order
+                    result = await self.orders.insert_one(order_dict, session=session)
+                    
+                    # Update position if necessary
+                    if order.order_type == OrderType.FUTURES:
+                        await self.track_futures_position(
+                            order.symbol,
+                            order.price,
+                            order.quantity,
+                            order.direction.value,
+                            order.leverage,
+                            session=session
+                        )
+
+                    return str(result.inserted_id)
+
         except Exception as e:
             logger.error(f"Failed to insert manual trade: {e}")
             return None
@@ -661,7 +704,7 @@ class MongoClient:
             return {}
 
     async def track_futures_position(self, symbol: str, price: Decimal, quantity: Decimal, 
-                                   direction: str, leverage: int) -> bool:
+                                   direction: str, leverage: int, session=None) -> bool:
         """Track new futures position or update existing one"""
         try:
             # Get existing position
@@ -687,7 +730,8 @@ class MongoClient:
                             "entry_price": str(avg_entry),
                             "last_updated": datetime.utcnow()
                         }
-                    }
+                    },
+                    session=session
                 )
             else:
                 # Create new position
@@ -705,7 +749,7 @@ class MongoClient:
                         "quantity": str(quantity),
                         "timestamp": datetime.utcnow()
                     }]
-                })
+                }, session=session)
 
             return True
 
@@ -949,5 +993,308 @@ class MongoClient:
         except Exception as e:
             logger.error(f"Error getting weekly thresholds: {e}")
             return []
+
+    async def get_settings(self, category: str = None) -> Dict:
+        """Get settings by category"""
+        try:
+            query = {"category": category} if category else {}
+            cursor = self.settings.find(query)
+            
+            settings = {}
+            async for doc in cursor:
+                if doc["category"] not in settings:
+                    settings[doc["category"]] = {}
+                settings[doc["category"]][doc["key"]] = doc["value"]
+            
+            return settings
+            
+        except Exception as e:
+            logger.error(f"Error getting settings: {e}")
+            return {}
+
+    async def update_setting(self, category: str, key: str, value: Any) -> bool:
+        """Update or create a setting"""
+        try:
+            result = await self.settings.update_one(
+                {"category": category, "key": key},
+                {
+                    "$set": {
+                        "value": value,
+                        "updated_at": datetime.utcnow()
+                    }
+                },
+                upsert=True
+            )
+            return bool(result.modified_count or result.upserted_id)
+            
+        except Exception as e:
+            logger.error(f"Error updating setting: {e}")
+            return False
+
+    async def delete_setting(self, category: str, key: str) -> bool:
+        """Delete a setting"""
+        try:
+            result = await self.settings.delete_one({
+                "category": category,
+                "key": key
+            })
+            return bool(result.deleted_count)
+            
+        except Exception as e:
+            logger.error(f"Error deleting setting: {e}")
+            return False
+
+    async def get_portfolio_history(self, days: int = 30) -> List[Dict]:
+        """Get portfolio value history"""
+        try:
+            cutoff = datetime.utcnow() - timedelta(days=days)
+            
+            pipeline = [
+                {"$match": {
+                    "created_at": {"$gte": cutoff},
+                    "status": "filled"
+                }},
+                {"$group": {
+                    "_id": {
+                        "date": {"$dateToString": {
+                            "format": "%Y-%m-%d", 
+                            "date": "$created_at"
+                        }}
+                    },
+                    "total_value": {
+                        "$sum": {
+                            "$multiply": [
+                                {"$toDecimal": "$price"},
+                                {"$toDecimal": "$quantity"}
+                            ]
+                        }
+                    },
+                    "fees": {"$sum": {"$toDecimal": "$fees"}}
+                }},
+                {"$sort": {"_id.date": 1}}
+            ]
+            
+            results = []
+            async for doc in self.orders.aggregate(pipeline):
+                results.append({
+                    "timestamp": datetime.strptime(doc["_id"]["date"], "%Y-%m-%d"),
+                    "balance": doc["total_value"],
+                    "fees": doc["fees"]
+                })
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error getting portfolio history: {e}")
+            return []
+
+    async def get_fee_metrics(self) -> Dict:
+        """Get comprehensive fee metrics"""
+        try:
+            # Get fee timeline
+            pipeline_timeline = [
+                {"$match": {"status": "filled"}},
+                {"$group": {
+                    "_id": {
+                        "date": {"$dateToString": {
+                            "format": "%Y-%m-%d", 
+                            "date": "$created_at"
+                        }}
+                    },
+                    "fees": {"$sum": {"$toDecimal": "$fees"}}
+                }},
+                {"$sort": {"_id.date": 1}}
+            ]
+            
+            # Get fees by order type
+            pipeline_types = [
+                {"$match": {"status": "filled"}},
+                {"$group": {
+                    "_id": "$order_type",
+                    "total_fees": {"$sum": {"$toDecimal": "$fees"}}
+                }}
+            ]
+            
+            # Execute aggregations
+            timeline = []
+            async for doc in self.orders.aggregate(pipeline_timeline):
+                timeline.append({
+                    "date": datetime.strptime(doc["_id"]["date"], "%Y-%m-%d"),
+                    "fees": doc["fees"]
+                })
+                
+            by_type = {}
+            async for doc in self.orders.aggregate(pipeline_types):
+                by_type[doc["_id"]] = doc["total_fees"]
+                
+            return {
+                "timeline": timeline,
+                "by_type": by_type,
+                "total": sum(float(v) for v in by_type.values())
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting fee metrics: {e}")
+            return {"timeline": [], "by_type": {}, "total": 0}
+
+    async def check_database_consistency(self) -> Dict[str, Any]:
+        """Check database consistency and repair if needed"""
+        try:
+            results = {
+                "checked_collections": 0,
+                "errors_found": 0,
+                "repairs_made": 0,
+                "details": []
+            }
+
+            # Check orders collection
+            orders_result = await self._check_orders_consistency()
+            results["details"].append({"orders": orders_result})
+            results["checked_collections"] += 1
+            results["errors_found"] += orders_result["errors"]
+            results["repairs_made"] += orders_result["repairs"]
+
+            # Check positions collection
+            positions_result = await self._check_positions_consistency()
+            results["details"].append({"positions": positions_result})
+            results["checked_collections"] += 1
+            results["errors_found"] += positions_result["errors"]
+            results["repairs_made"] += positions_result["repairs"]
+
+            return results
+
+        except Exception as e:
+            logger.error(f"Error checking database consistency: {e}")
+            return {
+                "checked_collections": 0,
+                "errors_found": 0,
+                "repairs_made": 0,
+                "error": str(e)
+            }
+
+    async def _check_orders_consistency(self) -> Dict[str, Any]:
+        """Check and repair orders collection consistency"""
+        errors = 0
+        repairs = 0
+        
+        try:
+            # Check for orders with missing required fields
+            missing_fields_query = {
+                "$or": [
+                    {"symbol": {"$exists": False}},
+                    {"status": {"$exists": False}},
+                    {"order_id": {"$exists": False}},
+                    {"created_at": {"$exists": False}}
+                ]
+            }
+            
+            async for order in self.orders.find(missing_fields_query):
+                errors += 1
+                # Can't repair orders with missing essential data
+                await self.orders.delete_one({"_id": order["_id"]})
+                repairs += 1
+
+            # Fix inconsistent numeric values
+            price_query = {
+                "price": {"$type": "string"},
+                "status": OrderStatus.FILLED.value
+            }
+            
+            async for order in self.orders.find(price_query):
+                errors += 1
+                try:
+                    # Convert string prices to Decimal
+                    price = Decimal(order["price"])
+                    quantity = Decimal(order["quantity"])
+                    
+                    await self.orders.update_one(
+                        {"_id": order["_id"]},
+                        {
+                            "$set": {
+                                "price": str(price),
+                                "quantity": str(quantity)
+                            }
+                        }
+                    )
+                    repairs += 1
+                except (DecimalException, ValueError):
+                    # If conversion fails, mark order as error
+                    await self.orders.update_one(
+                        {"_id": order["_id"]},
+                        {
+                            "$set": {
+                                "status": "ERROR",
+                                "error_reason": "Invalid numeric values"
+                            }
+                        }
+                    )
+                    repairs += 1
+
+            return {
+                "errors": errors,
+                "repairs": repairs,
+                "status": "completed"
+            }
+
+        except Exception as e:
+            logger.error(f"Error checking orders consistency: {e}")
+            return {
+                "errors": errors,
+                "repairs": repairs,
+                "status": "error",
+                "error": str(e)
+            }
+
+    async def _check_positions_consistency(self) -> Dict[str, Any]:
+        """Check and repair positions collection consistency"""
+        errors = 0
+        repairs = 0
+        
+        try:
+            # Find positions with mismatched status
+            status_query = {
+                "status": "OPEN",
+                "positionAmt": "0"
+            }
+            
+            async for position in self.positions.find(status_query):
+                errors += 1
+                await self.positions.update_one(
+                    {"_id": position["_id"]},
+                    {"$set": {"status": "CLOSED"}}
+                )
+                repairs += 1
+
+            # Verify position calculations
+            async for position in self.positions.find({"status": "OPEN"}):
+                try:
+                    # Recalculate position values
+                    trades = position.get("trades", [])
+                    if trades:
+                        total_quantity = sum(Decimal(t["quantity"]) for t in trades)
+                        if total_quantity != Decimal(position["positionAmt"]):
+                            errors += 1
+                            await self.positions.update_one(
+                                {"_id": position["_id"]},
+                                {"$set": {"positionAmt": str(total_quantity)}}
+                            )
+                            repairs += 1
+                except Exception as calc_error:
+                    logger.error(f"Error calculating position values: {calc_error}")
+                    errors += 1
+
+            return {
+                "errors": errors,
+                "repairs": repairs,
+                "status": "completed"
+            }
+
+        except Exception as e:
+            logger.error(f"Error checking positions consistency: {e}")
+            return {
+                "errors": errors,
+                "repairs": repairs,
+                "status": "error",
+                "error": str(e)
+            }
 
     # ...rest of existing code...
