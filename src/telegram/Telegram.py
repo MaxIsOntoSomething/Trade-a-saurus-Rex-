@@ -948,7 +948,7 @@ class TradeCommandManager:
                     order.leverage
                 )
                 order_info.append(
-                    f"• Stop Loss: ${float(order.sl_price):.2f} (P/L: ${sl_pnl:+.2f})"
+                    f"• Stop Loss: ${float(order.sl_price):,.2f} (P/L: ${sl_pnl:+.2f})"
                 )
 
             formatted.extend(order_info)
@@ -2239,66 +2239,32 @@ class AutomationManager:
                 reference = price_data["reference_price"]
                 change = price_data["price_change"]
                 
-                message_parts.append(
+                price_info = (
                     f"\n{symbol}:"
                     f"\n• Previous Open: ${reference:,.2f}"
                     f"\n• Current Price: ${current:,.2f}"
                     f"\n• Change: {change:+.2f}%"
                 )
+                message_parts.append(price_info)
             
             message_parts.append(f"\n\nAll {timeframe.value} thresholds have been reset.")
             message_parts.append("\nUse /thresholds to see new tracking status.")
+            
+            # Join all message parts
+            final_message = "\n".join(message_parts)
             
             # Send to all authorized users
             for user_id in self.bot.allowed_users:
                 try:
                     await self.bot.app.bot.send_message(
                         chat_id=user_id,
-                        text="\n".join(message_parts),
+                        text=final_message,
                         reply_markup=self.bot.markup
                     )
                 except Exception as e:
                     logger.error(f"Failed to send reset notification to {user_id}: {e}")
-                    
         except Exception as e:
             logger.error(f"Failed to send timeframe reset notification: {e}")
-
-    async def send_threshold_notification(self, symbol: str, timeframe: TimeFrame, 
-                                       threshold: float, current_price: float,
-                                       reference_price: float, price_change: float):
-        """Send notification when a threshold is triggered"""
-        message = (
-            f"{self.bot.env_info}\n\n"
-            f"🎯 Threshold Triggered!\n\n"
-            f"Symbol: {symbol}\n"
-            f"Timeframe: {timeframe.value}\n"
-            f"Threshold: {threshold}%\n"
-            f"Reference Price: ${reference_price:,.2f}\n"
-            f"Current Price: ${current_price:,.2f}\n"
-            f"Change: {price_change:+.2f}%"
-        )
-        
-        for user_id in self.bot.allowed_users:
-            try:
-                await self.bot.app.bot.send_message(
-                    chat_id=user_id,
-                    text=message,
-                    reply_markup=self.bot.markup
-                )
-            except Exception as e:
-                logger.error(f"Failed to send threshold notification to {user_id}: {e}")
-
-    def _get_timeframe_value(self, timeframe: TimeFrame) -> str:
-        """Convert TimeFrame enum to display string"""
-        if not timeframe:
-            return "N/A"
-            
-        display_map = {
-            TimeFrame.DAILY: "Daily",
-            TimeFrame.WEEKLY: "Weekly",
-            TimeFrame.MONTHLY: "Monthly"
-        }
-        return display_map.get(timeframe, str(timeframe))
 
     async def generate_weekly_summary(self):
         """Generate and send comprehensive weekly summary"""
@@ -2397,7 +2363,7 @@ class AutomationManager:
                 f"• Values: {', '.join(triggered_values)}"
             ])
             
-        return "\n".join(summary)
+        return "\n.join(summary)
         
     async def _generate_pair_analysis(self, trades: List[Order]) -> str:
         """Generate trading pair analysis"""
@@ -2477,7 +2443,7 @@ class AutomationManager:
                 f"• Futures: ${float(futures_value):,.2f} ({futures_percentage:.1f}%)"
             ]
             
-            return "\n".join(summary)
+            return "\n.join(summary)
             
         except Exception as e:
             logger.error(f"Error generating equity report: {e}")
