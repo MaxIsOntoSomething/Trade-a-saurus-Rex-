@@ -3,9 +3,11 @@
 .env
 .github/copilot-instructions.md
 **/__pycache__/
+**/*.pyc
 src/database/__pycache__/
 src/telegram/__pycache__/
 src/trading/__pycache__/
 src/types/__pycache__/
 src/utils/__pycache__/
 .github/bot_backup_old.py
+
