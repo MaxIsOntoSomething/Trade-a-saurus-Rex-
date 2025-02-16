@@ -20,7 +20,7 @@ if sys.platform == 'win32':
 from dotenv import load_dotenv
 from src.trading.binance_client import BinanceClient
 from src.database.mongo_client import MongoClient
-from src.telegram.bot import TelegramBot, DINO_ASCII
+from src.telegram.Telegram import TelegramBot, DINO_ASCII  # Updated import
 from src.trading.order_manager import OrderManager
 from src.utils.logger import setup_logging
 from src.trading.futures_client import FuturesClient
