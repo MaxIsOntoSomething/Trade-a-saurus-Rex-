@@ -1297,4 +1297,46 @@ class MongoClient:
                 "error": str(e)
             }
 
+    async def get_orders_for_chart(self, days: int = 30, mode: str = 'both') -> List[Order]:
+        """
+        Get orders for chart visualization with mode filtering
+        
+        Args:
+            days: Number of days to look back
+            mode: Filter mode - 'spot', 'futures', or 'both'
+            
+        Returns:
+            List of Order objects
+        """
+        try:
+            # Calculate cutoff date
+            cutoff_date = datetime.utcnow() - timedelta(days=days)
+            
+            # Build query
+            query = {
+                "created_at": {"$gte": cutoff_date},
+                "status": {"$in": [OrderStatus.FILLED.value, OrderStatus.CANCELLED.value]}
+            }
+            
+            # Add order type filter if needed
+            if mode == 'spot':
+                query["order_type"] = OrderType.SPOT.value
+            elif mode == 'futures':
+                query["order_type"] = OrderType.FUTURES.value
+            
+            # Get orders
+            cursor = self.orders.find(query).sort("created_at", 1)
+            orders = []
+            
+            async for doc in cursor:
+                order = self._document_to_order(doc)
+                if order:
+                    orders.append(order)
+                
+            return orders
+            
+        except Exception as e:
+            logger.error(f"Error getting orders for chart: {e}")
+            return []
+
     # ...rest of existing code...

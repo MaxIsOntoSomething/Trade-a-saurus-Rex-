@@ -14,6 +14,7 @@ from ..types.models import Order, OrderType, TradeDirection, TimeFrame  # Added 
 import mplfinance as mpf
 import numpy as np
 import seaborn as sns
+from io import BytesIO
 
 logger = logging.getLogger(__name__)
 
@@ -551,7 +552,7 @@ class ChartGenerator:
             if reference_price is not None:
                 order_price = Decimal(str(order.price))
                 change = ((order_price - reference_price) / reference_price) * Decimal('100')
-                info.append(f"Reference Price: ${float(reference_price):.2f} ({float(change):+.2f}%)")
+            info.append(f"Reference Price: ${float(reference_price):.2f} ({float(change):+.2f}%)")
                 
             info.extend([
                 f"Amount: {float(order.quantity):.8f}",
@@ -747,3 +748,127 @@ class PortfolioVisualizer:
         except Exception as e:
             print(f"Error generating fee metrics: {e}")
             return None
+
+    def generate_equity_curve(self, balance_history: List[Dict], orders: List = None) -> bytes:
+        """
+        Generate equity curve with orders marked
+        
+        Args:
+            balance_history: List of balance history points
+            orders: Optional list of orders to mark on the chart
+            
+        Returns:
+            Chart as bytes
+        """
+        try:
+            # Create figure
+            plt.figure(figsize=(12, 7))
+            
+            # Extract dates and balances
+            dates = [datetime.fromisoformat(entry['date']) for entry in balance_history]
+            balances = [float(entry['balance']) for entry in balance_history]
+            
+            # Plot equity curve
+            plt.plot(dates, balances, 'b-', linewidth=2, label='Account Balance')
+            
+            # Mark orders if provided
+            if orders:
+                # Group orders by type
+                spot_orders = [o for o in orders if o.order_type.value == 'spot']
+                futures_orders = [o for o in orders if o.order_type.value == 'futures']
+                
+                # Plot spot orders
+                if spot_orders:
+                    spot_dates = [o.created_at for o in spot_orders]
+                    spot_markers = [self._get_balance_at_date(balance_history, o.created_at) for o in spot_orders]
+                    plt.scatter(spot_dates, spot_markers, color='green', marker='^', s=80, label='Spot Orders', zorder=5)
+                
+                # Plot futures orders
+                if futures_orders:
+                    futures_dates = [o.created_at for o in futures_orders]
+                    futures_markers = [self._get_balance_at_date(balance_history, o.created_at) for o in futures_orders]
+                    plt.scatter(futures_dates, futures_markers, color='orange', marker='*', s=100, label='Futures Orders', zorder=5)
+            
+            # Format chart
+            plt.title('Account Equity Curve', fontsize=16)
+            plt.xlabel('Date', fontsize=12)
+            plt.ylabel('Balance (USDT)', fontsize=12)
+            plt.grid(True, alpha=0.3)
+            
+            # Format y-axis with dollar signs
+            plt.gca().yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'${x:,.2f}'))
+            
+            # Add legend
+            plt.legend(loc='upper left')
+            
+            # Add annotations for key metrics
+            if len(balances) > 1:
+                start_balance = balances[0]
+                end_balance = balances[-1]
+                change_pct = ((end_balance - start_balance) / start_balance) * 100
+                
+                plt.annotate(
+                    f'Start: ${start_balance:,.2f}\nEnd: ${end_balance:,.2f}\nChange: {change_pct:+.2f}%',
+                    xy=(0.02, 0.95),
+                    xycoords='axes fraction',
+                    bbox=dict(boxstyle="round,pad=0.5", fc="white", alpha=0.8),
+                    fontsize=10
+                )
+            
+            # Adjust layout
+            plt.tight_layout()
+            
+            # Save to bytes
+            buf = BytesIO()
+            plt.savefig(buf, format='png', dpi=100)
+            buf.seek(0)
+            plt.close()
+            
+            return buf.getvalue()
+            
+        except Exception as e:
+            logger.error(f"Error generating equity curve: {e}")
+            # Generate error chart
+            return self._generate_error_chart(f"Error generating equity curve: {str(e)}")
+
+    def _get_balance_at_date(self, balance_history: List[Dict], target_date: datetime) -> float:
+        """
+        Get balance at a specific date by finding the closest entry
+        
+        Args:
+            balance_history: List of balance history points
+            target_date: Target date to find balance for
+            
+        Returns:
+            Balance value
+        """
+        # Convert all dates to datetime objects if they're strings
+        history = [
+            {
+                'date': datetime.fromisoformat(entry['date']) if isinstance(entry['date'], str) else entry['date'],
+                'balance': float(entry['balance'])
+            }
+            for entry in balance_history
+        ]
+        
+        # Sort by date
+        history.sort(key=lambda x: x['date'])
+        
+        # Find closest date
+        closest_entry = min(history, key=lambda x: abs((x['date'] - target_date).total_seconds()))
+        
+        return closest_entry['balance']
+
+    def _generate_error_chart(self, message: str) -> bytes:
+        """Generate a simple error chart"""
+        plt.figure(figsize=(10, 6))
+        plt.text(0.5, 0.5, message, ha='center', va='center', fontsize=14)
+        plt.axis('off')
+        
+        # Save to bytes
+        buf = BytesIO()
+        plt.savefig(buf, format='png', dpi=100)
+        buf.seek(0)
+        plt.close()
+        
+        return buf.getvalue()
