@@ -1,0 +1,12 @@
+
+Core Commands (10):
+1. /menu or /start - Main command menu with inline buttons
+2. /trade - Trading operations menu
+3. /account - Account information menu
+4. /settings - Bot configuration menu
+5. /stats - Trading statistics menu
+6. /charts - Chart visualization menu
+7. /power - Toggle trading on/off
+8. /status - Display current bot status
+9. /help - Show help information
+10. /admin - Admin commands menu

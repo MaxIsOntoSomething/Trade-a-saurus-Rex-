@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 import logging
 from typing import Dict, Optional, Tuple, List, Union, Any
 from ..types.models import Order, OrderStatus, TimeFrame, OrderType, TradeDirection
-from ..types.constants import TIMEFRAME_INTERVALS
+from ..types.constants import TIMEFRAME_INTERVALS, safe_decimal
 from ..utils.chart_generator import ChartGenerator  # Add this import
 import asyncio
 import time
@@ -233,6 +233,10 @@ class FuturesClient:
             if not await self._sync_time(force=True):
                 raise ConnectionError("Failed to synchronize time with server")
 
+            # Initialize storage for invalid symbols
+            self._invalid_symbols = set()
+            self._symbol_mappings = {}
+
             # Get exchange info
             try:
                 exchange_info = await asyncio.get_event_loop().run_in_executor(
@@ -265,6 +269,11 @@ class FuturesClient:
                          margin_type: Optional[str] = None) -> bool:
         """Setup symbol-specific configurations with improved error handling"""
         try:
+            # Skip if already known to be invalid
+            if hasattr(self, '_invalid_symbols') and symbol in self._invalid_symbols:
+                logger.info(f"Skipping setup for known invalid futures symbol: {symbol}")
+                return False
+            
             target_leverage = leverage or self.default_leverage
             target_margin = (margin_type or self.default_margin_type).upper()
             
@@ -321,6 +330,14 @@ class FuturesClient:
                 
             return True
 
+        except BinanceAPIException as e:
+            if e.code == -4141:  # Symbol is closed
+                logger.error(f"Error in setup_symbol for {symbol}: {e}")
+                # Add to invalid symbols list
+                if not hasattr(self, '_invalid_symbols'):
+                    self._invalid_symbols = set()
+                self._invalid_symbols.add(symbol)
+            return False
         except Exception as e:
             logger.error(f"Error in setup_symbol for {symbol}: {e}")
             return False
@@ -411,8 +428,18 @@ class FuturesClient:
                                 signal_price: Optional[float] = None,
                                 threshold: Optional[float] = None,
                                 timeframe: Optional[TimeFrame] = None) -> Optional[Order]:
-        """Place a futures order with TP/SL support"""
+        """Place a futures order with TP/SL support and symbol validation"""
         try:
+            # Skip if already known to be invalid
+            if hasattr(self, '_invalid_symbols') and symbol in self._invalid_symbols:
+                logger.info(f"Skipping order for known invalid futures symbol: {symbol}")
+                return None
+
+            # Validate symbol first
+            if not await self.validate_futures_symbol(symbol):
+                logger.warning(f"Skipping order for invalid or closed symbol: {symbol}")
+                return None
+
             # Check reserve balance first
             if not await self.check_reserve_balance(amount):
                 logger.error("Order would violate reserve balance")
@@ -582,6 +609,17 @@ class FuturesClient:
             )
             return order
 
+        except KeyError as e:
+            logger.error(f"Failed to place futures order: {e}")
+            return None
+        except BinanceAPIException as e:
+            # Special handling for invalid symbol
+            if e.code == -1121:  # Invalid symbol
+                if not hasattr(self, '_invalid_symbols'):
+                    self._invalid_symbols = set()
+                self._invalid_symbols.add(symbol)
+            logger.error(f"Failed to place futures order: {e}")
+            return None
         except Exception as e:
             logger.error(f"Failed to place futures order: {e}")
             return None
@@ -758,23 +796,136 @@ class FuturesClient:
             return None
 
     async def get_symbol_ticker(self, symbol: str) -> Dict:
-        """Get futures market price for symbol"""
+        """Get symbol ticker with better error handling for invalid symbols"""
         try:
-            # Use mark price instead of ticker_price for futures
-            ticker = self.client.mark_price(symbol=symbol)
-            return {
-                'symbol': symbol,
-                'price': ticker['markPrice']
-            }
+            # First check if we already know this is an invalid symbol
+            if hasattr(self, '_invalid_symbols') and symbol in self._invalid_symbols:
+                logger.info(f"Skipping known invalid futures symbol: {symbol}")
+                return {'symbol': symbol, 'price': None}
+                
+            # FIXED: Use symbol_ticker method instead of futures_symbol_ticker
+            # The UMFutures client uses `ticker_price` not `futures_symbol_ticker`
+            ticker = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: self.client.ticker_price(symbol=symbol)
+            )
+            return ticker
         except BinanceAPIException as e:
+            # Handle invalid symbol error
             if e.code == -1121:  # Invalid symbol
-                logger.error(f"Invalid symbol: {symbol}")
-            else:
                 logger.error(f"Failed to get futures ticker: {e}")
-            raise
+                # Add to invalid symbols list
+                if not hasattr(self, '_invalid_symbols'):
+                    self._invalid_symbols = set()
+                self._invalid_symbols.add(symbol)
+            elif e.code == -4141:  # Symbol is closed
+                logger.error(f"Symbol is closed: {symbol}")
+                # Add to invalid symbols list
+                if not hasattr(self, '_invalid_symbols'):
+                    self._invalid_symbols = set()
+                self._invalid_symbols.add(symbol)
+            else:
+                logger.error(f"Error getting futures ticker: {e}")
+                
+            # Return a standardized response with None price
+            return {'symbol': symbol, 'price': None}
         except Exception as e:
-            logger.error(f"Failed to get futures ticker: {e}")
-            raise
+            logger.error(f"Unexpected error getting futures ticker: {e}")
+            return {'symbol': symbol, 'price': None}
+
+    def _save_invalid_symbol(self, symbol: str) -> None:
+        """Save invalid symbol to persistence to avoid future lookups"""
+        try:
+            # Store in memory
+            self._invalid_symbols.add(symbol)
+            
+            # If we have a MongoDB client through telegram_bot, store persistently
+            if hasattr(self, 'telegram_bot') and hasattr(self.telegram_bot, 'mongo_client'):
+                # Use asyncio to run this in background without awaiting
+                asyncio.create_task(self._save_invalid_symbol_to_db(symbol))
+        except Exception as e:
+            logger.error(f"Error saving invalid symbol: {e}")
+
+    async def _save_invalid_symbol_to_db(self, symbol: str, reason: str = "invalid") -> None:
+        """Save invalid symbol to database with reason"""
+        try:
+            if not hasattr(self, 'telegram_bot') or not hasattr(self, 'telegram_bot', 'mongo_client'):
+                logger.debug(f"MongoDB client not available, can't save invalid symbol {symbol}")
+                return
+                
+            mongo_client = self.telegram_bot.mongo_client
+            # Check if collection exists, create it if needed
+            if 'invalid_symbols' not in await mongo_client.db.list_collection_names():
+                await mongo_client.db.create_collection('invalid_symbols')
+                # Create index for faster lookups
+                await mongo_client.db.invalid_symbols.create_index("symbol", unique=True)
+                
+            # Insert the invalid symbol with mode information
+            await mongo_client.db.invalid_symbols.update_one(
+                {'symbol': symbol, 'mode': 'futures'},
+                {'$set': {
+                    'symbol': symbol,
+                    'mode': 'futures',
+                    'reason': reason,
+                    'timestamp': datetime.utcnow(),
+                    'attempts': 1
+                }},
+                upsert=True
+            )
+        except Exception as e:
+            logger.error(f"Error saving invalid symbol to database: {e}")
+
+    async def _load_invalid_symbols(self) -> None:
+        """Load previously identified invalid symbols from database"""
+        try:
+            if not hasattr(self, 'telegram_bot') or not hasattr(self, 'telegram_bot', 'mongo_client'):
+                logger.debug("MongoDB client not available, skipping loading invalid symbols")
+                return
+                
+            mongo_client = self.telegram_bot.mongo_client
+            if 'invalid_symbols' not in await mongo_client.db.list_collection_names():
+                return
+                
+            # Get invalid symbols for current mode
+            current_mode = 'futures' if hasattr(self, 'client') and isinstance(self.client, UMFutures) else 'spot'
+            cursor = mongo_client.db.invalid_symbols.find({'mode': current_mode})
+            
+            # Add to in-memory set
+            self._invalid_symbols = set()
+            async for doc in cursor:
+                self._invalid_symbols.add(doc['symbol'])
+                
+            logger.info(f"Loaded {len(self._invalid_symbols)} invalid symbols from database")
+        except Exception as e:
+            logger.error(f"Error loading invalid symbols: {e}")
+
+    def _convert_to_futures_symbol(self, symbol: str) -> str:
+        """Convert standard symbol to futures format if needed"""
+        # First check if we have a known mapping for this symbol
+        if symbol in self._symbol_mappings:
+            return self._symbol_mappings[symbol]
+        
+        # If symbol is already in symbol_info, it's correctly formatted
+        if symbol in self.symbol_info:
+            return symbol
+            
+        # For Binance futures, try these common formats
+        alternatives = [
+            symbol,                   # Original format
+            symbol + 'USDT',          # Add USDT suffix if not present
+            symbol + 'BUSD',          # Try BUSD suffix
+            symbol.replace('USDT', '') + 'USDT',  # Fix potential duplicate suffix
+            f"{symbol}_PERP"          # Try _PERP suffix for some exchanges
+        ]
+        
+        # Try each alternative that's not already in invalid symbols
+        for alt in alternatives:
+            if alt not in self._invalid_symbols and alt in self.symbol_info:
+                # Remember this mapping
+                self._symbol_mappings[symbol] = alt
+                return alt
+                
+        # Default to original format if no alternative works
+        return symbol
 
     async def get_account_info(self) -> Dict:
         """Get futures account information with proper error handling"""
@@ -830,32 +981,62 @@ class FuturesClient:
             await self.client.close_connection()
 
     async def update_reference_prices(self, symbols: List[str]):
-        """Update reference prices for futures market"""
+        """Update reference prices for futures market with improved error handling for invalid symbols"""
         try:
+            valid_symbols = []
             for symbol in symbols:
-                if (symbol not in self.reference_prices):
+                # First check if symbol is already known to be invalid
+                if symbol in self._invalid_symbols:
+                    logger.info(f"Skipping known invalid symbol: {symbol}")
+                    continue
+                    
+                # Initialize data structures if needed
+                if symbol not in self.reference_prices:
                     self.reference_prices[symbol] = {}
                     self.triggered_thresholds[symbol] = {tf: [] for tf in TimeFrame}
 
-                # Use ticker_price instead of futures_symbol_ticker
-                ticker = self.client.ticker_price(symbol=symbol)
-                current_price = float(ticker.get('price', 0))
-
-                logger.info(f"\n=== Checking {symbol} ===")
-                logger.info(f"Current futures price for {symbol}: ${current_price:,.2f}")
-
-                for timeframe in TimeFrame:
-                    logger.info(f"  ▶ Getting {timeframe.value} futures reference price")
-                    ref_price = await self.get_reference_price(symbol, timeframe)
+                # Try to get current price to verify symbol validity
+                try:
+                    ticker_result = await self.get_symbol_ticker(symbol=symbol)
                     
-                    if (ref_price is not None):
-                        self.reference_prices[symbol][timeframe] = ref_price
+                    if ticker_result.get('price') is None:
+                        logger.warning(f"Symbol {symbol} appears to be invalid, skipping")
+                        # The get_symbol_ticker method already adds to invalid_symbols
+                        continue
+                        
+                    current_price = float(ticker_result['price'])
+                    valid_symbols.append(symbol)
+                    
+                    # Print symbol header and current price together
+                    logger.info(f"\n=== Checking {symbol} ===")
+                    logger.info(f"Current futures price for {symbol}: ${current_price:,.2f}")
+
+                    # Process each timeframe
+                    for timeframe in TimeFrame:
+                        logger.info(f"  ▶ Getting {timeframe.value} futures reference price")
+                        ref_price = await self.get_reference_price(symbol, timeframe)
+                        
+                        if (ref_price is not None):
+                            self.reference_prices[symbol][timeframe] = ref_price
+                        else:
+                            logger.warning(f"    Using current futures price as {timeframe.value} reference")
+                            self.reference_prices[symbol][timeframe] = current_price
+                            
+                except BinanceAPIException as e:
+                    if e.code == -1121:  # Invalid symbol
+                        logger.warning(f"Invalid symbol: {symbol}. Adding to invalid symbols list.")
+                        self._invalid_symbols.add(symbol)
+                        self._save_invalid_symbol(symbol)
                     else:
-                        logger.warning(f"    Using current futures price as {timeframe.value} reference")
-                        self.reference_prices[symbol][timeframe] = current_price
+                        logger.error(f"Error getting ticker for {symbol}: {e}")
+                except Exception as e:
+                    logger.error(f"Unexpected error processing {symbol}: {e}")
 
+                # Add small delay between symbols
                 await asyncio.sleep(0.1)
-
+                
+            logger.info(f"Successfully updated reference prices for {len(valid_symbols)} symbols")
+            
         except Exception as e:
             logger.error(f"Failed to update futures prices: {e}", exc_info=True)
             raise
@@ -960,9 +1141,32 @@ class FuturesClient:
         return False
 
     async def get_current_price(self, symbol: str) -> Optional[float]:
-        """Get current futures price with error handling"""
+        """Get current futures price with improved error handling"""
         try:
-            ticker = self.client.ticker_price(symbol=symbol)
+            ticker = await self.get_symbol_ticker(symbol=symbol)
+            
+            # Check if price is None (invalid symbol or other error)
+            if ticker.get('price') is None:
+                logger.warning(f"No price available for {symbol}: {ticker.get('error', 'Unknown error')}")
+                # Add to invalid symbols if we get multiple failures
+                if not hasattr(self, '_price_failure_count'):
+                    self._price_failure_count = {}
+                
+                self._price_failure_count[symbol] = self._price_failure_count.get(symbol, 0) + 1
+                
+                # If we've failed 3+ times, add to invalid symbols
+                if self._price_failure_count[symbol] >= 3:
+                    logger.info(f"Adding {symbol} to invalid symbols after multiple price failures")
+                    if not hasattr(self, '_invalid_symbols'):
+                        self._invalid_symbols = set()
+                    self._invalid_symbols.add(symbol)
+                    
+                return None
+                
+            # Reset failure count on success
+            if hasattr(self, '_price_failure_count') and symbol in self._price_failure_count:
+                self._price_failure_count[symbol] = 0
+                
             return float(ticker['price'])
         except Exception as e:
             logger.error(f"Error getting futures price for {symbol}: {e}")
@@ -1023,27 +1227,39 @@ class FuturesClient:
             raise
 
     async def process_symbol(self, symbol: str):
-        """Process symbol with futures pricing"""
+        """Process symbol with futures pricing and better error handling"""
         try:
-            # Use synchronous mark_price method
-            ticker = self.client.ticker_price(symbol=symbol)
-            current_price = float(ticker['price'])
+            # First check if symbol is invalid
+            if symbol in self._invalid_symbols:
+                logger.info(f"Skipping known invalid symbol: {symbol}")
+                return None
+                
+            # Try to get ticker information
+            ticker_result = await self.get_symbol_ticker(symbol=symbol)
+            if ticker_result.get('price') is None:
+                logger.warning(f"Symbol {symbol} appears to be invalid, skipping further processing")
+                return None
+                
+            current_price = float(ticker_result['price'])
             
-            # Update reference prices
+            # Update reference prices (this method now handles invalid symbols)
             await self.update_reference_prices([symbol])
             
-            # Check timeframes
-            for timeframe in TimeFrame:
-                await self.check_timeframe_reset(timeframe)
-                thresholds = await self.check_thresholds(symbol, timeframe)
-                if thresholds:
-                    logger.info(f"Thresholds triggered for {symbol}: {thresholds}")
-                    
-            return current_price
-            
+            # Check timeframes only if symbol is valid
+            if symbol not in self._invalid_symbols:
+                for timeframe in TimeFrame:
+                    await self.check_timeframe_reset(timeframe)
+                    thresholds = await self.check_thresholds(symbol, timeframe)
+                    if thresholds:
+                        logger.info(f"Thresholds triggered for {symbol}: {thresholds}")
+                        
+                return current_price
+            return None
+                
         except Exception as e:
             logger.error(f"Error processing symbol {symbol}: {e}")
-            raise
+            # Don't raise here to continue processing other symbols
+            return None
 
     async def get_balance(self, symbol: str = 'USDT') -> Decimal:
         """Get futures wallet balance with proper time sync"""
@@ -1098,7 +1314,7 @@ class FuturesClient:
                 logger.info("[INIT] Reserve balance defaulting to $500.00")
             else:
                 parsed_value = float(value)
-                if parsed_value < 0:
+                if (parsed_value < 0):
                     self._reserve_balance = 500
                     logger.warning("[INIT] Negative reserve balance not allowed, using default $500.00")
                 else:
@@ -1284,3 +1500,95 @@ class FuturesClient:
         except Exception as e:
             logger.error(f"Error calculating trade amount: {e}")
             return 100.0  # Default fallback amount
+
+    async def send_timeframe_reset_notification(self, data: Dict) -> None:
+        """Send timeframe reset notification to Telegram bot"""
+        if not self.telegram_bot:
+            return
+            
+        try:
+            timeframe = data.get('timeframe')
+            prices = data.get('prices', [])
+            
+            # Filter out prices with None values
+            valid_prices = [p for p in prices if p.get('current_price') is not None and p.get('reference_price') is not None]
+            
+            if not valid_prices:
+                logger.warning(f"No valid prices to send in timeframe reset notification for {timeframe}")
+                return
+                
+            # Format message
+            message = f"🔄 {timeframe.value.capitalize()} timeframe reset\n\n"
+            
+            for price_data in valid_prices:
+                symbol = price_data.get('symbol')
+                current = price_data.get('current_price')
+                reference = price_data.get('reference_price')
+                change = price_data.get('price_change')
+                
+                # Skip if any value is None
+                if None in (symbol, current, reference, change):
+                    continue
+                    
+                # Add price info to message
+                message += (
+                    f"{symbol}: ${current:.2f}\n"
+                    f"Reference: ${reference:.2f}\n"
+                    f"Change: {change:+.2f}%\n\n"
+                )
+                
+            # Send message
+            await self.telegram_bot.send_message(message)
+            
+        except Exception as e:
+            logger.error(f"Error sending timeframe reset notification: {e}")
+
+    # Add an improved symbol validation method
+    async def validate_futures_symbol(self, symbol: str) -> bool:
+        """Validate if a symbol is available in futures market"""
+        # First check our cached invalid symbols list
+        if hasattr(self, '_invalid_symbols') and symbol in self._invalid_symbols:
+            logger.debug(f"Symbol {symbol} is known to be invalid, skipping validation")
+            return False
+            
+        # Then check if we have exchange info for this symbol
+        if hasattr(self, 'exchange_info') and 'symbols' in self.exchange_info:
+            valid_symbols = {s['symbol'] for s in self.exchange_info['symbols']}
+            if symbol in valid_symbols:
+                return True
+                
+        # If not found in cache or we need to check with the server
+        try:
+            # Use ticker_price instead of futures_ticker which doesn't exist
+            ticker = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: self.client.ticker_price(symbol=symbol)
+            )
+            # If we get here, the symbol is valid
+            return True
+        except BinanceAPIException as e:
+            # Handle common error codes
+            if e.code == -1121:  # Invalid symbol
+                logger.warning(f"Invalid futures symbol: {symbol}")
+                # Add to invalid symbols cache
+                if not hasattr(self, '_invalid_symbols'):
+                    self._invalid_symbols = set()
+                self._invalid_symbols.add(symbol)
+                # Store persistently
+                asyncio.create_task(self._save_invalid_symbol_to_db(symbol))
+                return False
+            elif e.code == -4141:  # Symbol is closed
+                logger.warning(f"Symbol is closed: {symbol}")
+                # Add to invalid symbols cache
+                if not hasattr(self, '_invalid_symbols'):
+                    self._invalid_symbols = set()
+                self._invalid_symbols.add(symbol)
+                # Store persistently 
+                asyncio.create_task(self._save_invalid_symbol_to_db(symbol, "closed"))
+                return False
+            else:
+                # Other API errors might be temporary, don't invalidate symbol
+                logger.error(f"Error checking futures symbol {symbol}: {e}")
+                raise
+        except Exception as e:
+            logger.error(f"Unexpected error validating futures symbol {symbol}: {e}")
+            return False

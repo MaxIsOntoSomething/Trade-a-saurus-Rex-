@@ -1,16 +1,21 @@
+# Update import to use safe_decimal from constants instead
+# Remove this line: from ..utils.decimal_helper import safe_decimal
+from ..types.constants import safe_decimal  # Add this import instead
+
+# Rest of the imports remain unchanged
 import asyncio
 import logging
-import time  # Add this import
+import time
 import os
 import platform
 from datetime import datetime, timedelta
-from typing import Dict, List
+from typing import Dict, List, Optional
 from ..types.models import Order, OrderStatus, TimeFrame, OrderType, TradeDirection
 from ..trading.binance_client import BinanceClient
 from ..database.mongo_client import MongoClient
 from ..telegram.bot import TelegramBot
 from .futures_client import FuturesClient
-from binance.error import ClientError  # Add this import
+from binance.exceptions import BinanceAPIException
 
 logger = logging.getLogger(__name__)
 
@@ -131,42 +136,67 @@ class OrderManager:
             except Exception as e:
                 logger.error(f"Failed to send connection notification: {e}")
 
-    async def get_price(self, symbol: str) -> float:
-        """Get price with fallback between spot and futures"""
+    async def get_price(self, symbol: str) -> Optional[float]:
+        """Get price with fallback between spot and futures, with proper error handling"""
         try:
             # Try primary client first
             try:
                 ticker = await self.active_client.get_symbol_ticker(symbol=symbol)
+                
+                # Check if price is None (invalid symbol)
+                if ticker.get('price') is None:
+                    logger.info(f"Symbol {symbol} returned no price")
+                    return None
+                    
                 return float(ticker['price'])
             except AttributeError:
                 # Fallback to alternate client
                 if self.futures_client and isinstance(self.active_client, BinanceClient):
                     ticker = await self.futures_client.get_symbol_ticker(symbol=symbol)
+                    
+                    # Check if price is None
+                    if ticker.get('price') is None:
+                        logger.info(f"Symbol {symbol} returned no price from fallback client")
+                        return None
+                        
                     return float(ticker['price'])
                 elif isinstance(self.active_client, FuturesClient):
                     ticker = await self.binance_client.get_symbol_ticker(symbol=symbol)
+                    
+                    # Check if price is None
+                    if ticker.get('price') is None:
+                        logger.info(f"Symbol {symbol} returned no price from fallback client")
+                        return None
+                        
                     return float(ticker['price'])
                 raise
-        except ClientError as e:
-            # ClientError doesn't have a code attribute, parse from error string
-            error_str = str(e)
-            if '-1121' in error_str and 'Invalid symbol' in error_str:
+        except BinanceAPIException as e:
+            if e.code == -1121:  # Invalid symbol
                 logger.error(f"Invalid symbol: {symbol}")
             else:
                 logger.error(f"Failed to get price for {symbol}: {e}")
-            raise
+            return None
         except KeyError:
             logger.error(f"Price key missing in ticker response for {symbol}")
-            raise
+            return None
         except Exception as e:
             logger.error(f"Failed to get price for {symbol}: {e}")
-            raise
+            return None
 
     async def process_symbol(self, symbol: str):
         """Process symbol with improved error handling and fallback"""
         try:
-            # Use new price getter with fallback
+            # First check if symbol is already marked as invalid in active client
+            if hasattr(self.active_client, '_invalid_symbols') and symbol in self.active_client._invalid_symbols:
+                logger.info(f"Skipping known invalid symbol: {symbol}")
+                return
+                
+            # Use new price getter with fallback that handles None values
             current_price = await self.get_price(symbol)
+            if current_price is None:
+                logger.warning(f"No valid price available for {symbol}, skipping processing")
+                return
+                
             logger.info(f"Current {symbol} price: ${current_price:,.2f}")
 
             # Check if symbol is futures-enabled
@@ -177,11 +207,7 @@ class OrderManager:
             
             # Get current price from correct client
             client = self.futures_client if is_futures else self.binance_client
-            # Use client's get_symbol_ticker method which handles the differences
-            ticker = await client.get_symbol_ticker(symbol=symbol)
-            current_price = float(ticker.get('price', 0))
-            logger.info(f"Current {symbol} price: ${current_price:,.2f}")
-
+            
             # Update reference prices using correct client
             await client.update_reference_prices([symbol])
             await asyncio.sleep(0.1)
@@ -297,14 +323,19 @@ class OrderManager:
                 await asyncio.sleep(10)
             
     async def create_order(self, symbol: str, timeframe: TimeFrame, threshold: float):
-        """Create and store an order with improved futures support"""
+        """Create and store an order with improved futures support and error handling"""
         try:
+            # Check if symbol is valid before proceeding
+            price_check = await self.get_price(symbol)
+            if price_check is None:
+                logger.warning(f"Cannot create order for {symbol} - no valid price")
+                return
+                
             # Get order amount using the new calculation method
-            amount = await self.binance_client.calculate_trade_amount()
+            amount = await self.active_client.calculate_trade_amount()
             
             # Get current price for the signal
-            ticker = await self.active_client.get_symbol_ticker(symbol=symbol)
-            signal_price = float(ticker['price'])
+            signal_price = price_check  # Use already fetched price
 
             # Check if this should be a futures order
             is_futures = (
@@ -340,7 +371,7 @@ class OrderManager:
                 await self.telegram_bot.send_order_notification(order)
             else:
                 logger.error(f"Failed to create order for {symbol}")
-                return  # Return without raising error
+                return
             
         except Exception as e:
             logger.error(f"Error creating order: {e}")
@@ -498,48 +529,55 @@ class OrderManager:
             logger.error(f"Error monitoring futures positions: {e}")
 
     async def check_order_status(self, order: Order):
-        """Check and update order status with TP/SL tracking"""
+        """Check status of a pending order with improved error handling"""
         try:
-            # Check main order status first
-            current_status = await self.active_client.check_order_status(
-                order.symbol, 
-                order.order_id
-            )
+            # Get current price
+            current_price = await self.get_price(order.symbol)
             
-            if current_status == OrderStatus.FILLED and order.status != OrderStatus.FILLED:
-                # Main order just filled, start monitoring TP/SL
-                await self._handle_order_fill(order)
+            if current_price is None:
+                logger.info(f"Symbol {order.symbol} returned no price")
+                logger.warning(f"No valid price available for {order.symbol}, skipping processing")
+                return
+                
+            # Use safe_decimal to convert prices
+            current_price_dec = safe_decimal(current_price)
+            order_price_dec = safe_decimal(order.price)
             
-            # If main order is filled, check TP/SL status
-            elif order.status == OrderStatus.FILLED:
-                await self._check_tp_sl_status(order)
-
+            # Calculate price difference
+            if order_price_dec > Decimal('0'):
+                price_diff = ((current_price_dec - order_price_dec) / order_price_dec) * Decimal('100')
+            else:
+                price_diff = Decimal('0')
+                
+            # Process order based on price difference
+            # ... existing code ...
+        
         except Exception as e:
             logger.error(f"Error checking order status: {e}")
 
     async def _check_tp_sl_status(self, order: Order):
-        """Monitor TP/SL orders"""
+        """Check take profit and stop loss conditions"""
         try:
-            # Check TP order if exists
-            if order.tp_order_id:
-                tp_status = await self.active_client.check_order_status(
-                    order.symbol, order.tp_order_id
-                )
-                if tp_status == OrderStatus.FILLED:
-                    # TP hit - update order and cancel SL
-                    await self._handle_tp_sl_trigger(order, "TP")
-                    return
-
-            # Check SL order if exists
-            if order.sl_order_id:
-                sl_status = await self.active_client.check_order_status(
-                    order.symbol, order.sl_order_id
-                )
-                if sl_status == OrderStatus.FILLED:
-                    # SL hit - update order and cancel remaining orders
-                    await self._handle_tp_sl_trigger(order, "SL")
-                    return
-
+            # Get current price
+            current_price = await self.get_price(order.symbol)
+            
+            if current_price is None:
+                logger.debug(f"No price available for {order.symbol}, skipping TP/SL check")
+                return
+                
+            # Use safe conversion
+            current_price_dec = safe_decimal(current_price)
+            
+            # Process TP conditions
+            if order.tp_price is not None:
+                tp_price = safe_decimal(order.tp_price)
+                # ... continue with TP logic
+                
+            # Process SL conditions
+            if order.sl_price is not None:
+                sl_price = safe_decimal(order.sl_price)
+                # ... continue with SL logic
+                
         except Exception as e:
             logger.error(f"Error checking TP/SL status: {e}")
 

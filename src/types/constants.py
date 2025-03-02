@@ -1,4 +1,8 @@
 from datetime import timedelta
+from decimal import Decimal, InvalidOperation, ConversionSyntax
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Decimal precision for different cryptocurrencies
 PRECISION = {
@@ -69,3 +73,24 @@ TRADING_FEES = {
     'TAKER': 0.001,  # 0.1% taker fee
     'DEFAULT': 0.001  # Default fee for testnet
 }
+
+# Utility function for decimal handling
+def safe_decimal(value, default: Decimal = Decimal('0')) -> Decimal:
+    """
+    Safely convert value to Decimal, returning default if conversion fails
+    
+    Args:
+        value: Value to convert to Decimal
+        default: Default value to return if conversion fails
+        
+    Returns:
+        Decimal representation of value, or default if conversion fails
+    """
+    if value is None:
+        return default
+        
+    try:
+        return Decimal(str(value))
+    except (ValueError, TypeError, InvalidOperation, ConversionSyntax) as e:
+        logger.debug(f"Error converting {value} (type: {type(value)}) to Decimal: {e}")
+        return default
