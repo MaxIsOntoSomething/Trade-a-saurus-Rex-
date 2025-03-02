@@ -13,11 +13,16 @@ class MongoClient:
         self.client = motor.motor_asyncio.AsyncIOMotorClient(uri)
         self.db = self.client[database]
         self.orders = self.db.orders
+        self.balance_history = self.db.balance_history  # Add balance_history collection
 
     async def init_indexes(self):
         await self.orders.create_index("order_id", unique=True)
         await self.orders.create_index("status")
         await self.orders.create_index("symbol")
+        await self.orders.create_index("created_at")
+        
+        # Add index for balance history
+        await self.balance_history.create_index("timestamp")
 
     def _validate_order_data(self, order: Order) -> bool:
         """Validate order data before insertion"""
@@ -459,6 +464,71 @@ class MongoClient:
 
         except Exception as e:
             logger.error(f"Error getting visualization data: {e}")
+            return []
+
+    async def record_balance(self, timestamp: datetime, balance: Decimal, invested: Decimal = None):
+        """Record balance snapshot for historical tracking"""
+        try:
+            await self.balance_history.insert_one({
+                "timestamp": timestamp,
+                "balance": str(balance),
+                "invested": str(invested) if invested is not None else None,
+                "created_at": datetime.utcnow()
+            })
+            return True
+        except Exception as e:
+            logger.error(f"Failed to record balance: {e}")
+            return False
+
+    async def get_balance_history(self, days: int = 30) -> List[Dict]:
+        """Get balance history for the specified number of days"""
+        try:
+            cutoff = datetime.utcnow() - timedelta(days=days)
+            cursor = self.balance_history.find(
+                {"timestamp": {"$gte": cutoff}}
+            ).sort("timestamp", 1)
+            
+            # Convert decimal strings to Decimal objects for all records
+            result = []
+            async for doc in cursor:
+                result.append({
+                    "timestamp": doc["timestamp"],
+                    "balance": Decimal(doc["balance"]),
+                    "invested": Decimal(doc["invested"]) if doc.get("invested") else None
+                })
+                
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error getting balance history: {e}")
+            return []
+
+    async def get_buy_orders(self, days: int = 30) -> List[Dict]:
+        """Get all buy orders in the specified period"""
+        try:
+            cutoff = datetime.utcnow() - timedelta(days=days)
+            cursor = self.orders.find({
+                "status": OrderStatus.FILLED.value,
+                "filled_at": {"$gte": cutoff}
+            }).sort("filled_at", 1)
+            
+            results = []
+            async for doc in cursor:
+                try:
+                    results.append({
+                        "timestamp": doc["filled_at"] if doc.get("filled_at") else doc["created_at"],
+                        "symbol": doc["symbol"],
+                        "price": Decimal(doc["price"]),
+                        "quantity": Decimal(doc["quantity"]),
+                        "order_id": doc["order_id"]
+                    })
+                except (KeyError, ValueError, DecimalException) as e:
+                    logger.error(f"Error parsing order {doc.get('order_id', 'unknown')}: {e}")
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error getting buy orders: {e}")
             return []
 
     # ...rest of existing code...

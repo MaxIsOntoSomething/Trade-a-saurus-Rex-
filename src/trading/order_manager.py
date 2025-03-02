@@ -5,6 +5,7 @@ import os
 import platform
 from datetime import datetime, timedelta
 from typing import Dict, List
+from decimal import Decimal  # Add the missing Decimal import
 from ..types.models import Order, OrderStatus, TimeFrame
 from ..trading.binance_client import BinanceClient
 from ..database.mongo_client import MongoClient
@@ -97,6 +98,7 @@ class OrderManager:
         logger.info("Starting price monitoring loop")
         self.check_interval = 5  # Now 5 seconds
         last_check = time.time()
+        last_balance_record = datetime.now() - timedelta(hours=1)  # Force initial balance record
 
         while self.running:
             try:
@@ -112,6 +114,23 @@ class OrderManager:
                     logger.error("Connection health check failed, waiting 30s...")
                     await asyncio.sleep(30)
                     continue
+
+                # Record balance once per hour
+                now = datetime.now()
+                if (now - last_balance_record).total_seconds() > 3600:  # 1 hour in seconds
+                    try:
+                        # Get current balance
+                        balance = await self.binance_client.get_balance()
+                        
+                        # Calculate invested amount
+                        invested = await self.calculate_invested_amount()
+                        
+                        # Record to database
+                        await self.mongo_client.record_balance(now, balance, invested)
+                        last_balance_record = now
+                        logger.info(f"Recorded balance: ${float(balance):.2f}, Invested: ${float(invested):.2f}")
+                    except Exception as e:
+                        logger.error(f"Failed to record balance: {e}")
 
                 if not self.telegram_bot.is_paused:
                     logger.info("\n" + "="*50)
@@ -222,3 +241,36 @@ class OrderManager:
 
         except Exception as e:
             logger.error(f"Error monitoring orders: {e}", exc_info=True)
+
+    async def calculate_invested_amount(self) -> Decimal:
+        """Calculate the total amount currently invested"""
+        try:
+            # Get sum of all filled orders that haven't been sold yet
+            pipeline = [
+                {"$match": {"status": OrderStatus.FILLED.value}},
+                {"$group": {
+                    "_id": "$symbol",
+                    "total_invested": {
+                        "$sum": {
+                            "$multiply": [
+                                {"$toDecimal": "$price"},
+                                {"$toDecimal": "$quantity"}
+                            ]
+                        }
+                    }
+                }},
+                {"$group": {
+                    "_id": None,
+                    "grand_total": {"$sum": "$total_invested"}
+                }}
+            ]
+            
+            result = await self.mongo_client.orders.aggregate(pipeline).to_list(1)
+            
+            if result and len(result) > 0:
+                return Decimal(str(result[0]["grand_total"]))
+            return Decimal('0')
+            
+        except Exception as e:
+            logger.error(f"Error calculating invested amount: {e}")
+            return Decimal('0')

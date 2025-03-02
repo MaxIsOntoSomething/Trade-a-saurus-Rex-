@@ -615,3 +615,41 @@ class BinanceClient:
         except Exception as e:
             logger.error(f"Failed to generate trade chart: {e}")
             return None
+
+    async def get_historical_prices(self, symbol: str, days: int = 30) -> List[Dict]:
+        """Get historical daily prices for a symbol"""
+        try:
+            # Calculate start time
+            end_time = int(datetime.utcnow().timestamp() * 1000)
+            start_time = int((datetime.utcnow() - timedelta(days=days)).timestamp() * 1000)
+            
+            await self.rate_limiter.acquire(weight=10)  # Higher weight for klines request
+            
+            # Get klines (daily candles)
+            klines = await self.client.get_klines(
+                symbol=symbol,
+                interval='1d',
+                startTime=start_time,
+                endTime=end_time,
+                limit=1000  # Maximum allowed
+            )
+            
+            # Process the klines data
+            results = []
+            for k in klines:
+                timestamp = datetime.fromtimestamp(k[0] / 1000)  # Convert ms to datetime
+                results.append({
+                    'timestamp': timestamp,
+                    'price': Decimal(str(k[4])),  # Use closing price
+                    'open': Decimal(str(k[1])),
+                    'high': Decimal(str(k[2])),
+                    'low': Decimal(str(k[3])),
+                    'volume': Decimal(str(k[5]))
+                })
+                
+            logger.info(f"Retrieved {len(results)} historical prices for {symbol}")
+            return results
+            
+        except Exception as e:
+            logger.error(f"Failed to get historical prices for {symbol}: {e}")
+            return []

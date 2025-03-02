@@ -1,11 +1,15 @@
 import mplfinance as mpf
 import pandas as pd
+import numpy as np  # Add the missing numpy import
 from datetime import datetime
 from decimal import Decimal
 from typing import List, Dict, Optional
 import logging
 from ..types.models import TimeFrame, Order
 import io
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+from matplotlib.ticker import FuncFormatter
 
 logger = logging.getLogger(__name__)
 
@@ -217,6 +221,115 @@ class ChartGenerator:
             
         except Exception as e:
             logger.error(f"Error generating chart: {e}")
+            return None
+
+    async def generate_balance_chart(self, 
+                                  balance_data: List[Dict],
+                                  btc_prices: List[Dict],
+                                  buy_orders: List[Dict]) -> Optional[bytes]:
+        """Generate chart showing balance, investments, and BTC price with buy markers"""
+        try:
+            if not balance_data or len(balance_data) < 2:
+                logger.error("Not enough balance data for chart generation")
+                return None
+                
+            # Create DataFrames
+            balance_df = pd.DataFrame([
+                {
+                    'timestamp': entry['timestamp'],
+                    'balance': float(entry['balance']),
+                    'invested': float(entry['invested']) if entry.get('invested') is not None else 0
+                }
+                for entry in balance_data
+            ])
+            balance_df.set_index('timestamp', inplace=True)
+            
+            # Create BTC price DataFrame
+            if btc_prices:
+                btc_df = pd.DataFrame([
+                    {
+                        'timestamp': price['timestamp'],
+                        'price': float(price['price'])
+                    }
+                    for price in btc_prices
+                ])
+                btc_df.set_index('timestamp', inplace=True)
+                # Resample to match balance_df index if needed
+                btc_df = btc_df.reindex(balance_df.index, method='ffill')
+            else:
+                btc_df = pd.DataFrame(index=balance_df.index)
+                btc_df['price'] = np.nan
+            
+            # Create figure with subplots
+            fig = plt.figure(figsize=(12, 10))
+            gs = GridSpec(3, 1, height_ratios=[2, 1, 1])
+            
+            # Format dates on x-axis
+            date_formatter = plt.matplotlib.dates.DateFormatter('%Y-%m-%d')
+            
+            # Plot 1: Balance
+            ax1 = fig.add_subplot(gs[0])
+            balance_df['balance'].plot(ax=ax1, color='green', linewidth=2, legend=True)
+            ax1.set_ylabel('USDT Balance')
+            ax1.xaxis.set_major_formatter(date_formatter)
+            ax1.grid(True, alpha=0.3)
+            ax1.set_title('Account Balance History')
+            
+            # Format y-axis with commas
+            ax1.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f'${x:,.2f}'))
+            
+            # Plot buy markers on balance chart
+            for order in buy_orders:
+                timestamp = order['timestamp']
+                if timestamp in balance_df.index:
+                    balance_value = balance_df.loc[timestamp, 'balance']
+                    ax1.scatter(timestamp, balance_value, marker='^', s=100, 
+                               color='lime', edgecolors='darkgreen', zorder=5)
+            
+            # Plot 2: Invested amount
+            ax2 = fig.add_subplot(gs[1], sharex=ax1)
+            balance_df['invested'].plot(ax=ax2, color='blue', linewidth=2, legend=True)
+            ax2.set_ylabel('USDT Invested')
+            ax2.xaxis.set_major_formatter(date_formatter)
+            ax2.grid(True, alpha=0.3)
+            
+            # Format y-axis with commas
+            ax2.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f'${x:,.2f}'))
+            
+            # Plot 3: BTC price reference
+            ax3 = fig.add_subplot(gs[2], sharex=ax1)
+            btc_df['price'].plot(ax=ax3, color='orange', linewidth=2)
+            ax3.set_ylabel('BTC Price (USDT)')
+            ax3.set_xlabel('Date')
+            ax3.xaxis.set_major_formatter(date_formatter)
+            ax3.grid(True, alpha=0.3)
+            
+            # Format y-axis with commas
+            ax3.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f'${x:,.2f}'))
+            
+            # Highlight buy orders on BTC chart
+            for order in buy_orders:
+                if order['symbol'] == 'BTCUSDT':
+                    timestamp = order['timestamp']
+                    if timestamp in btc_df.index:
+                        price = float(order['price'])
+                        ax3.scatter(timestamp, price, marker='^', s=100,
+                                  color='lime', edgecolors='darkgreen', zorder=5)
+            
+            # Layout adjustments
+            plt.tight_layout()
+            fig.subplots_adjust(hspace=0.15)
+            
+            # Save to buffer
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+            plt.close(fig)
+            buf.seek(0)
+            
+            return buf.getvalue()
+            
+        except Exception as e:
+            logger.error(f"Error generating balance chart: {e}", exc_info=True)
             return None
 
     def format_info_text(self, order: Order, reference_price: Optional[Decimal] = None) -> str:

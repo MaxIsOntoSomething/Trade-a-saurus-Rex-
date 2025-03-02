@@ -12,6 +12,7 @@ from typing import List, Optional, Dict  # Add Dict import
 from ..types.models import Order, OrderStatus, TimeFrame, OrderType, TradeDirection  # Update imports
 from ..trading.binance_client import BinanceClient
 from ..database.mongo_client import MongoClient
+import io  # Add for handling bytes from chart
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,7 @@ class VisualizationType:
     PROFIT_DIST = "profit_distribution"
     ORDER_TYPES = "order_types"
     HOURLY_ACTIVITY = "hourly_activity"
+    BALANCE_CHART = "balance_chart"  # Add new visualization type
 
 class TelegramBot:
     def __init__(self, token: str, allowed_users: List[int], 
@@ -115,7 +117,7 @@ Status: Ready to ROAR! 🦖
         
         # Add visualization command
         self.app.add_handler(CommandHandler("viz", self.show_viz_menu))
-        self.app.add_handler(CallbackQueryHandler(self.handle_viz_selection, pattern="^(daily_volume|profit_distribution|order_types|hourly_activity)$"))
+        self.app.add_handler(CallbackQueryHandler(self.handle_viz_selection, pattern="^(daily_volume|profit_distribution|order_types|hourly_activity|balance_chart)$"))
         
         await self.app.initialize()
         await self.app.start()
@@ -1035,7 +1037,8 @@ Menu:
             [InlineKeyboardButton("📊 Daily Volume", callback_data=VisualizationType.DAILY_VOLUME)],
             [InlineKeyboardButton("💰 Profit Distribution", callback_data=VisualizationType.PROFIT_DIST)],
             [InlineKeyboardButton("📈 Order Types", callback_data=VisualizationType.ORDER_TYPES)],
-            [InlineKeyboardButton("⏰ Hourly Activity", callback_data=VisualizationType.HOURLY_ACTIVITY)]
+            [InlineKeyboardButton("⏰ Hourly Activity", callback_data=VisualizationType.HOURLY_ACTIVITY)],
+            [InlineKeyboardButton("💹 Balance History", callback_data=VisualizationType.BALANCE_CHART)]
         ]
         
         await update.message.reply_text(
@@ -1049,6 +1052,13 @@ Menu:
         await query.answer()
         
         viz_type = query.data
+        
+        # Special handling for balance chart
+        if viz_type == VisualizationType.BALANCE_CHART:
+            await query.message.reply_text("Generating balance history chart...", reply_markup=self.markup)
+            await self._generate_balance_chart(query.message.chat_id)
+            return
+            
         data = await self.mongo_client.get_visualization_data(viz_type)
         
         if not data:
@@ -1072,6 +1082,58 @@ Menu:
 
         # Send visualization and restore keyboard
         await query.message.reply_text(response, reply_markup=self.markup)
+
+    async def _generate_balance_chart(self, chat_id: int):
+        """Generate and send balance history chart"""
+        try:
+            # Get historical balance data from MongoDB
+            days = 30  # Show last 30 days by default
+            balance_data = await self.mongo_client.get_balance_history(days)
+            
+            if not balance_data or len(balance_data) < 2:
+                await self.app.bot.send_message(
+                    chat_id=chat_id,
+                    text="Not enough balance history data to generate chart.",
+                    reply_markup=self.markup
+                )
+                return
+                
+            # Get BTC historical prices for the same period
+            btc_prices = await self.binance_client.get_historical_prices("BTCUSDT", days)
+            
+            # Get buy orders for the period
+            buy_orders = await self.mongo_client.get_buy_orders(days)
+                
+            # Generate chart using chart generator
+            chart_bytes = await self.binance_client.chart_generator.generate_balance_chart(
+                balance_data, btc_prices, buy_orders
+            )
+            
+            if not chart_bytes:
+                await self.app.bot.send_message(
+                    chat_id=chat_id,
+                    text="Failed to generate balance chart.",
+                    reply_markup=self.markup
+                )
+                return
+                
+            # Send chart to user
+            await self.app.bot.send_photo(
+                chat_id=chat_id,
+                photo=chart_bytes,
+                caption="📊 Account Balance History (30 days)\n"
+                        "💹 Green arrows indicate buy orders\n"
+                        "📈 Blue line shows BTC price for reference",
+                reply_markup=self.markup
+            )
+            
+        except Exception as e:
+            logger.error(f"Error generating balance chart: {e}", exc_info=True)
+            await self.app.bot.send_message(
+                chat_id=chat_id,
+                text=f"❌ Error generating balance chart: {str(e)}",
+                reply_markup=self.markup
+            )
 
     async def _generate_volume_viz(self, data: List[Dict]) -> str:
         """Generate volume visualization"""
@@ -1240,4 +1302,3 @@ Menu:
                 logger.error(f"Failed to send initial balance alert to {user_id}: {e}")
 
     # ...rest of existing code...
-
