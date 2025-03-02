@@ -879,3 +879,537 @@ Futures Settings:
         except Exception as e:
             logger.error(f"Error showing mode menu: {e}")
             await update.message.reply_text(f"Error: {str(e)}")
+
+    async def show_profits(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show profit information with mode awareness"""
+        try:
+            # Check if this is from a callback query
+            is_callback = bool(update.callback_query)
+            message = update.callback_query.message if is_callback else update.message
+            
+            # Get current trading mode
+            trading_mode = self.config['environment']['trading_mode']
+            is_futures = trading_mode == 'futures'
+            
+            # Show loading message
+            if not is_callback:
+                loading_message = await message.reply_text("Calculating profit information...")
+            
+            # Format message based on mode
+            if is_futures:
+                # Get futures PnL data
+                symbols = self.config['trading']['pairs']
+                
+                # Create message header
+                profit_text = "*Futures Profit/Loss Summary*\n\n"
+                
+                # Get overall PnL
+                summary = await self.mongo_client.get_trading_summary(include_futures=True)
+                futures_data = summary.get('futures_orders', {})
+                
+                profit_text += (
+                    f"*Overall Performance*\n"
+                    f"Total Realized PnL: ${float(futures_data.get('total_pnl', 0)):+,.2f}\n"
+                    f"Win Rate: {futures_data.get('win_rate', 0):.1f}%\n"
+                    f"Total Trades: {futures_data.get('total_orders', 0)}\n\n"
+                )
+                
+                # Add unrealized PnL
+                if 'unrealized_pnl' in summary:
+                    profit_text += f"Unrealized PnL: ${float(summary['unrealized_pnl']):+,.2f}\n\n"
+                
+                # Get PnL by symbol
+                profit_text += "*PnL by Symbol*\n"
+                
+                # Process each symbol
+                for symbol in symbols:
+                    try:
+                        # Get current price
+                        ticker = await self.binance_client.get_symbol_ticker(symbol)
+                        current_price = float(ticker.get('price', 0))
+                        
+                        # Calculate PnL for this symbol
+                        pnl_data = await self.mongo_client.calculate_futures_pnl(symbol)
+                        
+                        # Get position data if active
+                        position_data = await self.mongo_client.get_position(symbol)
+                        
+                        if pnl_data or position_data:
+                            # Add symbol header
+                            profit_text += f"\n*{symbol}*\n"
+                            
+                            # Add realized PnL
+                            if pnl_data:
+                                realized_pnl = float(pnl_data.get('realized_pnl', 0))
+                                trade_count = pnl_data.get('trade_count', 0)
+                                profit_text += f"Realized PnL: ${realized_pnl:+,.2f} ({trade_count} trades)\n"
+                            
+                            # Add active position info
+                            if position_data:
+                                entry_price = float(position_data.get('entry_price', 0))
+                                quantity = float(position_data.get('quantity', 0))
+                                direction = position_data.get('direction', 'LONG')
+                                leverage = position_data.get('leverage', 1)
+                                
+                                # Calculate unrealized PnL
+                                if direction == 'LONG':
+                                    pnl_pct = (current_price - entry_price) / entry_price * 100 * leverage
+                                    unrealized_pnl = quantity * (current_price - entry_price)
+                                else:
+                                    pnl_pct = (entry_price - current_price) / entry_price * 100 * leverage
+                                    unrealized_pnl = quantity * (entry_price - current_price)
+                                
+                                profit_text += (
+                                    f"Active Position: {direction} {abs(quantity):.4f} @ ${entry_price:.2f}\n"
+                                    f"Current Price: ${current_price:.2f}\n"
+                                    f"Unrealized PnL: ${unrealized_pnl:+,.2f} ({pnl_pct:+.2f}%)\n"
+                                    f"Leverage: {leverage}x\n"
+                                )
+                
+                    except Exception as e:
+                        logger.error(f"Error calculating PnL for {symbol}: {e}")
+                        profit_text += f"\n*{symbol}*: Error calculating PnL\n"
+                
+            else:
+                # Get spot portfolio data
+                position_stats = await self.mongo_client.get_position_stats()
+                
+                # Create message header
+                profit_text = "*Spot Portfolio Profit Summary*\n\n"
+                
+                if position_stats:
+                    # Add overall portfolio stats
+                    profit_text += (
+                        f"*Overall Portfolio*\n"
+                        f"Total Value: ${float(position_stats.get('total_value', 0)):,.2f}\n"
+                        f"Total Cost: ${float(position_stats.get('total_cost', 0)):,.2f}\n"
+                        f"Total Profit: ${float(position_stats.get('total_profit', 0)):+,.2f}\n"
+                        f"Profit %: {position_stats.get('profit_percentage', 0):+.2f}%\n\n"
+                    )
+                    
+                    # Add positions breakdown
+                    if position_stats.get('positions'):
+                        profit_text += "*Positions*\n"
+                        
+                        # Sort positions by profit percentage
+                        sorted_positions = sorted(
+                            position_stats['positions'], 
+                            key=lambda x: x.get('profit_percentage', 0),
+                            reverse=True
+                        )
+                        
+                        for pos in sorted_positions:
+                            symbol = pos['symbol']
+                            quantity = float(pos.get('quantity', 0))
+                            avg_price = float(pos.get('avg_price', 0))
+                            current_price = float(pos.get('current_price', 0))
+                            profit = float(pos.get('profit', 0))
+                            profit_pct = pos.get('profit_percentage', 0)
+                            
+                            profit_text += (
+                                f"\n*{symbol}*\n"
+                                f"Quantity: {quantity:.6f}\n"
+                                f"Avg Price: ${avg_price:.2f}\n"
+                                f"Current Price: ${current_price:.2f}\n"
+                                f"Profit: ${profit:+,.2f} ({profit_pct:+.2f}%)\n"
+                            )
+                else:
+                    profit_text += "No portfolio data available."
+            
+            # Delete loading message if exists
+            if not is_callback and 'loading_message' in locals():
+                await loading_message.delete()
+            
+            # Send profit message with back button
+            if is_callback:
+                await update.callback_query.edit_message_text(
+                    profit_text,
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔙 Back", callback_data="section_market")
+                    ]]),
+                    parse_mode='Markdown'
+                )
+            else:
+                await message.reply_text(
+                    profit_text,
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔙 Menu", callback_data="main_menu")
+                    ]]),
+                    parse_mode='Markdown'
+                )
+            
+        except Exception as e:
+            logger.error(f"Error showing profits: {e}")
+            
+            # Handle error based on update type
+            if update.callback_query:
+                await update.callback_query.edit_message_text(
+                    f"Error calculating profits: {str(e)}",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔙 Back", callback_data="section_market")
+                    ]])
+                )
+            else:
+                await update.message.reply_text(
+                    f"Error calculating profits: {str(e)}",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔙 Menu", callback_data="main_menu")
+                    ]])
+                )
+
+    def _get_timeframe_value(self, timeframe):
+        """Convert TimeFrame enum to readable string"""
+        if timeframe == TimeFrame.DAILY:
+            return "Daily"
+        elif timeframe == TimeFrame.WEEKLY:
+            return "Weekly"
+        elif timeframe == TimeFrame.MONTHLY:
+            return "Monthly"
+        return str(timeframe)
+
+    async def show_positions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show open futures positions"""
+        query = update.callback_query
+        
+        try:
+            # Check if we're in futures mode
+            if self.config['environment']['trading_mode'] != 'futures':
+                await query.edit_message_text(
+                    "This command is only available in Futures mode.",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔙 Back", callback_data="section_market")
+                    ]])
+                )
+                return
+            
+            # Get positions from futures client
+            positions = await self.binance_client.get_open_positions()
+            
+            if not positions:
+                await query.edit_message_text(
+                    "No open positions found.",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔙 Back", callback_data="section_market")
+                    ]])
+                )
+                return
+            
+            # Format positions
+            message = "*Open Futures Positions*\n\n"
+            
+            for symbol, position in positions.items():
+                entry_price = float(position.get('entryPrice', 0))
+                amount = float(position.get('positionAmt', 0))
+                leverage = int(position.get('leverage', 1))
+                pnl = float(position.get('unrealizedProfit', 0))
+                direction = "LONG" if amount > 0 else "SHORT"
+                
+                # Get current price
+                ticker = await self.binance_client.get_symbol_ticker(symbol)
+                current_price = float(ticker.get('price', 0))
+                
+                # Calculate PnL percentage
+                if entry_price > 0 and amount != 0:
+                    if direction == "LONG":
+                        pnl_pct = (current_price - entry_price) / entry_price * 100 * leverage
+                    else:
+                        pnl_pct = (entry_price - current_price) / entry_price * 100 * leverage
+                else:
+                    pnl_pct = 0
+                
+                message += f"*{symbol}* ({direction})\n"
+                message += f"Entry: ${entry_price:.2f} | Current: ${current_price:.2f}\n"
+                message += f"Size: {abs(amount):.4f} | Leverage: {leverage}x\n"
+                message += f"PnL: ${pnl:.2f} ({pnl_pct:.2f}%)\n\n"
+            
+            # Add back button
+            await query.edit_message_text(
+                message,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 Back", callback_data="section_market")
+                ]]),
+                parse_mode='Markdown'
+            )
+            
+        except Exception as e:
+            logger.error(f"Error showing positions: {e}")
+            await query.edit_message_text(
+                f"Error retrieving positions: {str(e)}",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 Back", callback_data="section_market")
+                ]])
+            )
+
+    async def show_viz_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Show visualization options menu"""
+        try:
+            query = update.callback_query
+            if query:
+                await query.answer()
+            
+            keyboard = [
+                [InlineKeyboardButton("Equity Curve", callback_data="viz_equity_curve")],
+                [InlineKeyboardButton("Trade Distribution", callback_data="viz_trade_distribution")],
+                [InlineKeyboardButton("Performance Metrics", callback_data="viz_performance_metrics")],
+                [InlineKeyboardButton("Price Charts", callback_data="viz_price_charts")],
+                [InlineKeyboardButton("Back to Main Menu", callback_data="back_to_main")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            message = "📊 *Visualization Menu*\n\nSelect a visualization to generate:"
+            
+            if query:
+                await query.edit_message_text(text=message, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
+            else:
+                await update.message.reply_text(text=message, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
+                
+        except Exception as e:
+            logger.error(f"Error showing visualization menu: {e}")
+            if update.callback_query:
+                await update.callback_query.edit_message_text(text=f"Error showing visualization menu: {e}")
+            else:
+                await update.message.reply_text(text=f"Error showing visualization menu: {e}")
+    
+    async def handle_viz_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle visualization selection"""
+        try:
+            query = update.callback_query
+            await query.answer()
+            
+            viz_type = query.data
+            
+            if viz_type == "viz_equity_curve":
+                # Show mode selection for equity curve
+                keyboard = [
+                    [InlineKeyboardButton("Spot", callback_data="equity_curve_spot")],
+                    [InlineKeyboardButton("Futures", callback_data="equity_curve_futures")],
+                    [InlineKeyboardButton("Combined", callback_data="equity_curve_combined")],
+                    [InlineKeyboardButton("Back", callback_data="back_to_viz_menu")]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await query.edit_message_text(
+                    text="Select mode for equity curve visualization:",
+                    reply_markup=reply_markup
+                )
+            elif viz_type.startswith("equity_curve_"):
+                mode = viz_type.replace("equity_curve_", "")
+                await query.edit_message_text(text=f"Generating equity curve for {mode} mode...")
+                
+                # Generate and send equity curve
+                await self.generate_equity_curve(update, context, mode)
+                
+            elif viz_type == "viz_trade_distribution":
+                await query.edit_message_text(text="Generating trade distribution visualization...")
+                
+                # Generate and send trade distribution
+                await self.generate_trade_distribution(update, context)
+                
+            elif viz_type == "viz_performance_metrics":
+                await query.edit_message_text(text="Generating performance metrics visualization...")
+                
+                # Generate and send performance metrics
+                await self.generate_performance_metrics(update, context)
+                
+            elif viz_type == "viz_price_charts":
+                # Show symbol selection for price charts
+                symbols = self.config.get("trading", {}).get("symbols", [])
+                keyboard = []
+                
+                # Create rows of 2 symbols each
+                for i in range(0, len(symbols), 2):
+                    row = []
+                    row.append(InlineKeyboardButton(symbols[i], callback_data=f"price_chart_{symbols[i]}"))
+                    if i + 1 < len(symbols):
+                        row.append(InlineKeyboardButton(symbols[i+1], callback_data=f"price_chart_{symbols[i+1]}"))
+                    keyboard.append(row)
+                
+                keyboard.append([InlineKeyboardButton("Back", callback_data="back_to_viz_menu")])
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                await query.edit_message_text(
+                    text="Select symbol for price chart:",
+                    reply_markup=reply_markup
+                )
+                
+            elif viz_type.startswith("price_chart_"):
+                symbol = viz_type.replace("price_chart_", "")
+                await query.edit_message_text(text=f"Generating price chart for {symbol}...")
+                
+                # Generate and send price chart
+                await self.generate_price_chart(update, context, symbol)
+                
+            elif viz_type == "back_to_viz_menu":
+                await self.show_viz_menu(update, context)
+                
+        except Exception as e:
+            logger.error(f"Error handling visualization selection: {e}")
+            await query.edit_message_text(text=f"Error generating visualization: {e}")
+    
+    async def generate_equity_curve(self, update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str) -> None:
+        """Generate and send equity curve visualization"""
+        try:
+            # Placeholder for actual implementation
+            message = f"Equity curve for {mode} mode would be generated here."
+            
+            keyboard = [[InlineKeyboardButton("Back to Viz Menu", callback_data="back_to_viz_menu")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.callback_query.edit_message_text(
+                text=message,
+                reply_markup=reply_markup
+            )
+        except Exception as e:
+            logger.error(f"Error generating equity curve: {e}")
+            await update.callback_query.edit_message_text(text=f"Error generating equity curve: {e}")
+    
+    async def generate_trade_distribution(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Generate and send trade distribution visualization"""
+        try:
+            # Placeholder for actual implementation
+            message = "Trade distribution visualization would be generated here."
+            
+            keyboard = [[InlineKeyboardButton("Back to Viz Menu", callback_data="back_to_viz_menu")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.callback_query.edit_message_text(
+                text=message,
+                reply_markup=reply_markup
+            )
+        except Exception as e:
+            logger.error(f"Error generating trade distribution: {e}")
+            await update.callback_query.edit_message_text(text=f"Error generating trade distribution: {e}")
+    
+    async def generate_performance_metrics(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Generate and send performance metrics visualization"""
+        try:
+            # Placeholder for actual implementation
+            message = "Performance metrics visualization would be generated here."
+            
+            keyboard = [[InlineKeyboardButton("Back to Viz Menu", callback_data="back_to_viz_menu")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.callback_query.edit_message_text(
+                text=message,
+                reply_markup=reply_markup
+            )
+        except Exception as e:
+            logger.error(f"Error generating performance metrics: {e}")
+            await update.callback_query.edit_message_text(text=f"Error generating performance metrics: {e}")
+    
+    async def generate_price_chart(self, update: Update, context: ContextTypes.DEFAULT_TYPE, symbol: str) -> None:
+        """Generate and send price chart visualization"""
+        try:
+            # Placeholder for actual implementation
+            message = f"Price chart for {symbol} would be generated here."
+            
+            keyboard = [[InlineKeyboardButton("Back to Viz Menu", callback_data="back_to_viz_menu")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.callback_query.edit_message_text(
+                text=message,
+                reply_markup=reply_markup
+            )
+        except Exception as e:
+            logger.error(f"Error generating price chart: {e}")
+            await update.callback_query.edit_message_text(text=f"Error generating price chart: {e}")
+
+    async def show_thresholds(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show current trading thresholds"""
+        try:
+            # Check if this is from a callback query
+            is_callback = bool(update.callback_query)
+            message = update.callback_query.message if is_callback else update.message
+            
+            # Get thresholds from config
+            thresholds = self.config['trading']['thresholds']
+            
+            # Format message
+            threshold_text = "*Trading Thresholds*\n\n"
+            
+            for timeframe, values in thresholds.items():
+                threshold_text += f"*{timeframe.capitalize()}*: {', '.join([f'{v}%' for v in values])}\n"
+            
+            # Get triggered thresholds
+            triggered = {}
+            for symbol in self.config['trading']['pairs']:
+                for timeframe in thresholds.keys():
+                    triggered_values = await self.mongo_client.get_triggered_thresholds(symbol, timeframe)
+                    if triggered_values:
+                        if symbol not in triggered:
+                            triggered[symbol] = {}
+                        triggered[symbol][timeframe] = triggered_values
+            
+            # Add triggered thresholds to message
+            if triggered:
+                threshold_text += "\n*Recently Triggered Thresholds*:\n"
+                for symbol, timeframes in triggered.items():
+                    threshold_text += f"\n{symbol}:\n"
+                    for timeframe, values in timeframes.items():
+                        threshold_text += f"  {timeframe.capitalize()}: {', '.join([f'{v}%' for v in values])}\n"
+            else:
+                threshold_text += "\nNo recently triggered thresholds."
+            
+            # Send message with back button
+            if is_callback:
+                await update.callback_query.edit_message_text(
+                    threshold_text,
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔙 Back", callback_data="section_trading")
+                    ]]),
+                    parse_mode='Markdown'
+                )
+            else:
+                await message.reply_text(
+                    threshold_text,
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔙 Menu", callback_data="main_menu")
+                    ]]),
+                    parse_mode='Markdown'
+                )
+            
+        except Exception as e:
+            logger.error(f"Error showing thresholds: {e}")
+            
+            # Handle error based on update type
+            if update.callback_query:
+                await update.callback_query.edit_message_text(
+                    f"Error showing thresholds: {str(e)}",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔙 Back", callback_data="section_trading")
+                    ]])
+                )
+            else:
+                await update.message.reply_text(
+                    f"Error showing thresholds: {str(e)}",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔙 Menu", callback_data="main_menu")
+                    ]])
+                )
+
+    async def add_trade_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Start the process of adding a new trade"""
+        try:
+            query = update.callback_query
+            if query:
+                await query.answer()
+                
+            keyboard = [
+                [InlineKeyboardButton("Spot", callback_data="add_trade_spot")],
+                [InlineKeyboardButton("Futures", callback_data="add_trade_futures")],
+                [InlineKeyboardButton("Back", callback_data="back_to_trading_menu")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            message = "Select trading mode for your new trade:"
+            
+            if query:
+                await query.edit_message_text(text=message, reply_markup=reply_markup)
+            else:
+                await update.message.reply_text(text=message, reply_markup=reply_markup)
+                
+        except Exception as e:
+            logger.error(f"Error in add_trade_start: {e}")
+            if query:
+                await query.edit_message_text(text=f"Error: {e}")
+            else:
+                await update.message.reply_text(text=f"Error: {e}")

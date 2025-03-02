@@ -10,6 +10,7 @@ from ..trading.binance_client import BinanceClient
 from ..database.mongo_client import MongoClient
 from ..telegram.bot import TelegramBot
 from .futures_client import FuturesClient
+from binance.error import ClientError  # Add this import
 
 logger = logging.getLogger(__name__)
 
@@ -146,8 +147,10 @@ class OrderManager:
                     ticker = await self.binance_client.get_symbol_ticker(symbol=symbol)
                     return float(ticker['price'])
                 raise
-        except BinanceAPIException as e:
-            if e.code == -1121:  # Invalid symbol
+        except ClientError as e:
+            # ClientError doesn't have a code attribute, parse from error string
+            error_str = str(e)
+            if '-1121' in error_str and 'Invalid symbol' in error_str:
                 logger.error(f"Invalid symbol: {symbol}")
             else:
                 logger.error(f"Failed to get price for {symbol}: {e}")
