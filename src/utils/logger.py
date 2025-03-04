@@ -5,6 +5,9 @@ from pathlib import Path
 import sys
 import codecs
 from datetime import datetime
+import shutil
+from datetime import datetime, timedelta
+import glob
 
 # Create custom logger levels
 BALANCE_CHECK = 25
@@ -36,8 +39,111 @@ class WindowsConsoleHandler(logging.StreamHandler):
             stream = sys.stdout
         super().__init__(stream)
 
+class CleanupRotatingFileHandler(RotatingFileHandler):
+    """Enhanced RotatingFileHandler that cleans up old log files"""
+    def __init__(self, filename, mode='a', maxBytes=0, backupCount=0, 
+                 encoding=None, delay=False, errors=None, max_age_days=None):
+        super().__init__(filename, mode, maxBytes, backupCount, encoding, delay, errors)
+        self.max_age_days = max_age_days
+        self.cleanup_old_logs()
+        
+    def doRollover(self):
+        """Override doRollover to clean up old logs after rotation"""
+        super().doRollover()
+        self.cleanup_old_logs()
+        
+    def cleanup_old_logs(self):
+        """Remove log files that exceed the maximum count or are older than max_age_days"""
+        if not self.max_age_days:
+            return
+            
+        try:
+            # Get the base path and pattern for the log files
+            base_path = Path(self.baseFilename)
+            log_dir = base_path.parent
+            base_name = base_path.stem
+            extension = base_path.suffix
+            pattern = f"{base_name}.*{extension}"
+            
+            # Find all log files matching the pattern
+            log_files = list(log_dir.glob(pattern))
+            
+            # Find files older than max_age_days
+            cutoff_date = datetime.now() - timedelta(days=self.max_age_days)
+            
+            # Check each file's modification time
+            for log_file in log_files:
+                try:
+                    # Get file modification time
+                    mtime = datetime.fromtimestamp(log_file.stat().st_mtime)
+                    if mtime < cutoff_date:
+                        os.remove(log_file)
+                        logging.getLogger().info(f"Removed old log file: {log_file}")
+                except Exception as e:
+                    logging.getLogger().error(f"Error checking/removing log file {log_file}: {e}")
+        except Exception as e:
+            logging.getLogger().error(f"Error in log file cleanup: {e}")
+
+def cleanup_log_directory(log_dir=None, max_size_mb=500, min_free_space_mb=1000):
+    """Clean up the entire log directory if it gets too large or disk space is low"""
+    if log_dir is None:
+        log_dir = Path('logs')
+    
+    try:
+        # Check if directory exists
+        if not log_dir.exists():
+            return
+            
+        # Calculate total size of log directory
+        total_size_bytes = sum(f.stat().st_size for f in log_dir.glob('**/*') if f.is_file())
+        total_size_mb = total_size_bytes / (1024 * 1024)
+        
+        # Check free space on the disk
+        if sys.platform == 'win32':
+            import ctypes
+            free_bytes = ctypes.c_ulonglong(0)
+            ctypes.windll.kernel32.GetDiskFreeSpaceExW(
+                ctypes.c_wchar_p(str(log_dir)), None, None, ctypes.pointer(free_bytes))
+            free_space_mb = free_bytes.value / (1024 * 1024)
+        else:
+            import shutil
+            free_space_mb = shutil.disk_usage(str(log_dir)).free / (1024 * 1024)
+        
+        # Log current space usage
+        logger = logging.getLogger()
+        logger.info(f"Log directory size: {total_size_mb:.2f} MB, Free disk space: {free_space_mb:.2f} MB")
+        
+        # If either condition is met, clean up old logs
+        if total_size_mb > max_size_mb or free_space_mb < min_free_space_mb:
+            logger.warning(f"Log directory cleanup triggered: size={total_size_mb:.2f}MB, free space={free_space_mb:.2f}MB")
+            
+            # Get all log files sorted by modification time (oldest first)
+            log_files = sorted(
+                [f for f in log_dir.glob('**/*') if f.is_file()],
+                key=lambda f: f.stat().st_mtime
+            )
+            
+            # Remove oldest files until we're below the threshold or have removed half the files
+            files_to_remove = max(len(log_files) // 2, 1)
+            for i, log_file in enumerate(log_files):
+                if i >= files_to_remove:
+                    break
+                    
+                try:
+                    os.remove(log_file)
+                    logger.info(f"Removed old log file during cleanup: {log_file}")
+                except Exception as e:
+                    logger.error(f"Failed to remove log file {log_file}: {e}")
+            
+            # Calculate new total size
+            new_total_bytes = sum(f.stat().st_size for f in log_dir.glob('**/*') if f.is_file())
+            new_total_mb = new_total_bytes / (1024 * 1024)
+            logger.info(f"Log directory cleanup complete. New size: {new_total_mb:.2f} MB")
+    except Exception as e:
+        logging.getLogger().error(f"Error in log directory cleanup: {e}")
+
 def setup_logging() -> ConfigLogger:
-    """Configure logging with enhanced tracking"""
+    """Configure logging with enhanced tracking and cleanup"""
     # Create logs directory if it doesn't exist
     log_dir = Path('logs')
     log_dir.mkdir(exist_ok=True)
@@ -58,42 +164,46 @@ def setup_logging() -> ConfigLogger:
     console_handler.setFormatter(console_formatter)
     console_handler.setLevel(logging.INFO)
 
-    # Debug log file
-    debug_handler = RotatingFileHandler(
+    # Debug log file with enhanced cleanup
+    debug_handler = CleanupRotatingFileHandler(
         log_dir / 'debug.log',
-        maxBytes=10*1024*1024,
+        maxBytes=10*1024*1024,  # 10MB
         backupCount=5,
-        encoding='utf-8'
+        encoding='utf-8',
+        max_age_days=7  # Auto-delete logs older than a week
     )
     debug_handler.setFormatter(file_formatter)
     debug_handler.setLevel(logging.DEBUG)
 
-    # Error log file
-    error_handler = RotatingFileHandler(
+    # Error log file with enhanced cleanup
+    error_handler = CleanupRotatingFileHandler(
         log_dir / 'error.log',
-        maxBytes=10*1024*1024,
+        maxBytes=5*1024*1024,  # 5MB
         backupCount=5,
-        encoding='utf-8'
+        encoding='utf-8',
+        max_age_days=14  # Keep errors longer - 2 weeks
     )
     error_handler.setFormatter(file_formatter)
     error_handler.setLevel(logging.ERROR)
 
     # Balance specific log file with custom filter
-    balance_handler = RotatingFileHandler(
+    balance_handler = CleanupRotatingFileHandler(
         log_dir / 'balance.log',
-        maxBytes=10*1024*1024,
-        backupCount=5,
-        encoding='utf-8'
+        maxBytes=5*1024*1024,  # 5MB
+        backupCount=3,
+        encoding='utf-8',
+        max_age_days=30  # Keep balance logs for a month
     )
     balance_handler.setFormatter(file_formatter)
     balance_handler.setLevel(logging.INFO)
 
     # Config specific log file
-    config_handler = RotatingFileHandler(
+    config_handler = CleanupRotatingFileHandler(
         log_dir / 'config.log',
-        maxBytes=10*1024*1024,
-        backupCount=5,
-        encoding='utf-8'
+        maxBytes=5*1024*1024,  # 5MB
+        backupCount=2,
+        encoding='utf-8',
+        max_age_days=14  # Keep config for 2 weeks
     )
     config_handler.setFormatter(file_formatter)
     config_handler.setLevel(CONFIG_CHECK)
@@ -137,6 +247,9 @@ def setup_logging() -> ConfigLogger:
 
     # Create config logger instance
     config_logger = ConfigLogger(root_logger)
+    
+    # Run initial log directory cleanup
+    cleanup_log_directory()
     
     # Log startup
     root_logger.info("Logging system initialized")
