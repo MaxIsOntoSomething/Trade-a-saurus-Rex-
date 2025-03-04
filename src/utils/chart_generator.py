@@ -227,53 +227,45 @@ class ChartGenerator:
                                   balance_data: List[Dict],
                                   btc_prices: List[Dict],
                                   buy_orders: List[Dict]) -> Optional[bytes]:
-        """Generate chart showing balance, investments, and BTC price with buy markers"""
+        """Generate chart showing balance and investment data on the same chart"""
         try:
             if not balance_data or len(balance_data) < 2:
                 logger.error("Not enough balance data for chart generation")
                 return None
                 
-            # Create DataFrames
+            # Create DataFrame
             balance_df = pd.DataFrame([
                 {
                     'timestamp': entry['timestamp'],
                     'balance': float(entry['balance']),
-                    'invested': float(entry['invested']) if entry.get('invested') is not None else 0
+                    'invested': float(entry['invested']) if entry.get('invested') is not None else 0,
+                    'fees': float(entry.get('fees', 0))  # Add fees column with default value of 0
                 }
                 for entry in balance_data
             ])
             balance_df.set_index('timestamp', inplace=True)
             
-            # Create BTC price DataFrame
-            if btc_prices:
-                btc_df = pd.DataFrame([
-                    {
-                        'timestamp': price['timestamp'],
-                        'price': float(price['price'])
-                    }
-                    for price in btc_prices
-                ])
-                btc_df.set_index('timestamp', inplace=True)
-                # Resample to match balance_df index if needed
-                btc_df = btc_df.reindex(balance_df.index, method='ffill')
-            else:
-                btc_df = pd.DataFrame(index=balance_df.index)
-                btc_df['price'] = np.nan
+            # Calculate profit (balance - invested)
+            balance_df['profit'] = balance_df['balance'] - balance_df['invested']
             
-            # Create figure with subplots
-            fig = plt.figure(figsize=(12, 10))
-            gs = GridSpec(3, 1, height_ratios=[2, 1, 1])
+            # Create figure with two subplots (balance+invested on top, fees on bottom)
+            fig = plt.figure(figsize=(12, 8))
+            gs = GridSpec(2, 1, height_ratios=[3, 1])
             
             # Format dates on x-axis
             date_formatter = plt.matplotlib.dates.DateFormatter('%Y-%m-%d')
             
-            # Plot 1: Balance
+            # Plot 1: Balance and Invested on same chart
             ax1 = fig.add_subplot(gs[0])
-            balance_df['balance'].plot(ax=ax1, color='green', linewidth=2, legend=True)
-            ax1.set_ylabel('USDT Balance')
+            balance_df['balance'].plot(ax=ax1, color='green', linewidth=2, label='Total Balance')
+            balance_df['invested'].plot(ax=ax1, color='blue', linewidth=2, label='Invested Amount')
+            balance_df['profit'].plot(ax=ax1, color='purple', linewidth=1.5, linestyle='--', label='Profit')
+            
+            ax1.set_ylabel('USDT Value')
             ax1.xaxis.set_major_formatter(date_formatter)
             ax1.grid(True, alpha=0.3)
             ax1.set_title('Account Balance History')
+            ax1.legend(loc='upper left')
             
             # Format y-axis with commas
             ax1.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f'${x:,.2f}'))
@@ -286,35 +278,23 @@ class ChartGenerator:
                     ax1.scatter(timestamp, balance_value, marker='^', s=100, 
                                color='lime', edgecolors='darkgreen', zorder=5)
             
-            # Plot 2: Invested amount
+            # Plot 2: Fees
             ax2 = fig.add_subplot(gs[1], sharex=ax1)
-            balance_df['invested'].plot(ax=ax2, color='blue', linewidth=2, legend=True)
-            ax2.set_ylabel('USDT Invested')
-            ax2.xaxis.set_major_formatter(date_formatter)
-            ax2.grid(True, alpha=0.3)
+            if 'fees' in balance_df.columns:
+                balance_df['fees'].plot(ax=ax2, color='red', linewidth=2, label='Fees')
+                ax2.set_ylabel('USDT Fees')
+                ax2.xaxis.set_major_formatter(date_formatter)
+                ax2.grid(True, alpha=0.3)
+                ax2.legend(loc='upper left')
+                
+                # Format y-axis with commas
+                ax2.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f'${x:,.2f}'))
+            else:
+                ax2.text(0.5, 0.5, 'No fee data available', 
+                      horizontalalignment='center', verticalalignment='center',
+                      transform=ax2.transAxes)
             
-            # Format y-axis with commas
-            ax2.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f'${x:,.2f}'))
-            
-            # Plot 3: BTC price reference
-            ax3 = fig.add_subplot(gs[2], sharex=ax1)
-            btc_df['price'].plot(ax=ax3, color='orange', linewidth=2)
-            ax3.set_ylabel('BTC Price (USDT)')
-            ax3.set_xlabel('Date')
-            ax3.xaxis.set_major_formatter(date_formatter)
-            ax3.grid(True, alpha=0.3)
-            
-            # Format y-axis with commas
-            ax3.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f'${x:,.2f}'))
-            
-            # Highlight buy orders on BTC chart
-            for order in buy_orders:
-                if order['symbol'] == 'BTCUSDT':
-                    timestamp = order['timestamp']
-                    if timestamp in btc_df.index:
-                        price = float(order['price'])
-                        ax3.scatter(timestamp, price, marker='^', s=100,
-                                  color='lime', edgecolors='darkgreen', zorder=5)
+            ax2.set_xlabel('Date')
             
             # Layout adjustments
             plt.tight_layout()

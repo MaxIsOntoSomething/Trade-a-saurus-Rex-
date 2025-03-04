@@ -148,6 +148,61 @@ async def check_initial_connection(binance_client: BinanceClient, config: dict) 
         logger.error("=" * 50)
         return False
 
+async def initialize_services(config):
+    """Initialize all services"""
+    try:
+        # Initialize MongoDB client
+        mongo_client = MongoClient(
+            uri=config['mongodb']['uri'],
+            database=config['mongodb']['database']
+        )
+        await mongo_client.init_indexes()  # Initialize database indexes
+        
+        # Initialize Binance client
+        binance_client = BinanceClient(
+            api_key=config['binance']['api_key'],
+            api_secret=config['binance']['api_secret'],
+            testnet=config['binance']['testnet'],
+            mongo_client=mongo_client,
+            config=config
+        )
+        
+        # Initialize client connection
+        await binance_client.initialize()
+        
+        # Initialize Telegram bot
+        telegram_bot = TelegramBot(
+            token=config['telegram']['bot_token'],
+            allowed_users=config['telegram']['allowed_users'],
+            binance_client=binance_client,
+            mongo_client=mongo_client,
+            config=config
+        )
+        
+        # Link components
+        binance_client.telegram_bot = telegram_bot
+        
+        # Initialize telegram bot
+        await telegram_bot.initialize()
+        
+        # Initialize OrderManager
+        order_manager = OrderManager(
+            binance_client=binance_client,
+            mongo_client=mongo_client,
+            telegram_bot=telegram_bot,
+            config=config
+        )
+        
+        return {
+            'mongo_client': mongo_client,
+            'binance_client': binance_client,
+            'telegram_bot': telegram_bot,
+            'order_manager': order_manager
+        }
+    except Exception as e:
+        logger.error(f"Error initializing services: {e}", exc_info=True)
+        raise
+
 async def main():
     """Main function with improved config loading"""
     print(DINO_ASCII)
@@ -170,41 +225,16 @@ async def main():
             logger.error("Invalid configuration, exiting...")
             return
 
-        # Initialize components
-        binance_client = BinanceClient(
-            api_key=config['binance']['api_key'],
-            api_secret=config['binance']['api_secret'],
-            testnet=config['binance']['testnet']
-        )
-        await binance_client.initialize()
+        services = await initialize_services(config)
+        binance_client = services['binance_client']
+        telegram_bot = services['telegram_bot']
+        order_manager = services['order_manager']
         
         # Check initial connection with all configured pairs
         if not await check_initial_connection(binance_client, config):
             logger.error("Initial connection check failed, exiting...")
             return
         
-        mongo_client = MongoClient(
-            uri=config['mongodb']['uri'],
-            database=config['mongodb']['database']
-        )
-        await mongo_client.init_indexes()
-        
-        telegram_bot = TelegramBot(
-            token=config['telegram']['bot_token'],
-            allowed_users=config['telegram']['allowed_users'],
-            binance_client=binance_client,
-            mongo_client=mongo_client,
-            config=config  # Add config here
-        )
-        await telegram_bot.initialize()
-        
-        order_manager = OrderManager(
-            binance_client=binance_client,
-            mongo_client=mongo_client,
-            telegram_bot=telegram_bot,
-            config=config
-        )
-
         # Run both components concurrently
         try:
             # Start both services

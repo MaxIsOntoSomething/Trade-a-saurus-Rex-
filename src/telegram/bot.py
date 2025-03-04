@@ -58,13 +58,19 @@ class TelegramBot:
         self.allowed_users = allowed_users
         self.binance_client = binance_client
         self.mongo_client = mongo_client
-        self.config = config  # Add this line
+        self.config = config
         self.app = None
         self.is_paused = False
         self.running = False
         self._polling_task = None
         self._update_id = 0
         self.temp_trade_data = {}
+        
+        # Set base currency and reserve balance in binance client immediately
+        if 'trading' in self.config:
+            self.binance_client.base_currency = self.config['trading'].get('base_currency', 'USDT')
+            self.binance_client.reserve_balance = float(self.config['trading'].get('reserve_balance', 0))
+            
         self.keyboard = [
             [KeyboardButton("/balance"), KeyboardButton("/stats"), KeyboardButton("/profits")],
             [KeyboardButton("/power"), KeyboardButton("/add"), KeyboardButton("/thresholds")],  # Changed /trading to /power
@@ -106,6 +112,7 @@ Status: Ready to ROAR! 🦖
         self.app.add_handler(add_trade_handler)
         self.app.add_handler(CommandHandler("thresholds", self.show_thresholds))
         self.app.add_handler(CommandHandler("menu", self.show_menu))
+        self.app.add_handler(CommandHandler("resetthresholds", self.reset_all_thresholds))  # Add new command
         
         # Register command handlers
         self.app.add_handler(CommandHandler("start", self.start_command))
@@ -121,19 +128,31 @@ Status: Ready to ROAR! 🦖
         
         await self.app.initialize()
         await self.app.start()
+        await self.send_restored_thresholds_message()
 
     async def start(self):
         """Start the bot and begin polling"""
         self.running = True
         
-        # Send startup message without ASCII art to avoid encoding issues
+        # Send startup message to all authorized users
         for user_id in self.allowed_users:
             try:
+                # First send welcome message
                 await self.app.bot.send_message(
                     chat_id=user_id, 
                     text=self.startup_message,
                     reply_markup=self.markup
                 )
+                
+                # Then check for restored thresholds
+                if self.binance_client and hasattr(self.binance_client, 'restored_threshold_info'):
+                    restored_info = self.binance_client.restored_threshold_info
+                    if restored_info:
+                        logger.info(f"Sending threshold restoration notification: {restored_info}")
+                        await self.send_threshold_restoration_notification(restored_info)
+                    else:
+                        logger.info("No restored thresholds to notify about")
+                
             except Exception as e:
                 logger.error(f"Failed to send startup message to {user_id}: {e}")
         
@@ -455,8 +474,8 @@ Menu:
                 f"Symbol: {order.symbol}\n"
                 f"Amount: {float(order.quantity):.8f} {order.symbol.replace('USDT', '')}\n"
                 f"Price: ${float(order.price):.2f}\n"
-                f"Total: ${float(order.price * order.quantity):.2f} USDT\n"  # Fixed double colon here
-                f"Fees: ${float(order.fees):.4f} {order.fee_asset}\n"
+                f"Total: ${float(order.price * order.quantity):.2f} USDT\n"  
+                f"Fees: ${float(order.fees):.4f} {order.fee_asset}\n"  # Fixed double colon here
                 f"Threshold: {order.threshold if order.threshold else 'Manual'}\n"
                 f"Timeframe: {self._get_timeframe_value(order.timeframe)}\n\n"
                 f"Check /profits to see your updated portfolio."
@@ -575,8 +594,12 @@ Menu:
                     else:
                         price_info = f"Current: ${current_price:,.2f}"
                     
-                    # Get threshold information
-                    triggered = self.binance_client.triggered_thresholds.get(symbol, {}).get(timeframe, [])
+                    # Get threshold information with proper access to triggered thresholds
+                    triggered = []
+                    if symbol in self.binance_client.triggered_thresholds:
+                        if timeframe.value in self.binance_client.triggered_thresholds[symbol]:
+                            triggered = list(self.binance_client.triggered_thresholds[symbol][timeframe.value])
+                    
                     available = [t for t in self.config['trading']['thresholds'][timeframe.value] 
                                if t not in triggered]
                     
@@ -1098,7 +1121,7 @@ Menu:
                 )
                 return
                 
-            # Get BTC historical prices for the same period
+            # Get BTC historical prices for the same period (still pass for backward compatibility)
             btc_prices = await self.binance_client.get_historical_prices("BTCUSDT", days)
             
             # Get buy orders for the period
@@ -1123,7 +1146,9 @@ Menu:
                 photo=chart_bytes,
                 caption="📊 Account Balance History (30 days)\n"
                         "💹 Green arrows indicate buy orders\n"
-                        "📈 Blue line shows BTC price for reference",
+                        "🟢 Green line: Total Balance\n"
+                        "🔵 Blue line: Invested Amount\n"
+                        "🟣 Purple line: Profit (Balance - Invested)",
                 reply_markup=self.markup
             )
             
@@ -1261,7 +1286,7 @@ Menu:
         message = (
             "⚠️ Trading Paused - Reserve Balance Protection\n\n"
             f"Current Balance: ${float(current_balance):.2f}\n"
-            f"Pending Orders: ${float(pending_value):.2f}\n"
+            f"Pending Orders: ${float(pending_value)::.2f}\n"
             f"Available Balance: ${available_balance:.2f}\n"
             f"Reserve Balance: ${reserve_balance:.2f}\n\n"
             "Trading will resume automatically on next timeframe reset\n"
@@ -1282,7 +1307,7 @@ Menu:
         """Send alert when initial balance is below reserve"""
         message = (
             "⚠️ WARNING - Insufficient Initial Balance\n\n"
-            f"Current Balance: ${float(current_balance)::.2f}\n"
+            f"Current Balance: ${float(current_balance):.2f}\n"  # Fixed double colon here
             f"Required Reserve: ${reserve_balance:.2f}\n\n"
             "Trading is paused until balance is above reserve requirement.\n"
             "You can:\n"
@@ -1301,4 +1326,180 @@ Menu:
             except Exception as e:
                 logger.error(f"Failed to send initial balance alert to {user_id}: {e}")
 
-    # ...rest of existing code...
+    async def send_threshold_restoration_notification(self, restored_info: Dict):
+        """Send notification about restored threshold state after restart"""
+        if not restored_info:
+            logger.warning("No threshold information to send in notification")
+            return
+            
+        message_parts = ["📋 Restored Threshold State:"]
+        threshold_count = 0
+        
+        for symbol, timeframes in restored_info.items():
+            symbol_parts = [f"\n🔸 {symbol}:"]
+            symbol_has_thresholds = False
+            
+            for timeframe, thresholds in timeframes.items():
+                if thresholds:  # Only show timeframes with triggered thresholds
+                    threshold_str = ", ".join([f"{t}%" for t in thresholds])
+                    symbol_parts.append(f"  • {timeframe.value}: {threshold_str}")
+                    threshold_count += len(thresholds)
+                    symbol_has_thresholds = True
+            
+            if symbol_has_thresholds:
+                message_parts.extend(symbol_parts)
+        
+        if threshold_count > 0:
+            message_parts.append("\nThese thresholds will not be triggered again until their next reset.")
+            
+            # Log the full message for debugging
+            logger.info(f"Sending threshold restoration notification with {threshold_count} thresholds")
+            
+            # Send to all authorized users
+            for user_id in self.allowed_users:
+                try:
+                    await self.app.bot.send_message(
+                        chat_id=user_id,
+                        text="\n".join(message_parts),
+                        reply_markup=self.markup
+                    )
+                    logger.info(f"Sent threshold restoration notification to user {user_id}")
+                except Exception as e:
+                    logger.error(f"Failed to send threshold restoration notification to {user_id}: {e}")
+        else:
+            logger.info("No thresholds to restore, skipping notification")
+
+    async def start_bot(self):
+        """Start the Telegram bot"""
+        # ...existing code...
+        
+        # Notify about restored thresholds
+        await self.notify_restored_thresholds()
+        
+        # ...existing code...
+    
+    async def notify_restored_thresholds(self):
+        """Notify users about thresholds that were restored from database"""
+        try:
+            # Get restored threshold information from binance client
+            restored_info = []
+            if self.binance_client and hasattr(self.binance_client, 'restored_threshold_info'):
+                restored_info = self.binance_client.restored_threshold_info
+            
+            if not restored_info:
+                logger.info("No restored thresholds to notify about")
+                return
+                
+            # Create notification message
+            message = "🔄 Restored threshold state:\n\n"
+            for info in restored_info:
+                message += f"• {info}\n"
+                
+            # Send notification to all allowed users
+            for user_id in self.allowed_users:
+                await self.send_message(user_id, message)
+                
+            logger.info(f"Notified users about {len(restored_info)} restored threshold states")
+            
+        except Exception as e:
+            logger.error(f"Failed to notify about restored thresholds: {e}")
+
+    async def reset_all_thresholds(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Reset all thresholds across all timeframes"""
+        if not self._is_authorized(update.effective_user.id):
+            await update.message.reply_text("⛔ Unauthorized access")
+            return
+        
+        try:
+            # Reset daily thresholds
+            await self.binance_client.reset_timeframe_thresholds('daily')
+            
+            # Reset weekly thresholds
+            await self.binance_client.reset_timeframe_thresholds('weekly')
+            
+            # Reset monthly thresholds
+            await self.binance_client.reset_timeframe_thresholds('monthly')
+            
+            await update.message.reply_text(
+                "✅ All thresholds have been reset across all timeframes.",
+                reply_markup=self.markup
+            )
+        except Exception as e:
+            logger.error(f"Failed to reset all thresholds: {e}")
+            await update.message.reply_text(
+                f"❌ Error resetting thresholds: {str(e)}",
+                reply_markup=self.markup
+            )
+
+    async def send_message(self, chat_id, text, **kwargs):
+        """Helper method to send messages to users"""
+        try:
+            if self.app and self.app.bot:
+                await self.app.bot.send_message(chat_id=chat_id, text=text, **kwargs)
+                return True
+            else:
+                logger.error("Telegram bot not initialized")
+                return False
+        except Exception as e:
+            logger.error(f"Error sending message: {e}")
+            return False
+
+    async def send_restored_thresholds_message(self):
+        """Send message about restored thresholds if any"""
+        try:
+            if not self.binance_client or not hasattr(self.binance_client, 'restored_threshold_info'):
+                logger.info("No restored thresholds to notify about")
+                return
+
+            restored_info = self.binance_client.restored_threshold_info
+            
+            # Skip if no thresholds were restored
+            if not restored_info:
+                logger.info("No restored thresholds to notify about (empty)")
+                return
+            
+            # Format the restored thresholds message
+            message = "🔄 *Restored Triggered Thresholds*\n\n"
+            
+            # Handle dictionary format with proper structure
+            has_thresholds = False
+            
+            for symbol, timeframes in restored_info.items():
+                if not timeframes:  # Skip symbols with no timeframes
+                    continue
+                    
+                symbol_message = f"*{symbol}*:\n"
+                symbol_has_thresholds = False
+                
+                for timeframe, thresholds in timeframes.items():
+                    if thresholds:  # Only include if there are thresholds
+                        sorted_thresholds = sorted(thresholds)
+                        threshold_str = ", ".join(f"{t}%" for t in sorted_thresholds)
+                        symbol_message += f"  • {timeframe.value}: {threshold_str}\n"
+                        symbol_has_thresholds = True
+                
+                if symbol_has_thresholds:
+                    message += symbol_message + "\n"
+                    has_thresholds = True
+            
+            # If no thresholds were found in any symbol, return early
+            if not has_thresholds:
+                logger.info("No triggered thresholds to report")
+                return
+                
+            message += "These thresholds will not trigger again until their next reset period."
+            
+            # Send the message to all allowed users
+            for user_id in self.allowed_users:
+                try:
+                    await self.app.bot.send_message(
+                        chat_id=user_id, 
+                        text=message, 
+                        parse_mode="Markdown"
+                    )
+                    logger.info(f"Sent threshold restoration message to user {user_id}")
+                except Exception as e:
+                    logger.error(f"Failed to send threshold restoration message to {user_id}: {e}")
+                    
+        except Exception as e:
+            logger.error(f"Failed to send startup threshold message: {e}")

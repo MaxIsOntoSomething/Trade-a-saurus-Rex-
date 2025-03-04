@@ -13,16 +13,16 @@ from ..utils.chart_generator import ChartGenerator
 logger = logging.getLogger(__name__)
 
 class BinanceClient:
-    def __init__(self, api_key: str, api_secret: str, testnet: bool = True):
+    def __init__(self, api_key: str, api_secret: str, telegram_bot=None, mongo_client=None, config=None, testnet: bool = True):
         self.api_key = api_key
         self.api_secret = api_secret
         self.testnet = testnet
-        self.client: Optional[AsyncClient] = None
-        self.reference_prices: Dict[str, Dict[TimeFrame, float]] = {}
-        self.triggered_thresholds: Dict[str, Dict[TimeFrame, List[float]]] = {}
+        self.client = None
+        self.reference_prices = {}
+        self.triggered_thresholds = {}
         self.rate_limiter = RateLimiter()
         self.symbol_info = {}
-        self.last_reset: Dict[TimeFrame, datetime] = {
+        self.last_reset = {
             tf: datetime.utcnow() for tf in TimeFrame
         }
         self.balance_cache = {}
@@ -31,11 +31,26 @@ class BinanceClient:
             TimeFrame.WEEKLY: None,
             TimeFrame.MONTHLY: None
         }
-        logger.setLevel(logging.DEBUG)  # Add this line
-        self.telegram_bot = None  # Add this line
+        logger.setLevel(logging.DEBUG)
+        self.telegram_bot = telegram_bot
         self.chart_generator = ChartGenerator()
         self.reserve_balance = None
         self.base_currency = None
+        self.mongo_client = mongo_client
+        self.config = config
+        
+        # Initialize thresholds dictionary with nested structure to track triggered thresholds
+        self.triggered_thresholds = {}
+        
+        # Initialize pairs with nested dictionaries for each timeframe if config is provided
+        if config and 'trading' in config and 'pairs' in config['trading']:
+            pairs = config['trading']['pairs']
+            for pair in pairs:
+                self.triggered_thresholds[pair] = {
+                    'daily': set(),
+                    'weekly': set(),
+                    'monthly': set()
+                }
         
     def set_telegram_bot(self, bot):
         """Set telegram bot for notifications"""
@@ -44,7 +59,12 @@ class BinanceClient:
     async def check_initial_balance(self) -> bool:
         """Check if current balance is above reserve requirement"""
         try:
-            if self.reserve_balance is None:
+            if self.reserve_balance is None or self.reserve_balance <= 0:
+                logger.info(f"Initial balance check skipped - no reserve requirement (value: {self.reserve_balance})")
+                return True
+
+            if not self.base_currency:
+                logger.warning("Initial balance check skipped - no base currency specified")
                 return True
 
             current_balance = await self.get_balance(self.base_currency)
@@ -82,9 +102,18 @@ class BinanceClient:
             testnet=self.testnet
         )
 
-        # Log initial configuration
-        logger.info(f"[INIT] Base Currency: {self.base_currency}")
-        logger.info(f"[INIT] Reserve Balance: ${self.reserve_balance:,.2f}" if self.reserve_balance else "[INIT] No reserve balance set")
+        # Set reserve balance directly from config with debug logging
+        if self.telegram_bot and self.telegram_bot.config:
+            self.base_currency = self.telegram_bot.config['trading']['base_currency']
+            self.reserve_balance = float(self.telegram_bot.config['trading'].get('reserve_balance', 0))
+            logger.info(f"[INIT] Base Currency: {self.base_currency}")
+            logger.info(f"[INIT] Reserve Balance: ${self.reserve_balance:,.2f}")
+        else:
+            logger.warning("[INIT] No config found for reserve balance!")
+            self.reserve_balance = 0  # Set default value instead of None
+
+        # Initialize restored threshold info
+        self.restored_threshold_info = []
 
         # Get exchange info for precision
         exchange_info = await self.client.get_exchange_info()
@@ -95,18 +124,63 @@ class BinanceClient:
                 'filters': {f['filterType']: f for f in symbol['filters']}
             }
             
-        # Set reserve balance directly from config with debug logging
-        if self.telegram_bot and self.telegram_bot.config:
-            self.reserve_balance = float(self.telegram_bot.config['trading'].get('reserve_balance', 0))
-            self.base_currency = self.telegram_bot.config['trading']['base_currency']
-            logger.info(f"[CRITICAL] Reserve balance set to: ${self.reserve_balance:,.2f} {self.base_currency}")
-        else:
-            self.reserve_balance = 0  # Set default value instead of None
-            logger.warning("[CRITICAL] No config found for reserve balance!")
+        # Restore triggered thresholds from database
+        if self.mongo_client:
+            self.restored_threshold_info = await self.restore_threshold_state()
             
-            # Add initial balance check
-            await self.check_initial_balance()
-        
+        # Add initial balance check
+        await self.check_initial_balance()
+
+    async def restore_threshold_state(self):
+        """Restore triggered thresholds from database on startup"""
+        try:
+            logger.info("Restoring threshold state from database...")
+            threshold_states = await self.mongo_client.get_triggered_thresholds()
+            
+            restored_count = 0
+            restored_info = {}  # Change to dictionary to properly track thresholds by symbol/timeframe
+            
+            # Process each threshold state and update the internal dictionary
+            for state in threshold_states:
+                symbol = state.get("symbol")
+                timeframe_str = state.get("timeframe")
+                thresholds = state.get("thresholds", [])
+                
+                # Skip if any required data is missing
+                if not symbol or not timeframe_str:
+                    continue
+                    
+                # Ensure pair is in our tracking dictionary
+                if symbol not in self.triggered_thresholds:
+                    self.triggered_thresholds[symbol] = {
+                        'daily': set(),
+                        'weekly': set(),
+                        'monthly': set()
+                    }
+                
+                # Convert thresholds to a set of floats and update internal state
+                threshold_set = set(float(t) for t in thresholds)
+                self.triggered_thresholds[symbol][timeframe_str] = threshold_set
+                
+                # Track restored thresholds in a structured way for notifications
+                if symbol not in restored_info:
+                    restored_info[symbol] = {}
+                    
+                if threshold_set:  # Only include timeframes with thresholds
+                    timeframe_enum = TimeFrame(timeframe_str)
+                    restored_info[symbol][timeframe_enum] = threshold_set
+                    restored_count += len(threshold_set)
+                    logger.info(f"Restored {len(threshold_set)} thresholds for {symbol} {timeframe_str}")
+            
+            logger.info(f"Restored {restored_count} thresholds across {len(restored_info)} symbols")
+            self.restored_threshold_info = restored_info
+            return restored_info
+            
+        except Exception as e:
+            logger.error(f"Failed to restore threshold state: {e}")
+            self.restored_threshold_info = {}
+            return {}
+
     async def close(self):
         if self.client:
             await self.client.close_connection()
@@ -143,7 +217,13 @@ class BinanceClient:
                 
                 # Clear triggered thresholds
                 if symbol in self.triggered_thresholds:
-                    self.triggered_thresholds[symbol][timeframe] = []
+                    self.triggered_thresholds[symbol][timeframe] = set()
+                    
+                    # Clear in database as well
+                    if self.telegram_bot and self.telegram_bot.mongo_client:
+                        await self.telegram_bot.mongo_client.save_triggered_threshold(
+                            symbol, timeframe.value, []
+                        )
                     
             self.last_reset[timeframe] = now
             
@@ -253,120 +333,200 @@ class BinanceClient:
             logger.error(f"Failed to update prices: {e}", exc_info=True)
             raise
             
-    async def check_thresholds(self, symbol: str, thresholds: Dict[str, List[float]]) -> Optional[tuple]:
-        """Check price against thresholds and return (timeframe, threshold) if triggered"""
+    async def check_thresholds(self, symbol: str, timeframe: TimeFrame) -> List[float]:
+        """Check if any thresholds are triggered for the given symbol and timeframe"""
         try:
-            await self.rate_limiter.acquire()
-            ticker = await self.client.get_symbol_ticker(symbol=symbol)
-            current_price = float(ticker['price'])
-            
-            for timeframe in TimeFrame:
-                # Skip if timeframe not in thresholds
-                if timeframe.value not in thresholds:
-                    continue
+            # Skip if trading is paused
+            if hasattr(self, 'telegram_bot') and self.telegram_bot.is_paused:
+                return []
 
-                if symbol not in self.reference_prices:
-                    continue
-                    
-                ref_price = self.reference_prices[symbol].get(timeframe)
-                if not ref_price:
-                    continue
-                    
-                price_change = ((ref_price - current_price) / ref_price) * 100
-                logger.debug(f"{symbol} {timeframe.value} price change: {price_change:.2f}%")
+            # Get current price and reference price
+            current_price = await self.get_current_price(symbol)
+            reference_price = await self.get_reference_price(symbol, timeframe)
+            
+            if not reference_price:
+                logger.warning(f"No reference price for {symbol} on {timeframe.value}")
+                return []
                 
-                # Check thresholds from lowest to highest
-                for threshold in sorted(thresholds[timeframe.value]):
-                    if (price_change >= threshold and 
-                        threshold not in self.triggered_thresholds[symbol][timeframe]):
-                        logger.info(f"Threshold triggered for {symbol}: {threshold}% on {timeframe.value}")
-                        
-                        # Send threshold notification before updating triggered list
-                        if self.telegram_bot:
-                            await self.telegram_bot.send_threshold_notification(
-                                symbol=symbol,
-                                timeframe=timeframe,
-                                threshold=threshold,
-                                current_price=current_price,
-                                reference_price=ref_price,
-                                price_change=price_change
-                            )
-                        
-                        self.triggered_thresholds[symbol][timeframe].append(threshold)
-                        return timeframe, threshold
-                        
-            return None
+            # Calculate absolute price change percentage
+            price_change = abs(((current_price - reference_price) / reference_price) * 100)
+            
+            # Debug log for price change
+            logger.debug(f"{symbol} {timeframe.value} price change: {price_change:.2f}%")
+            
+            # Get thresholds for the timeframe from config
+            timeframe_thresholds = self.config['trading']['thresholds'][timeframe.value]
+            
+            # Get already triggered thresholds for this symbol and timeframe
+            # Ensure proper access to the triggered thresholds data structure
+            triggered = set()
+            if symbol in self.triggered_thresholds and timeframe.value in self.triggered_thresholds[symbol]:
+                triggered = self.triggered_thresholds[symbol][timeframe.value]
+            
+            # Check which thresholds are triggered but not yet processed
+            newly_triggered = []
+            for threshold in timeframe_thresholds:
+                if price_change >= threshold and threshold not in triggered:
+                    logger.info(f"Threshold triggered for {symbol}: {threshold}% on {timeframe.value}")
+                    newly_triggered.append(threshold)
+                    
+                    # Mark threshold as triggered
+                    self.mark_threshold_triggered(symbol, timeframe, threshold)
+                    
+                    # Send notification if telegram bot is available
+                    if hasattr(self, 'telegram_bot') and self.telegram_bot:
+                        await self.telegram_bot.send_threshold_notification(
+                            symbol, timeframe, threshold, 
+                            current_price, reference_price, price_change
+                        )
+                    
+            return newly_triggered
             
         except Exception as e:
-            logger.error(f"Error checking thresholds for {symbol}: {e}", exc_info=True)
-            return None
+            logger.error(f"Error checking thresholds for {symbol} on {timeframe.value}: {e}")
+            return []
+
+    def mark_threshold_triggered(self, symbol: str, timeframe: TimeFrame, threshold: float):
+        """Mark a threshold as triggered in memory and persist to database"""
+        try:
+            # Initialize if needed
+            if symbol not in self.triggered_thresholds:
+                self.triggered_thresholds[symbol] = {}
+            if timeframe not in self.triggered_thresholds[symbol]:
+                self.triggered_thresholds[symbol][timeframe] = []
+                
+            # Add threshold if not already in list
+            if threshold not in self.triggered_thresholds[symbol][timeframe]:
+                self.triggered_thresholds[symbol][timeframe].append(threshold)
+                logger.info(f"Marking threshold {threshold}% as triggered for {symbol} {timeframe.value}")
+                
+            # Persist to database in background
+            asyncio.create_task(self.mongo_client.save_triggered_threshold(
+                symbol, timeframe, threshold
+            ))
+        except Exception as e:
+            logger.error(f"Error marking threshold triggered: {e}")
             
-    def _get_quantity_precision(self, symbol: str) -> int:
-        """Get the required decimal precision for quantity"""
-        if symbol in self.symbol_info:
-            return self.symbol_info[symbol]['baseAssetPrecision']
-        return PRECISION['DEFAULT']
-        
-    def _get_price_precision(self, symbol: str) -> int:
-        """Get the required decimal precision for price"""
-        if symbol in self.symbol_info:
-            return self.symbol_info[symbol]['quotePrecision']
-        return PRECISION['DEFAULT']
-        
-    async def calculate_fees(self, symbol: str, price: Decimal, quantity: Decimal) -> Tuple[Decimal, str]:
-        """Calculate fees for an order"""
-        if self.testnet:
-            # Testnet simulation
-            fee_rate = TRADING_FEES['DEFAULT']
-            fee_amount = price * quantity * Decimal(str(fee_rate))
-            fee_asset = 'USDT'
-        else:
-            try:
-                trade_fee = await self.client.get_trade_fee(symbol=symbol)
-                if trade_fee and trade_fee[0]:
-                    fee_rate = Decimal(str(trade_fee[0].get('makerCommission', TRADING_FEES['MAKER'])))
-                    fee_amount = price * quantity * fee_rate
-                    fee_asset = trade_fee[0].get('feeCoin', 'USDT')
-                else:
-                    fee_rate = Decimal(str(TRADING_FEES['DEFAULT']))
-                    fee_amount = price * quantity * fee_rate
-                    fee_asset = 'USDT'
-            except Exception as e:
-                logger.warning(f"Failed to get trading fees for {symbol}, using default: {e}")
-                fee_rate = Decimal(str(TRADING_FEES['DEFAULT']))
-                fee_amount = price * quantity * fee_rate
-                fee_asset = 'USDT'
+    async def reset_timeframe_thresholds(self, timeframe_str: str):
+        """Reset all thresholds for a specific timeframe"""
+        try:
+            # Convert string to TimeFrame enum if it's not already
+            if isinstance(timeframe_str, str):
+                timeframe = TimeFrame(timeframe_str)
+            else:
+                timeframe = timeframe_str
+            
+            logger.info(f"Resetting all thresholds for {timeframe.value} timeframe...")
+            
+            # Get reference prices for all symbols
+            reset_data = {
+                "timeframe": timeframe,
+                "prices": []
+            }
+            
+            # Track which symbols were reset for logging
+            reset_symbols = []
+            
+            for symbol in self.config['trading']['pairs']:
+                # Get current price
+                current_price = await self.get_current_price(symbol)
+                
+                # Store current price as new reference
+                if symbol not in self.reference_prices:
+                    self.reference_prices[symbol] = {}
+                
+                # Update reference price to current price
+                old_reference = self.reference_prices.get(symbol, {}).get(timeframe)
+                self.reference_prices[symbol][timeframe] = current_price
+                
+                # Calculate price change from previous reference (if exists)
+                price_change = 0
+                if old_reference:
+                    price_change = ((current_price - old_reference) / old_reference) * 100
+                
+                # Add to reset data for notification
+                reset_data["prices"].append({
+                    "symbol": symbol,
+                    "current_price": current_price,
+                    "reference_price": current_price,  # New reference is current price
+                    "previous_reference": old_reference,
+                    "price_change": price_change
+                })
+                
+                # Check if symbol had triggered thresholds to reset
+                if symbol in self.triggered_thresholds and timeframe.value in self.triggered_thresholds[symbol]:
+                    # Only log if there were thresholds to clear
+                    if self.triggered_thresholds[symbol][timeframe.value]:
+                        reset_symbols.append(symbol)
+                        logger.info(f"Cleared thresholds for {symbol} {timeframe.value}: {list(self.triggered_thresholds[symbol][timeframe.value])}")
+                    
+                    # Clear triggered thresholds for this symbol and timeframe
+                    self.triggered_thresholds[symbol][timeframe.value] = set()
+            
+            # Persist changes to database
+            await self.mongo_client.save_reference_prices(self.reference_prices)
+            await self.mongo_client.clear_triggered_thresholds(timeframe)
+            
+            # Send notification if telegram bot is available
+            if reset_data["prices"] and hasattr(self, 'telegram_bot') and self.telegram_bot:
+                await self.telegram_bot.send_timeframe_reset_notification(reset_data)
+                
+            if reset_symbols:
+                logger.info(f"Reset thresholds for {len(reset_symbols)} symbols: {', '.join(reset_symbols)}")
+            else:
+                logger.info(f"No triggered thresholds were found to reset for {timeframe.value} timeframe")
+                
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error resetting {timeframe_str} thresholds: {e}", exc_info=True)
+            return False
 
-        return fee_amount.quantize(Decimal('0.00000001')), fee_asset
-
-    def _adjust_quantity_to_lot_size(self, symbol: str, quantity: Decimal) -> Decimal:
-        """Adjust quantity to comply with lot size filter"""
-        if symbol not in self.symbol_info:
-            return quantity
-
-        lot_size_filter = self.symbol_info[symbol]['filters'].get('LOT_SIZE', {})
-        if not lot_size_filter:
-            return quantity
-
-        min_qty = Decimal(str(lot_size_filter.get('minQty', '0')))
-        max_qty = Decimal(str(lot_size_filter.get('maxQty', '999999')))
-        step_size = Decimal(str(lot_size_filter.get('stepSize', '0')))
-
-        if step_size == 0:
-            return quantity
-
-        # Calculate precision from step size
-        step_precision = abs(Decimal(str(step_size)).as_tuple().exponent)
-        
-        # Round to step size
-        adjusted_qty = Decimal(str(float(quantity) - (float(quantity) % float(step_size))))
-        adjusted_qty = adjusted_qty.quantize(Decimal('0.' + '0' * step_precision))
-
-        # Ensure quantity is within bounds
-        adjusted_qty = max(min_qty, min(adjusted_qty, max_qty))
-        
-        logger.debug(f"Adjusted quantity from {quantity} to {adjusted_qty} (step size: {step_size})")
-        return adjusted_qty
+    async def restore_triggered_thresholds(self):
+        """Restore triggered thresholds from database on startup"""
+        try:
+            # Get thresholds from database
+            stored_thresholds = await self.mongo_client.get_all_triggered_thresholds()
+            
+            # Initialize dictionary for notification data
+            restored_info = {}
+            
+            # Process each stored threshold
+            for threshold_data in stored_thresholds:
+                symbol = threshold_data['symbol']
+                timeframe = TimeFrame(threshold_data['timeframe'])
+                threshold = threshold_data['threshold']
+                
+                # Initialize nested dictionaries if needed
+                if symbol not in self.triggered_thresholds:
+                    self.triggered_thresholds[symbol] = {}
+                if timeframe not in self.triggered_thresholds[symbol]:
+                    self.triggered_thresholds[symbol][timeframe] = []
+                    
+                # Add threshold to in-memory storage
+                if threshold not in self.triggered_thresholds[symbol][timeframe]:
+                    self.triggered_thresholds[symbol][timeframe].append(threshold)
+                    
+                # Add to notification data
+                if symbol not in restored_info:
+                    restored_info[symbol] = {}
+                if timeframe not in restored_info[symbol]:
+                    restored_info[symbol][timeframe] = []
+                restored_info[symbol][timeframe].append(threshold)
+                
+            # Store restored threshold info for notification
+            self.restored_threshold_info = restored_info
+            
+            # Log restoration results
+            total_count = sum(len(thresholds) for symbol_data in self.triggered_thresholds.values() 
+                            for thresholds in symbol_data.values())
+            logger.info(f"Restored {total_count} triggered thresholds from database")
+            
+            return self.triggered_thresholds
+            
+        except Exception as e:
+            logger.error(f"Error restoring triggered thresholds: {e}")
+            return {}
 
     async def check_reserve_balance(self, order_amount: float) -> bool:
         """Check if placing an order would violate reserve balance"""
@@ -374,7 +534,7 @@ class BinanceClient:
             logger.info("[RESERVE CHECK] Starting reserve balance check...")
             
             if self.reserve_balance is None or self.reserve_balance <= 0:
-                logger.warning("[RESERVE CHECK] No valid reserve balance set!")
+                logger.info(f"[RESERVE CHECK] No valid reserve balance set (value: {self.reserve_balance})")
                 return True
 
             # Get current balance in base currency (USDT)
@@ -384,9 +544,10 @@ class BinanceClient:
             
             # Get sum of pending orders
             pending_orders_value = Decimal('0')
-            cursor = self.telegram_bot.mongo_client.orders.find({"status": "pending"})
-            async for order in cursor:
-                pending_orders_value += (Decimal(str(order['price'])) * Decimal(str(order['quantity'])))
+            if self.telegram_bot and self.telegram_bot.mongo_client:
+                cursor = self.telegram_bot.mongo_client.orders.find({"status": "pending"})
+                async for order in cursor:
+                    pending_orders_value += (Decimal(str(order['price'])) * Decimal(str(order['quantity'])))
 
             # Calculate remaining balance after pending orders
             available_balance = float(current_balance - pending_orders_value)
@@ -444,8 +605,7 @@ class BinanceClient:
             
             # Only update triggered thresholds if it's not a manual trade
             if not is_manual and threshold and symbol in self.triggered_thresholds and timeframe:
-                if threshold not in self.triggered_thresholds[symbol][timeframe]:
-                    self.triggered_thresholds[symbol][timeframe].append(threshold)
+                self.mark_threshold_triggered(symbol, timeframe.value, threshold)
             
             # Generate unique order ID
             order_id = str(int(datetime.utcnow().timestamp() * 1000))
@@ -653,3 +813,136 @@ class BinanceClient:
         except Exception as e:
             logger.error(f"Failed to get historical prices for {symbol}: {e}")
             return []
+
+    def mark_threshold_triggered(self, pair: str, timeframe: str, threshold: float):
+        """Mark a threshold as triggered and persist to database"""
+        # Ensure symbol exists in dictionary
+        if pair not in self.triggered_thresholds:
+            self.triggered_thresholds[pair] = {
+                'daily': set(),
+                'weekly': set(),
+                'monthly': set()
+            }
+            
+        # Ensure timeframe exists in the symbol's dictionary
+        if timeframe not in self.triggered_thresholds[pair]:
+            self.triggered_thresholds[pair][timeframe] = set()
+        
+        # Skip if already triggered
+        if threshold in self.triggered_thresholds[pair][timeframe]:
+            logger.debug(f"Threshold {threshold}% already triggered for {pair} {timeframe}")
+            return False
+        
+        # Mark as triggered
+        self.triggered_thresholds[pair][timeframe].add(threshold)
+        
+        # Save to database - create task but wait for completion to ensure it's saved
+        try:
+            logger.info(f"Marking threshold {threshold}% as triggered for {pair} {timeframe}")
+            if self.mongo_client:
+                asyncio.create_task(
+                    self.mongo_client.save_triggered_threshold(
+                        pair, 
+                        timeframe, 
+                        list(self.triggered_thresholds[pair][timeframe])
+                    )
+                )
+            return True
+        except Exception as e:
+            logger.error(f"Failed to persist threshold {threshold}% for {pair} {timeframe}: {e}")
+            return False
+
+    async def reset_timeframe_thresholds(self, timeframe: str):
+        """Reset thresholds for a specific timeframe and persist to database"""
+        try:
+            # Reset in memory
+            for symbol in self.triggered_thresholds:
+                # Ensure timeframe exists in the symbol's dictionary
+                if timeframe not in self.triggered_thresholds[symbol]:
+                    self.triggered_thresholds[symbol][timeframe] = set()
+                else:
+                    self.triggered_thresholds[symbol][timeframe] = set()
+            
+            # Reset in database
+            if self.mongo_client:
+                await self.mongo_client.reset_timeframe_thresholds(timeframe)
+            
+            logger.info(f"Reset all thresholds for timeframe: {timeframe}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to reset thresholds for {timeframe}: {e}")
+            return False
+
+    async def get_current_price(self, symbol: str) -> float:
+        """Get the current price for a symbol"""
+        try:
+            await self.rate_limiter.acquire()
+            ticker = await self.client.get_symbol_ticker(symbol=symbol)
+            return float(ticker['price'])
+        except Exception as e:
+            logger.error(f"Failed to get current price for {symbol}: {e}")
+            return None
+
+    def _get_quantity_precision(self, symbol: str) -> int:
+        """Get the quantity precision for a symbol"""
+        try:
+            if symbol in self.symbol_info:
+                return self.symbol_info[symbol]['baseAssetPrecision']
+            return 8  # Default precision if symbol info not available
+        except Exception as e:
+            logger.error(f"Error getting quantity precision for {symbol}: {e}")
+            return 8  # Default safe value
+
+    def _get_price_precision(self, symbol: str) -> int:
+        """Get the price precision for a symbol"""
+        try:
+            if symbol in self.symbol_info:
+                return self.symbol_info[symbol]['quotePrecision']
+            return 8  # Default precision if symbol info not available
+        except Exception as e:
+            logger.error(f"Error getting price precision for {symbol}: {e}")
+            return 8  # Default safe value
+
+    def _adjust_quantity_to_lot_size(self, symbol: str, quantity: Decimal) -> Decimal:
+        """Adjust quantity to valid lot size"""
+        try:
+            if symbol not in self.symbol_info:
+                return quantity  # Return unchanged if symbol info not available
+                
+            filters = self.symbol_info[symbol]['filters']
+            if 'LOT_SIZE' in filters:
+                lot_filter = filters['LOT_SIZE']
+                min_qty = Decimal(str(lot_filter['minQty']))
+                max_qty = Decimal(str(lot_filter['maxQty']))
+                step_size = Decimal(str(lot_filter['stepSize']))
+                
+                # Adjust to step size
+                if step_size != Decimal('0'):
+                    decimal_places = abs(step_size.as_tuple().exponent)
+                    quantity = (quantity // step_size) * step_size
+                    quantity = quantity.quantize(Decimal('0.' + '0' * decimal_places))
+                    
+                # Ensure within limits
+                quantity = max(min_qty, min(max_qty, quantity))
+                
+            return quantity
+        except Exception as e:
+            logger.error(f"Error adjusting quantity for {symbol}: {e}")
+            return quantity
+
+    async def calculate_fees(self, symbol: str, price: Decimal, quantity: Decimal) -> Tuple[Decimal, str]:
+        """Calculate trading fees for an order"""
+        try:
+            # Get fee rate for the symbol or use default
+            fee_rate = Decimal(str(TRADING_FEES.get(symbol, TRADING_FEES['DEFAULT'])))
+            
+            # Calculate fee amount
+            fee_amount = price * quantity * fee_rate
+            
+            # Default fee asset is USDT for spot trades
+            fee_asset = "USDT"
+            
+            return fee_amount, fee_asset
+        except Exception as e:
+            logger.error(f"Error calculating fees: {e}")
+            return Decimal('0'), "USDT"  # Default safe values

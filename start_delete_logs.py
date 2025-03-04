@@ -1,6 +1,7 @@
 import os
 import shutil
 import subprocess
+from pymongo import MongoClient
 
 # Define the logs directory
 logs_dir = "logs"
@@ -16,6 +17,14 @@ if os.path.exists(logs_dir):
                 shutil.rmtree(file_path)
         except Exception as e:
             print(f"Failed to delete {file_path}: {e}")
+
+# Delete the MongoDB database "tradeasaurus"
+try:
+    client = MongoClient("mongodb://localhost:27017/")  # Adjust connection string if needed
+    client.drop_database("tradeasaurus")
+    print("Database 'tradeasaurus' deleted successfully.")
+except Exception as e:
+    print(f"Failed to delete database 'tradeasaurus': {e}")
 
 # Start main.py
 subprocess.run(["python", "main.py"])

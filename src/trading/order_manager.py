@@ -60,39 +60,62 @@ class OrderManager:
             return False
             
     async def process_symbol(self, symbol: str):
-        """Check daily/weekly/monthly timeframes for a single symbol."""
+        """Process a single symbol for threshold checking"""
         try:
             logger.info(f"\n=== Processing {symbol} ===")
-            ticker = await self.binance_client.client.get_symbol_ticker(symbol=symbol)
-            current_price = float(ticker['price'])
+            
+            # Skip if trading is paused
+            if hasattr(self.binance_client, 'telegram_bot') and self.binance_client.telegram_bot.is_paused:
+                logger.info(f"Trading is paused, skipping {symbol}")
+                return
+                
+            # Get current price
+            current_price = await self.binance_client.get_current_price(symbol)
             logger.info(f"Current {symbol} price: ${current_price:,.2f}")
-
-            # Fetch all reference prices first and wait for completion
-            await self.binance_client.update_reference_prices([symbol])
-            await asyncio.sleep(0.1)  # Small delay after fetching references
-
-            # Check each timeframe in order
+            
+            # Check thresholds for each timeframe
             for timeframe in TimeFrame:
-                await self.binance_client.check_timeframe_reset(timeframe)
                 logger.info(f"Checking {timeframe.value} timeframe...")
                 
-                # Check thresholds with proper timeframe values
-                thresholds = self.config['trading']['thresholds'][timeframe.value]
-                triggered = await self.binance_client.check_thresholds(
-                    symbol, {timeframe.value: thresholds}
-                )
+                # Get triggered thresholds
+                triggered_thresholds = await self.binance_client.check_thresholds(symbol, timeframe)
                 
-                if triggered:
-                    tf, threshold = triggered
+                # Process each triggered threshold
+                for threshold in triggered_thresholds:
                     logger.info(f"🎯 Trigger: {symbol} {threshold}% on {timeframe.value}")
-                    # Create buy order
-                    await self.create_order(symbol, timeframe, threshold)
-                    logger.info(f"Created buy order for {symbol} at threshold {threshold}%")
-                
-                await asyncio.sleep(0.1)  # Small delay between timeframes
-
+                    
+                    # Attempt to place an order for this threshold
+                    try:
+                        # Check if we have enough balance - pass the order amount
+                        order_amount = self.config['trading']['order_amount']
+                        if not await self.binance_client.check_reserve_balance(order_amount):
+                            logger.warning(f"Insufficient balance to place order for {symbol} at {threshold}%")
+                            continue
+                            
+                        # Place buy order
+                        order = await self.binance_client.place_limit_buy_order(
+                            symbol=symbol,
+                            amount=order_amount,
+                            threshold=threshold,
+                            timeframe=timeframe
+                        )
+                        
+                        if order:
+                            # Save order to database
+                            await self.mongo_client.insert_order(order)
+                            
+                            # Send notification
+                            if self.telegram_bot:
+                                await self.telegram_bot.send_order_notification(order)
+                                
+                            logger.info(f"Created buy order for {symbol} at threshold {threshold}%")
+                        else:
+                            logger.error(f"Failed to create buy order for {symbol} at threshold {threshold}%")
+                    except Exception as e:
+                        logger.error(f"Error placing order for {symbol} at threshold {threshold}%: {e}")
+                        
         except Exception as e:
-            logger.error(f"Error processing {symbol}: {e}", exc_info=True)
+            logger.error(f"Error processing {symbol}: {e}")
 
     async def monitor_thresholds(self):
         logger.info("Starting price monitoring loop")

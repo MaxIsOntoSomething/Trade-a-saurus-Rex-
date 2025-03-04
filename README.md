@@ -39,8 +39,11 @@ This bot watches for significant price drops in cryptocurrencies and automatical
 - 🔄 Auto-cancellation of unfilled orders
 - 🤖 Telegram integration for monitoring and control
 - 📈 Tax-adjusted profit calculations (28%)
-- 🎨 Chat position visualizations after Order Executions
+- 🎨 Chart position visualizations after Order Executions
 - 💰 USDT balance protection
+- 📊 Enhanced visualization tools with balance history charts
+- 🗄️ MongoDB persistence of thresholds and reference prices
+- 🔁 Threshold state restoration after restart
 - 🐳 Docker support (works best when running on Server)
 
 ## Prerequisites
@@ -65,14 +68,28 @@ This bot watches for significant price drops in cryptocurrencies and automatical
 
 ## Telegram Commands
 
-- `/balance` - Current portfolio balance
-- `/stats` - Trading statistics
-- `/profits` - P/L analysis with tax calculations
-- `/add` - Add manual trade
-- `/thresholds` - View threshold status
 - `/start` - Start the bot and show welcome message
-- `/power` - Toggle trading on/off 
+- `/power` - Toggle trading on/off
 - `/balance` - Check current balance
+- `/stats` - Trading statistics
+- `/profits` - P/L analysis with tax calculations 
+- `/history` - View recent order history
+- `/thresholds` - Show threshold status and resets
+- `/add` - Add manual trade (interactive)
+- `/resetthresholds` - Reset all thresholds across timeframes
+- `/viz` - Show data visualizations (volume, profit, balance charts)
+- `/menu` - Show all available commands
+
+## Recent Updates and Improvements
+
+- **Enhanced Data Persistence**: All thresholds and reference prices are now stored in MongoDB for reliable recovery after restarts
+- **Threshold Restoration**: Bot now properly restores triggered thresholds after a restart
+- **Improved Visualization Tools**: Added balance history charts and improved trade visualizations
+- **Better Error Handling**: Comprehensive error handling throughout the system
+- **Fixed Format Strings**: Resolved formatting issues in notifications
+- **Optimized MongoDB Queries**: More efficient and robust database operations
+- **Reserve Balance Protection**: Enhanced reserve balance protection to prevent over-trading
+- **Command Improvements**: Added `/resetthresholds` command for manual reset
 
 ## Portfolio Analysis
 
@@ -81,6 +98,15 @@ The bot provides detailed portfolio analysis including:
 - Tax-adjusted profits
 - Fee calculations
 - Multi-timeframe performance
+- Balance history tracking
+
+## Docker Support
+
+The bot can run in Docker for improved stability and easier deployment on servers:
+
+```bash
+docker-compose up -d
+```
 
 ## Note on Drop Analysis
 
@@ -109,6 +135,9 @@ MIT License
 - ✅ **MongoDB Integration**  
 - ✅ **Migrating from SQLite**  
 - ✅ **Docker Support**
+- ✅ **Threshold Persistence**
+- ✅ **Balance History Charts**
+- ✅ **Format String Fixes**
 
 ### 📌 Planned  
 - 📌 **Weekly & Monthly Summary (Optional)**  

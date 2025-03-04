@@ -14,6 +14,9 @@ class MongoClient:
         self.db = self.client[database]
         self.orders = self.db.orders
         self.balance_history = self.db.balance_history  # Add balance_history collection
+        self.threshold_state = self.db.threshold_state  # Add collection for threshold state
+        self.thresholds = self.db.thresholds  # Add this line for thresholds collection
+        self.reference_prices = self.db.reference_prices  # Add this line for reference prices collection
 
     async def init_indexes(self):
         await self.orders.create_index("order_id", unique=True)
@@ -23,6 +26,17 @@ class MongoClient:
         
         # Add index for balance history
         await self.balance_history.create_index("timestamp")
+        
+        # Add index for threshold state
+        await self.threshold_state.create_index([("symbol", 1), ("timeframe", 1)], unique=True)
+        
+        # Add index for thresholds collection
+        await self.thresholds.create_index([("symbol", 1), ("timeframe", 1), ("threshold", 1)], unique=True)
+        
+        # Add index for reference prices
+        await self.reference_prices.create_index([("symbol", 1), ("timeframe", 1)], unique=True)
+        
+        logger.info("Database indexes initialized")
 
     def _validate_order_data(self, order: Order) -> bool:
         """Validate order data before insertion"""
@@ -466,13 +480,14 @@ class MongoClient:
             logger.error(f"Error getting visualization data: {e}")
             return []
 
-    async def record_balance(self, timestamp: datetime, balance: Decimal, invested: Decimal = None):
+    async def record_balance(self, timestamp: datetime, balance: Decimal, invested: Decimal = None, fees: Decimal = None):
         """Record balance snapshot for historical tracking"""
         try:
             await self.balance_history.insert_one({
                 "timestamp": timestamp,
                 "balance": str(balance),
                 "invested": str(invested) if invested is not None else None,
+                "fees": str(fees) if fees is not None else None,
                 "created_at": datetime.utcnow()
             })
             return True
@@ -494,7 +509,8 @@ class MongoClient:
                 result.append({
                     "timestamp": doc["timestamp"],
                     "balance": Decimal(doc["balance"]),
-                    "invested": Decimal(doc["invested"]) if doc.get("invested") else None
+                    "invested": Decimal(doc["invested"]) if doc.get("invested") else None,
+                    "fees": Decimal(doc["fees"]) if doc.get("fees") else Decimal('0')
                 })
                 
             return result
@@ -530,5 +546,168 @@ class MongoClient:
         except Exception as e:
             logger.error(f"Error getting buy orders: {e}")
             return []
+
+    async def save_triggered_threshold(self, symbol: str, timeframe: TimeFrame, threshold: float):
+        """Save a triggered threshold to the database"""
+        try:
+            # Convert TimeFrame enum to string value to prevent BSON serialization errors
+            timeframe_value = timeframe.value if hasattr(timeframe, 'value') else str(timeframe)
+            
+            # Prepare document
+            doc = {
+                'symbol': symbol,
+                'timeframe': timeframe_value,
+                'threshold': threshold,
+                'triggered_at': datetime.utcnow()
+            }
+            
+            # Use upsert to avoid duplicates
+            await self.thresholds.update_one(
+                {
+                    'symbol': symbol,
+                    'timeframe': timeframe_value,
+                    'threshold': threshold
+                },
+                {'$set': doc},
+                upsert=True
+            )
+            
+            logger.debug(f"Saved triggered threshold: {symbol} {timeframe_value} {threshold}%")
+            return True
+        except Exception as e:
+            logger.error(f"Error saving triggered threshold: {e}")
+            return False
+
+    async def get_all_triggered_thresholds(self):
+        """Get all triggered thresholds from the database"""
+        try:
+            cursor = self.thresholds.find()
+            result = []
+            async for doc in cursor:
+                result.append(doc)
+            return result
+        except Exception as e:
+            logger.error(f"Error getting triggered thresholds: {e}")
+            return []
+
+    async def clear_triggered_thresholds(self, timeframe: TimeFrame):
+        """Clear all triggered thresholds for a timeframe"""
+        try:
+            # Convert timeframe to string if it's an enum
+            timeframe_value = timeframe.value if hasattr(timeframe, 'value') else str(timeframe)
+            
+            result = await self.thresholds.delete_many({'timeframe': timeframe_value})
+            logger.info(f"Cleared {result.deleted_count} thresholds for {timeframe_value} timeframe")
+            return True
+        except Exception as e:
+            logger.error(f"Error clearing triggered thresholds: {e}")
+            return False
+
+    async def save_reference_prices(self, reference_prices: dict):
+        """Save reference prices to the database"""
+        try:
+            # Convert the nested dictionary to a flat list of documents
+            docs = []
+            for symbol, timeframes in reference_prices.items():
+                for timeframe, price in timeframes.items():
+                    # Convert TimeFrame enum to string value
+                    timeframe_value = timeframe.value if hasattr(timeframe, 'value') else str(timeframe)
+                    
+                    docs.append({
+                        'symbol': symbol,
+                        'timeframe': timeframe_value,
+                        'price': float(price),
+                        'updated_at': datetime.utcnow()
+                    })
+            
+            # Skip if no documents
+            if not docs:
+                return True
+                
+            # Clear existing prices and insert new ones
+            await self.reference_prices.delete_many({})
+            if docs:
+                await self.reference_prices.insert_many(docs)
+                
+            logger.debug(f"Saved {len(docs)} reference prices")
+            return True
+        except Exception as e:
+            logger.error(f"Error saving reference prices: {e}")
+            return False
+            
+    async def get_reference_prices(self):
+        """Get all reference prices from the database"""
+        try:
+            cursor = self.reference_prices.find()
+            result = {}
+            async for doc in cursor:
+                symbol = doc['symbol']
+                timeframe = TimeFrame(doc['timeframe'])
+                price = doc['price']
+                
+                if symbol not in result:
+                    result[symbol] = {}
+                result[symbol][timeframe] = price
+                
+            return result
+        except Exception as e:
+            logger.error(f"Error getting reference prices: {e}")
+            return {}
+
+    async def save_triggered_threshold(self, symbol: str, timeframe: str, thresholds: list):
+        """Save triggered thresholds to database for persistence"""
+        try:
+            # Convert timeframe to string if it's an enum to prevent BSON encoding errors
+            timeframe_value = timeframe.value if hasattr(timeframe, 'value') else str(timeframe)
+            
+            # Convert thresholds to float to ensure consistent storage
+            thresholds_float = [float(t) for t in thresholds]
+            
+            # Use upsert to create or update
+            await self.threshold_state.update_one(
+                {"symbol": symbol, "timeframe": timeframe_value},
+                {"$set": {"thresholds": thresholds_float, "updated_at": datetime.utcnow()}},
+                upsert=True
+            )
+            
+            logger.info(f"Saved threshold state for {symbol} {timeframe_value}: {thresholds_float}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save threshold state: {e}")
+            return False
+
+    async def get_triggered_thresholds(self):
+        """Get all triggered thresholds from database"""
+        try:
+            cursor = self.threshold_state.find({})
+            result = []
+            async for doc in cursor:
+                # Ensure thresholds are stored as float
+                thresholds = [float(t) for t in doc.get('thresholds', [])]
+                result.append({
+                    "symbol": doc.get("symbol"),
+                    "timeframe": doc.get("timeframe"),
+                    "thresholds": thresholds
+                })
+            logger.info(f"Retrieved {len(result)} threshold states from database")
+            return result
+        except Exception as e:
+            logger.error(f"Failed to get threshold state: {e}")
+            return []
+
+    async def reset_timeframe_thresholds(self, timeframe: str):
+        """Reset all thresholds for a specific timeframe"""
+        try:
+            # Convert timeframe to string if it's an enum
+            timeframe_value = timeframe.value if hasattr(timeframe, 'value') else str(timeframe)
+            
+            await self.threshold_state.update_many(
+                {"timeframe": timeframe_value},
+                {"$set": {"thresholds": [], "updated_at": datetime.utcnow()}}
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Failed to reset timeframe thresholds: {e}")
+            return False
 
     # ...rest of existing code...
