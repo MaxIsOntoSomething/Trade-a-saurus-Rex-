@@ -125,7 +125,7 @@ MIT License
 
 ### 🚀 Work in Progress  
 - ⚙️ **Futures Integration** ⏳ (In Progress)  
-- 🔗 **Bitget Integration** ⏳ (In Progress)  
+- 🔗 **Bybit Integration** ⏳ (In Progress)  
 
 ### ✅ Finished  
 - ✅ **Telegram - Open Orders Command**  
