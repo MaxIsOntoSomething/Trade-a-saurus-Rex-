@@ -49,6 +49,7 @@ class VisualizationType:
     ORDER_TYPES = "order_types"
     HOURLY_ACTIVITY = "hourly_activity"
     BALANCE_CHART = "balance_chart"  # Add new visualization type
+    ROI_COMPARISON = "roi_comparison"  # Add new visualization type for ROI comparison
 
 class TelegramBot:
     def __init__(self, token: str, allowed_users: List[int], 
@@ -124,7 +125,7 @@ Status: Ready to ROAR! 🦖
         
         # Add visualization command
         self.app.add_handler(CommandHandler("viz", self.show_viz_menu))
-        self.app.add_handler(CallbackQueryHandler(self.handle_viz_selection, pattern="^(daily_volume|profit_distribution|order_types|hourly_activity|balance_chart)$"))
+        self.app.add_handler(CallbackQueryHandler(self.handle_viz_selection, pattern="^(daily_volume|profit_distribution|order_types|hourly_activity|balance_chart|roi_comparison)$"))
         
         await self.app.initialize()
         await self.app.start()
@@ -1061,7 +1062,8 @@ Menu:
             [InlineKeyboardButton("💰 Profit Distribution", callback_data=VisualizationType.PROFIT_DIST)],
             [InlineKeyboardButton("📈 Order Types", callback_data=VisualizationType.ORDER_TYPES)],
             [InlineKeyboardButton("⏰ Hourly Activity", callback_data=VisualizationType.HOURLY_ACTIVITY)],
-            [InlineKeyboardButton("💹 Balance History", callback_data=VisualizationType.BALANCE_CHART)]
+            [InlineKeyboardButton("💹 Balance History", callback_data=VisualizationType.BALANCE_CHART)],
+            [InlineKeyboardButton("🔄 ROI Comparison", callback_data=VisualizationType.ROI_COMPARISON)]
         ]
         
         await update.message.reply_text(
@@ -1076,13 +1078,23 @@ Menu:
         
         viz_type = query.data
         
+        # Get allowed symbols from config for filtering
+        allowed_symbols = set(self.config['trading']['pairs'])
+        
         # Special handling for balance chart
         if viz_type == VisualizationType.BALANCE_CHART:
             await query.message.reply_text("Generating balance history chart...", reply_markup=self.markup)
             await self._generate_balance_chart(query.message.chat_id)
             return
             
-        data = await self.mongo_client.get_visualization_data(viz_type)
+        # Special handling for ROI comparison
+        if viz_type == VisualizationType.ROI_COMPARISON:
+            await query.message.reply_text("Generating ROI comparison chart...", reply_markup=self.markup)
+            await self._generate_roi_comparison(query.message.chat_id)
+            return
+            
+        # Pass allowed symbols to get only active trading pairs data
+        data = await self.mongo_client.get_visualization_data(viz_type, allowed_symbols)
         
         if not data:
             await query.message.reply_text(
@@ -1214,6 +1226,92 @@ Menu:
             response.append(f"{hour:02d}:00 {status}: {count}\n{bar}")
             
         return "\n".join(response)
+
+    async def _generate_roi_comparison(self, chat_id: int):
+        """Generate and send ROI comparison chart"""
+        try:
+            # Get historical performance data
+            days = 90  # Look at the last 90 days for comparison
+            allowed_symbols = set(self.config['trading']['pairs'])
+            
+            # Get portfolio performance data (returns a dict with dates and ROI percentages)
+            portfolio_data = await self.mongo_client.get_portfolio_performance(days, allowed_symbols)
+            
+            # Check if portfolio data is sufficient, generate simulated data if needed
+            if not portfolio_data or len(portfolio_data) < 5:  # Need at least 5 data points
+                logger.warning(f"Insufficient portfolio data ({len(portfolio_data) if portfolio_data else 0} points), using simulated data")
+                portfolio_data = await self._generate_simulated_portfolio_data(days)
+                
+                # Notify the user about simulation
+                await self.app.bot.send_message(
+                    chat_id=chat_id,
+                    text="⚠️ Not enough real portfolio data available. Generating simulated performance chart for demonstration.",
+                    reply_markup=self.markup
+                )
+            
+            # Get benchmark data (BTC performance)
+            btc_performance = await self.binance_client.get_historical_benchmark("BTCUSDT", days)
+            
+            # Get S&P 500 performance if available (through binance client's API or mock data)
+            sp500_performance = await self.binance_client.get_historical_benchmark("SP500", days)
+            
+            # Generate chart using chart generator
+            chart_bytes = await self.binance_client.chart_generator.generate_roi_comparison_chart(
+                portfolio_data, btc_performance, sp500_performance
+            )
+            
+            if not chart_bytes:
+                await self.app.bot.send_message(
+                    chat_id=chat_id,
+                    text="Failed to generate ROI comparison chart.",
+                    reply_markup=self.markup
+                )
+                return
+                
+            # Send chart to user
+            await self.app.bot.send_photo(
+                chat_id=chat_id,
+                photo=chart_bytes,
+                caption="📊 ROI Comparison (90 days)\n"
+                        "🟢 Green line: Portfolio Performance\n"
+                        "🟠 Orange line: Bitcoin Performance\n"
+                        "🔵 Blue line: S&P 500 Performance\n\n"
+                        "Values show percentage return relative to initial investment",
+                reply_markup=self.markup
+            )
+            
+        except Exception as e:
+            logger.error(f"Error generating ROI comparison chart: {e}", exc_info=True)
+            await self.app.bot.send_message(
+                chat_id=chat_id,
+                text=f"❌ Error generating ROI comparison chart: {str(e)}",
+                reply_markup=self.markup
+            )
+
+    async def _generate_simulated_portfolio_data(self, days: int) -> dict:
+        """Generate simulated portfolio performance data when real data is insufficient"""
+        import numpy as np
+        
+        logger.info("Generating simulated portfolio performance data")
+        today = datetime.utcnow()
+        np.random.seed(42)  # Use fixed seed for consistent results
+        
+        # Start with slight positive bias (0.05% average daily growth)
+        daily_change = 0.05
+        result = {}
+        
+        # Generate simulated portfolio performance data
+        base_value = 0.0  # Start at 0% ROI
+        for day in range(days, -1, -1):
+            date = (today - timedelta(days=day)).strftime('%Y-%m-%d')
+            # Simulate some realistic movement with noise and slight upward bias
+            random_factor = np.random.normal(0, 1) * daily_change
+            # More volatility than S&P 500 but less than BTC
+            base_value += random_factor + (daily_change / 10.0)  # Slight positive bias
+            result[date] = float(base_value)
+            
+        logger.info(f"Generated {len(result)} days of simulated portfolio data")
+        return result
 
     async def send_timeframe_reset_notification(self, reset_data: dict):
         """Send notification when a timeframe resets with price information"""
@@ -1503,3 +1601,42 @@ Menu:
                     
         except Exception as e:
             logger.error(f"Failed to send startup threshold message: {e}")
+
+    async def send_api_rate_limit_alert(self, service_name: str, feature: str):
+        """Send alert when an external API rate limit is reached"""
+        message = (
+            f"⚠️ API RATE LIMIT EXCEEDED\n\n"
+            f"Service: {service_name}\n"
+            f"Feature: {feature}\n\n"
+            f"The bot will use simulated data until the rate limit resets."
+        )
+        
+        for user_id in self.allowed_users:
+            try:
+                await self.app.bot.send_message(
+                    chat_id=user_id,
+                    text=message,
+                    reply_markup=self.markup
+                )
+            except Exception as e:
+                logger.error(f"Failed to send API rate limit alert to {user_id}: {e}")
+
+    async def send_api_error_alert(self, service_name: str, error_details: str, feature: str):
+        """Send alert when an external API returns an error"""
+        message = (
+            f"⚠️ API ERROR DETECTED\n\n"
+            f"Service: {service_name}\n"
+            f"Feature: {feature}\n"
+            f"Error: {error_details}\n\n"
+            f"The bot will use simulated data until the API is available again."
+        )
+        
+        for user_id in self.allowed_users:
+            try:
+                await self.app.bot.send_message(
+                    chat_id=user_id,
+                    text=message,
+                    reply_markup=self.markup
+                )
+            except Exception as e:
+                logger.error(f"Failed to send API error alert to {user_id}: {e}")

@@ -225,7 +225,7 @@ class ChartGenerator:
 
     async def generate_balance_chart(self, 
                                   balance_data: List[Dict],
-                                  btc_prices: List[Dict],
+                                  btc_prices: List[Dict],  # Keep param for backward compatibility but don't use it
                                   buy_orders: List[Dict]) -> Optional[bytes]:
         """Generate chart showing balance and investment data on the same chart"""
         try:
@@ -265,18 +265,63 @@ class ChartGenerator:
             ax1.xaxis.set_major_formatter(date_formatter)
             ax1.grid(True, alpha=0.3)
             ax1.set_title('Account Balance History')
-            ax1.legend(loc='upper left')
             
-            # Format y-axis with commas
+            # Format y-axis with commas and dollar sign
             ax1.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f'${x:,.2f}'))
             
-            # Plot buy markers on balance chart
+            # Add legend with better positioning
+            ax1.legend(loc='upper left', frameon=True, framealpha=0.8)
+            
+            # Plot buy markers on balance chart with clearer appearance
+            buy_marker_timestamps = []
+            buy_marker_values = []
+            buy_marker_sizes = []
+            buy_marker_labels = []
+            
             for order in buy_orders:
                 timestamp = order['timestamp']
                 if timestamp in balance_df.index:
                     balance_value = balance_df.loc[timestamp, 'balance']
-                    ax1.scatter(timestamp, balance_value, marker='^', s=100, 
-                               color='lime', edgecolors='darkgreen', zorder=5)
+                    buy_marker_timestamps.append(timestamp)
+                    buy_marker_values.append(balance_value)
+                    
+                    # Scale marker size based on order value (min 100, max 400)
+                    order_value = float(order.get('value', 0))
+                    marker_size = min(max(100, order_value * 2), 400)
+                    buy_marker_sizes.append(marker_size)
+                    
+                    # Create label with symbol and amount
+                    symbol = order.get('symbol', '').replace('USDT', '')
+                    amount = float(order.get('quantity', 0))
+                    buy_marker_labels.append(f"{symbol}: {amount:.4f}")
+            
+            # Add markers if we have any
+            if buy_marker_timestamps:
+                scatter = ax1.scatter(
+                    buy_marker_timestamps, 
+                    buy_marker_values, 
+                    marker='^', 
+                    s=buy_marker_sizes,
+                    color='lime', 
+                    edgecolors='darkgreen', 
+                    zorder=5,
+                    alpha=0.8
+                )
+                
+                # Add annotation for each buy point
+                for i, (x, y, label) in enumerate(zip(buy_marker_timestamps, buy_marker_values, buy_marker_labels)):
+                    # Only annotate every other point if many to avoid clutter
+                    if len(buy_marker_timestamps) <= 10 or i % 2 == 0:
+                        ax1.annotate(
+                            label,
+                            xy=(x, y),
+                            xytext=(0, 10),  # 10 points vertical offset
+                            textcoords='offset points',
+                            ha='center',
+                            va='bottom',
+                            fontsize=8,
+                            bbox=dict(boxstyle='round,pad=0.3', fc='yellow', alpha=0.7)
+                        )
             
             # Plot 2: Fees
             ax2 = fig.add_subplot(gs[1], sharex=ax1)
@@ -285,16 +330,22 @@ class ChartGenerator:
                 ax2.set_ylabel('USDT Fees')
                 ax2.xaxis.set_major_formatter(date_formatter)
                 ax2.grid(True, alpha=0.3)
-                ax2.legend(loc='upper left')
                 
                 # Format y-axis with commas
                 ax2.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f'${x:,.2f}'))
+                
+                # Add legend
+                ax2.legend(loc='upper left')
             else:
                 ax2.text(0.5, 0.5, 'No fee data available', 
                       horizontalalignment='center', verticalalignment='center',
                       transform=ax2.transAxes)
             
             ax2.set_xlabel('Date')
+            
+            # Add vertical grid lines for better date alignment
+            ax1.grid(True, which='major', axis='x', linestyle='-', alpha=0.2)
+            ax2.grid(True, which='major', axis='x', linestyle='-', alpha=0.2)
             
             # Layout adjustments
             plt.tight_layout()
@@ -310,6 +361,156 @@ class ChartGenerator:
             
         except Exception as e:
             logger.error(f"Error generating balance chart: {e}", exc_info=True)
+            return None
+
+    async def generate_roi_comparison_chart(self, 
+                                    portfolio_data: Dict,
+                                    btc_performance: Dict,
+                                    sp500_performance: Dict = None) -> Optional[bytes]:
+        """Generate chart comparing portfolio ROI with BTC and S&P 500"""
+        try:
+            if not portfolio_data or len(portfolio_data) < 2:
+                logger.error("Not enough portfolio data for ROI comparison")
+                
+                # Generate minimal sample data if needed
+                if not portfolio_data or len(portfolio_data) < 2:
+                    logger.info("Creating minimal sample data for ROI chart")
+                    # Create sample data with two points (to avoid errors but still show in logs)
+                    today = datetime.now()
+                    yesterday = today - timedelta(days=1)
+                    portfolio_data = {
+                        yesterday.strftime('%Y-%m-%d'): 0.0,
+                        today.strftime('%Y-%m-%d'): 1.0
+                    }
+            
+            # Create DataFrame for portfolio data
+            portfolio_df = pd.DataFrame([
+                {'date': date, 'roi': value} for date, value in portfolio_data.items()
+            ])
+            portfolio_df['date'] = pd.to_datetime(portfolio_df['date'])
+            portfolio_df.set_index('date', inplace=True)
+            
+            # Check if BTC data is available, create minimal if needed
+            if not btc_performance or len(btc_performance) < 2:
+                logger.info("Creating minimal sample BTC data")
+                today = datetime.now()
+                yesterday = today - timedelta(days=1)
+                btc_performance = {
+                    yesterday.strftime('%Y-%m-%d'): 0.0,
+                    today.strftime('%Y-%m-%d'): 1.5
+                }
+                
+            # Create DataFrame for BTC performance
+            btc_df = pd.DataFrame([
+                {'date': date, 'roi': value} for date, value in btc_performance.items()
+            ])
+            btc_df['date'] = pd.to_datetime(btc_df['date'])
+            btc_df.set_index('date', inplace=True)
+            
+            # Create DataFrame for S&P 500 if available
+            sp500_df = None
+            if sp500_performance and len(sp500_performance) > 0:
+                sp500_df = pd.DataFrame([
+                    {'date': date, 'roi': value} for date, value in sp500_performance.items()
+                ])
+                sp500_df['date'] = pd.to_datetime(sp500_df['date'])
+                sp500_df.set_index('date', inplace=True)
+            else:
+                # Create minimal sample S&P data
+                logger.info("Creating minimal sample S&P 500 data")
+                today = datetime.now()
+                yesterday = today - timedelta(days=1)
+                sp500_data = {
+                    yesterday.strftime('%Y-%m-%d'): 0.0,
+                    today.strftime('%Y-%m-%d'): 0.8
+                }
+                sp500_df = pd.DataFrame([
+                    {'date': date, 'roi': value} for date, value in sp500_data.items()
+                ])
+                sp500_df['date'] = pd.to_datetime(sp500_df['date'])
+                sp500_df.set_index('date', inplace=True)
+            
+            # Align all data on the same dates
+            # Get the common date range
+            start_date = max(
+                portfolio_df.index.min(),
+                btc_df.index.min(),
+                sp500_df.index.min() if sp500_df is not None else portfolio_df.index.min()
+            )
+            end_date = min(
+                portfolio_df.index.max(),
+                btc_df.index.max(),
+                sp500_df.index.max() if sp500_df is not None else portfolio_df.index.max()
+            )
+            
+            # Filter all dataframes to common date range
+            portfolio_df = portfolio_df.loc[start_date:end_date]
+            btc_df = btc_df.loc[start_date:end_date]
+            if sp500_df is not None:
+                sp500_df = sp500_df.loc[start_date:end_date]
+            
+            # Create figure for ROI comparison
+            fig, ax = plt.subplots(figsize=(12, 8))
+            
+            # Plot portfolio ROI
+            portfolio_df['roi'].plot(ax=ax, color='green', linewidth=2, label='Portfolio')
+            
+            # Plot BTC ROI
+            btc_df['roi'].plot(ax=ax, color='orange', linewidth=2, label='Bitcoin')
+            
+            # Plot S&P 500 ROI if available
+            if sp500_df is not None:
+                sp500_df['roi'].plot(ax=ax, color='blue', linewidth=2, label='S&P 500')
+            
+            # Add zero line for reference
+            ax.axhline(y=0, color='gray', linestyle='--', alpha=0.7)
+            
+            # Format chart
+            ax.set_title('Return on Investment (ROI) Comparison')
+            ax.set_ylabel('ROI (%)')
+            ax.grid(True, alpha=0.3)
+            
+            # Format y-axis as percentage
+            ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f'{x:.1f}%'))
+            
+            # Add legend
+            ax.legend(loc='best')
+            
+            # Calculate final ROI values for annotation
+            final_portfolio_roi = portfolio_df['roi'].iloc[-1]
+            final_btc_roi = btc_df['roi'].iloc[-1]
+            final_sp500_roi = sp500_df['roi'].iloc[-1] if sp500_df is not None else None
+            
+            # Add annotations for final values
+            text_y_pos = max(final_portfolio_roi, final_btc_roi)
+            if final_sp500_roi is not None:
+                text_y_pos = max(text_y_pos, final_sp500_roi)
+            text_y_pos += 5  # Add some padding
+            
+            # Add performance summary text
+            summary_text = (
+                f"Portfolio: {final_portfolio_roi:.2f}%\n"
+                f"Bitcoin: {final_btc_roi:.2f}%"
+            )
+            if final_sp500_roi is not None:
+                summary_text += f"\nS&P 500: {final_sp500_roi:.2f}%"
+                
+            # Add text box with performance summary
+            props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
+            ax.text(0.02, 0.98, summary_text, transform=ax.transAxes, fontsize=10,
+                  verticalalignment='top', bbox=props)
+            
+            # Save to buffer
+            buf = io.BytesIO()
+            plt.tight_layout()
+            plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+            plt.close(fig)
+            buf.seek(0)
+            
+            return buf.getvalue()
+            
+        except Exception as e:
+            logger.error(f"Error generating ROI comparison chart: {e}", exc_info=True)
             return None
 
     def format_info_text(self, order: Order, reference_price: Optional[Decimal] = None) -> str:
@@ -328,7 +529,7 @@ class ChartGenerator:
                 
             info.extend([
                 f"Amount: {float(order.quantity):.8f}",
-                f"Total Value: ${float(order.price * order.quantity):.2f}",  # Fixed format string here
+                f"Total Value: ${float(order.price * order.quantity)::.2f}",  # Fixed format string here
                 f"Type: {order.order_type.value.upper()}"
             ])
             

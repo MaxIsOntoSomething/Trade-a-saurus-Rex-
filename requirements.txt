@@ -10,3 +10,4 @@ matplotlib>=3.8.0
 numpy>=1.26.2
 websockets>=12.0
 httpx>=0.25.2
+finnhub-python>=2.4.18
