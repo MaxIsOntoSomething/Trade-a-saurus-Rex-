@@ -5,18 +5,18 @@ from datetime import datetime, timedelta
 import asyncio
 import logging
 from typing import Dict, List, Optional, Tuple
-import finnhub
 import aiohttp
 import json
 from ..types.models import Order, OrderStatus, TimeFrame, OrderType  # Add OrderType
 from ..utils.rate_limiter import RateLimiter
 from ..types.constants import PRECISION, MIN_NOTIONAL, TIMEFRAME_INTERVALS, TRADING_FEES
 from ..utils.chart_generator import ChartGenerator
+from ..utils.yahoo_scrapooooor_sp500 import YahooSP500Scraper  # Import the new Yahoo scraper
 
 logger = logging.getLogger(__name__)
 
 class BinanceClient:
-    def __init__(self, api_key: str, api_secret: str, telegram_bot=None, mongo_client=None, config=None, testnet: bool = True, finnhub_api_key: str = None):
+    def __init__(self, api_key: str, api_secret: str, telegram_bot=None, mongo_client=None, config=None, testnet: bool = True):
         self.api_key = api_key
         self.api_secret = api_secret
         self.testnet = testnet
@@ -42,15 +42,8 @@ class BinanceClient:
         self.mongo_client = mongo_client
         self.config = config
         
-        # Initialize Finnhub client for S&P 500 data
-        self.finnhub_api_key = finnhub_api_key
-        self.finnhub_client = None
-        if finnhub_api_key:
-            try:
-                self.finnhub_client = finnhub.Client(api_key=finnhub_api_key)
-                logger.info("Finnhub client initialized for S&P 500 data")
-            except Exception as e:
-                logger.error(f"Failed to initialize Finnhub client: {e}")
+        # Initialize Yahoo SP500 scraper
+        self.yahoo_scraper = YahooSP500Scraper()
         
         # Initialize thresholds dictionary with nested structure to track triggered thresholds
         self.triggered_thresholds = {}
@@ -983,17 +976,13 @@ class BinanceClient:
                     
                 return result
                 
-            # For S&P 500 data using Finnhub API
+            # For S&P 500 data using Yahoo scraper
             elif symbol == "SP500":
-                if not self.finnhub_api_key:
-                    logger.warning("No Finnhub API key provided for S&P 500 data, using simulated data")
-                    return await self._get_simulated_sp500_data(days)
-                
                 try:
-                    # Use Finnhub API to get S&P 500 historical data
-                    return await self._get_finnhub_sp500_data(days)
+                    # Use Yahoo Finance scraper to get S&P 500 historical data
+                    return await self.yahoo_scraper.get_sp500_data(days)
                 except Exception as e:
-                    logger.error(f"Error getting Finnhub S&P 500 data: {e}", exc_info=True)
+                    logger.error(f"Error getting Yahoo S&P 500 data: {e}", exc_info=True)
                     logger.info("Falling back to simulated S&P 500 data")
                     return await self._get_simulated_sp500_data(days)
             else:
@@ -1003,97 +992,6 @@ class BinanceClient:
         except Exception as e:
             logger.error(f"Error getting historical benchmark data for {symbol}: {e}", exc_info=True)
             return {}
-            
-    async def _get_finnhub_sp500_data(self, days: int = 90) -> Dict:
-        """Get real S&P 500 data using Finnhub API"""
-        try:
-            # Calculate start and end timestamps
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=90)
-            
-            # Convert to Unix timestamps (seconds)
-            from_timestamp = int(start_date.timestamp())
-            to_timestamp = int(end_date.timestamp())
-            
-            # Use direct HTTP request with aiohttp instead of the synchronous finnhub client
-            url = f"https://finnhub.io/api/v1/stock/candle"
-            params = {
-                "symbol": "^GSPC",  # S&P 500 index symbol
-                "resolution": "D",   # Daily candles
-                "from": from_timestamp,
-                "to": to_timestamp,
-                "token": self.finnhub_api_key
-            }
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, params=params) as response:
-                    # Check for rate limit status code specifically
-                    if response.status == 429:
-                        logger.error("Finnhub API rate limit exceeded (429)")
-                        return await self._get_simulated_sp500_data(days)
-                    
-                    # Check for permission denied (403) status specifically
-                    elif response.status == 403:
-                        error_text = await response.text()
-                        logger.error(f"Finnhub API permission denied (403): {error_text}")
-                        logger.info("API key may be invalid or missing permissions for stock data")
-                        
-                        # Don't attempt to notify users here - avoid potential infinite loop
-                        # if telegram_bot._generate_roi_comparison calls this method
-                        
-                        # Fall back to simulated data
-                        logger.info("Falling back to simulated S&P 500 data due to permission issue")
-                        return await self._get_simulated_sp500_data(days)
-                    
-                    elif response.status != 200:
-                        error_text = await response.text()
-                        logger.error(f"Finnhub API error: {response.status} {error_text}")
-                        return await self._get_simulated_sp500_data(days)
-                        
-                    data = await response.json()
-                    
-                    if data.get('s') != 'ok':
-                        error_msg = f"Finnhub API returned error status: {data}"
-                        logger.error(error_msg)
-                        return await self._get_simulated_sp500_data(days)
-                    
-                    # Process the candle data
-                    timestamps = data.get('t', [])  # Unix timestamps in seconds
-                    close_prices = data.get('c', [])
-                    
-                    if not timestamps or not close_prices:
-                        logger.error("No data in Finnhub API response")
-                        return await self._get_simulated_sp500_data(days)
-                    
-                    # Create a datetime-indexed dict of prices
-                    price_dict = {}
-                    for ts, price in zip(timestamps, close_prices):
-                        dt = datetime.fromtimestamp(ts)
-                        date_str = dt.strftime('%Y-%m-%d')
-                        price_dict[date_str] = price
-                    
-                    # Sort by date
-                    dates = sorted(price_dict.keys())
-                    if not dates:
-                        return {}
-                    
-                    # Calculate ROI percentages relative to first day
-                    base_price = price_dict[dates[0]]
-                    result = {}
-                    
-                    for date in dates:
-                        current_price = price_dict[date]
-                        roi = ((current_price - base_price) / base_price) * 100
-                        result[date] = roi
-                    
-                    logger.info(f"Successfully retrieved {len(result)} days of real S&P 500 data from Finnhub")
-                    return result
-        
-        except Exception as e:
-            logger.error(f"Error fetching S&P 500 data from Finnhub: {e}", exc_info=True)
-            # Fall back to simulated data
-            logger.info("Using simulated S&P 500 data instead")
-            return await self._get_simulated_sp500_data(days)
             
     async def _get_simulated_sp500_data(self, days: int = 90) -> Dict:
         """Generate simulated S&P 500 data when API is unavailable"""

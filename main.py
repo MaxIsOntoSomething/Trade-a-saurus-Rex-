@@ -87,18 +87,9 @@ def load_config_from_env() -> dict:
                 'weekly': [float(x) for x in os.getenv('TRADING_THRESHOLDS_WEEKLY', '5,10,15').split(',') if x],
                 'monthly': [float(x) for x in os.getenv('TRADING_THRESHOLDS_MONTHLY', '10,20,30').split(',') if x]
             }
-        },
-        'market_data': {
-            'finnhub_api_key': os.getenv('FINNHUB_API_KEY', '')
         }
     }
     
-    # Log if Finnhub API key is provided
-    if config['market_data']['finnhub_api_key']:
-        config_logger.log_config("Finnhub API key found in environment variables")
-    else:
-        config_logger.log_config("No Finnhub API key in environment - S&P 500 data will be simulated")
-        
     return config
 
 def load_and_merge_config() -> dict:
@@ -113,20 +104,6 @@ def load_and_merge_config() -> dict:
             config_logger.log_config("Loading configuration from config.json")
             with open(config_path, 'r') as f:
                 config = json.load(f)
-                
-            # Check if market_data section exists
-            if 'market_data' not in config:
-                config_logger.log_config("Adding missing market_data section to config")
-                config['market_data'] = {'finnhub_api_key': ''}
-            elif 'finnhub_api_key' not in config['market_data']:
-                config_logger.log_config("Adding missing finnhub_api_key to config")
-                config['market_data']['finnhub_api_key'] = ''
-                
-            # Log if Finnhub API key is found in config
-            if config['market_data']['finnhub_api_key']:
-                config_logger.log_config("Finnhub API key found in config.json")
-            else:
-                config_logger.log_config("No Finnhub API key in config - S&P 500 data will be simulated")
         else:
             config_logger.log_config("Loading configuration from environment variables")
             load_dotenv()
@@ -182,14 +159,13 @@ async def initialize_services(config):
         )
         await mongo_client.init_indexes()  # Initialize database indexes
         
-        # Initialize Binance client with finnhub api key
+        # Initialize Binance client without finnhub api key
         binance_client = BinanceClient(
             api_key=config['binance']['api_key'],
             api_secret=config['binance']['api_secret'],
             testnet=config['binance']['testnet'],
             mongo_client=mongo_client,
-            config=config,
-            finnhub_api_key=config['market_data']['finnhub_api_key']  # Pass Finnhub API key
+            config=config
         )
         
         # Initialize client connection

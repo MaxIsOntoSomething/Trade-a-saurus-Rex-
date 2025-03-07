@@ -1,7 +1,7 @@
 import mplfinance as mpf
 import pandas as pd
 import numpy as np  # Add the missing numpy import
-from datetime import datetime
+from datetime import datetime, timedelta  # Add timedelta import
 from decimal import Decimal
 from typing import List, Dict, Optional
 import logging
@@ -377,7 +377,7 @@ class ChartGenerator:
                     logger.info("Creating minimal sample data for ROI chart")
                     # Create sample data with two points (to avoid errors but still show in logs)
                     today = datetime.now()
-                    yesterday = today - timedelta(days=1)
+                    yesterday = today - timedelta(days=1)  # Now works with proper import
                     portfolio_data = {
                         yesterday.strftime('%Y-%m-%d'): 0.0,
                         today.strftime('%Y-%m-%d'): 1.0

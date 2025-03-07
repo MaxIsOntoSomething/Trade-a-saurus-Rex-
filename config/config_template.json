@@ -23,9 +23,6 @@
             "monthly": [] // Empty array means no monthly threshold remove comment for code to work
         },
         "reserve_balance": 500  
-    },
-    "market_data": {
-        "finnhub_api_key": "your_finnhub_api_key"
     }
 }
 
