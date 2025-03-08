@@ -215,3 +215,52 @@ class YahooSP500Scraper:
         except Exception as e:
             logger.error(f"Error getting S&P 500 daily change: {e}")
             return None
+
+    async def get_ytd_data(self) -> Dict[str, float]:
+        """
+        Get year-to-date performance data for S&P 500
+        Returns a dictionary of dates and percentage changes since the first trading day of the year
+        """
+        try:
+            # Calculate the days since the start of the year plus some buffer
+            current_year = datetime.now().year
+            start_date = datetime(current_year, 1, 1)
+            days_since_start = (datetime.now() - start_date).days
+            
+            # Get data for the year
+            data = await self.get_sp500_data(days_since_start + 10)  # Add buffer for holidays/weekends
+            
+            if not data:
+                logger.error("Failed to get S&P 500 data for YTD calculation")
+                return {}
+            
+            # Find the first trading day of the year
+            dates = sorted(data.keys())
+            first_date = None
+            base_value = 0
+            
+            for date in dates:
+                year = int(date.split('-')[0])
+                if year == current_year:
+                    first_date = date
+                    base_value = data[date]
+                    break
+            
+            if first_date is None:
+                logger.error("Could not find first trading day of the year in data")
+                return {}
+            
+            # Calculate YTD changes relative to the first trading day
+            ytd_data = {}
+            for date, value in data.items():
+                year = int(date.split('-')[0])
+                if year == current_year:
+                    # Reset the base to 0 (showing percentage change from first day)
+                    ytd_data[date] = value - base_value
+            
+            logger.info(f"Generated YTD data for S&P 500 with {len(ytd_data)} data points")
+            return ytd_data
+            
+        except Exception as e:
+            logger.error(f"Error getting YTD S&P 500 data: {e}", exc_info=True)
+            return {}

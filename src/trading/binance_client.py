@@ -1014,4 +1014,72 @@ class BinanceClient:
         logger.info(f"Generated {len(result)} days of simulated S&P 500 data")
         return result
 
+    async def get_btc_ytd_performance(self) -> Dict[str, float]:
+        """Get BTC year-to-date performance data"""
+        try:
+            current_year = datetime.now().year
+            start_date = datetime(current_year, 1, 1)
+            days_since_start = (datetime.now() - start_date).days
+            
+            # Get historical prices for BTC
+            prices = await self.get_historical_prices("BTCUSDT", days_since_start + 10)  # Add buffer
+            
+            if not prices or len(prices) < 2:
+                logger.warning("Not enough BTC historical data for YTD performance")
+                return {}
+                
+            # Find the first trading day of the current year
+            first_price = None
+            ytd_data = {}
+            
+            for price_data in prices:
+                date = price_data['timestamp']
+                if date.year == current_year:
+                    # Found first day of current year with data
+                    if first_price is None:
+                        first_price = float(price_data['price'])
+                    
+                    # Calculate percentage change from first day
+                    current_price = float(price_data['price'])
+                    change_pct = ((current_price - first_price) / first_price) * 100
+                    
+                    # Store with date string key
+                    date_str = date.strftime('%Y-%m-%d')
+                    ytd_data[date_str] = change_pct
+            
+            logger.info(f"Generated BTC YTD performance data with {len(ytd_data)} data points")
+            return ytd_data
+            
+        except Exception as e:
+            logger.error(f"Error getting BTC YTD performance: {e}", exc_info=True)
+            return {}
+
+    async def generate_ytd_comparison_chart(self) -> Optional[bytes]:
+        """Generate year-to-date comparison chart for BTC vs S&P 500"""
+        try:
+            # Get BTC year-to-date performance
+            btc_data = await self.get_btc_ytd_performance()
+            if not btc_data:
+                logger.error("Failed to get BTC YTD data")
+                return None
+                
+            # Get S&P 500 year-to-date performance
+            sp500_data = await self.yahoo_scraper.get_ytd_data()
+            if not sp500_data:
+                logger.error("Failed to get S&P 500 YTD data")
+                return None
+                
+            # Generate chart
+            chart_bytes = await self.chart_generator.generate_ytd_comparison_chart(
+                btc_data,
+                sp500_data,
+                datetime.now().year
+            )
+            
+            return chart_bytes
+            
+        except Exception as e:
+            logger.error(f"Error generating YTD comparison chart: {e}", exc_info=True)
+            return None
+
     # ...rest of existing code...

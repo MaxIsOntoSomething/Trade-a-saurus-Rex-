@@ -50,6 +50,8 @@ class VisualizationType:
     HOURLY_ACTIVITY = "hourly_activity"
     BALANCE_CHART = "balance_chart"  # Add new visualization type
     ROI_COMPARISON = "roi_comparison"  # Add new visualization type for ROI comparison
+    SP500_VS_BTC = "sp500_vs_btc"  # Add new visualization type for S&P 500 vs BTC comparison
+    PORTFOLIO_COMPOSITION = "portfolio_composition"  # Add new visualization type
 
 class TelegramBot:
     def __init__(self, token: str, allowed_users: List[int], 
@@ -125,7 +127,7 @@ Status: Ready to ROAR! 🦖
         
         # Add visualization command
         self.app.add_handler(CommandHandler("viz", self.show_viz_menu))
-        self.app.add_handler(CallbackQueryHandler(self.handle_viz_selection, pattern="^(daily_volume|profit_distribution|order_types|hourly_activity|balance_chart|roi_comparison)$"))
+        self.app.add_handler(CallbackQueryHandler(self.handle_viz_selection, pattern="^(daily_volume|profit_distribution|order_types|hourly_activity|balance_chart|roi_comparison|sp500_vs_btc|portfolio_composition)$"))
         
         await self.app.initialize()
         await self.app.start()
@@ -1063,7 +1065,9 @@ Menu:
             [InlineKeyboardButton("📈 Order Types", callback_data=VisualizationType.ORDER_TYPES)],
             [InlineKeyboardButton("⏰ Hourly Activity", callback_data=VisualizationType.HOURLY_ACTIVITY)],
             [InlineKeyboardButton("💹 Balance History", callback_data=VisualizationType.BALANCE_CHART)],
-            [InlineKeyboardButton("🔄 ROI Comparison", callback_data=VisualizationType.ROI_COMPARISON)]
+            [InlineKeyboardButton("🔄 ROI Comparison", callback_data=VisualizationType.ROI_COMPARISON)],
+            [InlineKeyboardButton("⚔️ S&P 500 vs BTC (YTD)", callback_data=VisualizationType.SP500_VS_BTC)],
+            [InlineKeyboardButton("🥧 Portfolio Composition", callback_data=VisualizationType.PORTFOLIO_COMPOSITION)]
         ]
         
         await update.message.reply_text(
@@ -1091,6 +1095,18 @@ Menu:
         if viz_type == VisualizationType.ROI_COMPARISON:
             await query.message.reply_text("Generating ROI comparison chart...", reply_markup=self.markup)
             await self._generate_roi_comparison(query.message.chat_id)
+            return
+            
+        # Special handling for S&P 500 vs BTC comparison
+        if viz_type == VisualizationType.SP500_VS_BTC:
+            await query.message.reply_text("Generating S&P 500 vs BTC year-to-date comparison...", reply_markup=self.markup)
+            await self._generate_sp500_vs_btc_comparison(query.message.chat_id)
+            return
+            
+        # Special handling for portfolio composition
+        if viz_type == VisualizationType.PORTFOLIO_COMPOSITION:
+            await query.message.reply_text("Generating portfolio composition chart...", reply_markup=self.markup)
+            await self._generate_portfolio_composition_chart(query.message.chat_id)
             return
             
         # Pass allowed symbols to get only active trading pairs data
@@ -1640,3 +1656,352 @@ Menu:
                 )
             except Exception as e:
                 logger.error(f"Failed to send API error alert to {user_id}: {e}")
+
+    async def _generate_sp500_vs_btc_comparison(self, chat_id: int):
+        """Generate and send S&P 500 vs BTC year-to-date comparison chart"""
+        try:
+            # Get current year
+            current_year = datetime.now().year
+            start_date = datetime(current_year, 1, 1)
+            days_since_start = (datetime.now() - start_date).days
+            
+            # Get BTC data for current year
+            btc_data = await self.binance_client.get_historical_prices("BTCUSDT", days_since_start + 5)  # Add buffer days
+            
+            if not btc_data or len(btc_data) < 2:
+                await self.app.bot.send_message(
+                    chat_id=chat_id,
+                    text="Not enough BTC price data for year-to-date comparison.",
+                    reply_markup=self.markup
+                )
+                return
+                
+            # Filter BTC data to only include this year
+            btc_ytd_prices = {}
+            btc_start_price = None
+            
+            for data_point in btc_data:
+                if data_point['timestamp'].year == current_year:
+                    date_str = data_point['timestamp'].strftime('%Y-%m-%d')
+                    price = float(data_point['price'])
+                    
+                    # Set start price to first entry of the year
+                    if btc_start_price is None:
+                        btc_start_price = price
+                    
+                    # Calculate percentage change from start of year
+                    btc_ytd_prices[date_str] = ((price - btc_start_price) / btc_start_price) * 100
+            
+            # Get S&P 500 data from Yahoo scraper
+            sp500_data = await self.binance_client.yahoo_scraper.get_sp500_data(days_since_start + 5)
+            
+            if not sp500_data or len(sp500_data) < 2:
+                await self.app.bot.send_message(
+                    chat_id=chat_id,
+                    text="Failed to get S&P 500 data for year-to-date comparison.",
+                    reply_markup=self.markup
+                )
+                return
+                
+            # Filter S&P 500 data to only include this year
+            sp500_ytd = {}
+            first_date = None
+            first_value = 0
+            
+            # Sort the dates to find the earliest one in the current year
+            dates = sorted(sp500_data.keys())
+            for date in dates:
+                year = int(date.split('-')[0])
+                if year == current_year:
+                    if first_date is None:
+                        first_date = date
+                        first_value = sp500_data[date]
+                    
+                    # Adjust values to be relative to the first day of the year
+                    sp500_ytd[date] = sp500_data[date] - first_value
+            
+            # Create the comparison chart
+            chart_bytes = await self._create_ytd_comparison_chart(btc_ytd_prices, sp500_ytd, current_year)
+            
+            if not chart_bytes:
+                await self.app.bot.send_message(
+                    chat_id=chat_id,
+                    text="Failed to generate comparison chart.",
+                    reply_markup=self.markup
+                )
+                return
+                
+            # Get current values for caption
+            btc_current = list(btc_ytd_prices.values())[-1] if btc_ytd_prices else 0
+            sp500_current = list(sp500_ytd.values())[-1] if sp500_ytd else 0
+            
+            # Send the chart
+            await self.app.bot.send_photo(
+                chat_id=chat_id,
+                photo=chart_bytes,
+                caption=f"📈 {current_year} Year-to-Date Performance Comparison\n\n"
+                        f"🟠 Bitcoin: {btc_current:.2f}%\n"
+                        f"🔵 S&P 500: {sp500_current:.2f}%\n\n"
+                        f"Chart shows percentage change since January 1, {current_year}",
+                reply_markup=self.markup
+            )
+            
+        except Exception as e:
+            logger.error(f"Error generating S&P 500 vs BTC comparison: {e}", exc_info=True)
+            await self.app.bot.send_message(
+                chat_id=chat_id,
+                text=f"❌ Error generating comparison chart: {str(e)}",
+                reply_markup=self.markup
+            )
+            
+    async def _create_ytd_comparison_chart(self, btc_data: dict, sp500_data: dict, year: int) -> Optional[bytes]:
+        """Create year-to-date comparison chart between BTC and S&P 500"""
+        try:
+            import matplotlib.pyplot as plt
+            from matplotlib.ticker import FuncFormatter
+            import matplotlib.dates as mdates
+            import pandas as pd
+            import io
+
+            # Convert data to DataFrames
+            btc_df = pd.DataFrame([
+                {'date': date, 'value': value} for date, value in btc_data.items()
+            ])
+            
+            if not btc_df.empty:
+                btc_df['date'] = pd.to_datetime(btc_df['date'])
+                btc_df.set_index('date', inplace=True)
+                
+            sp500_df = pd.DataFrame([
+                {'date': date, 'value': value} for date, value in sp500_data.items()
+            ])
+            
+            if not sp500_df.empty:
+                sp500_df['date'] = pd.to_datetime(sp500_df['date'])
+                sp500_df.set_index('date', inplace=True)
+            
+            # Create figure
+            fig, ax = plt.subplots(figsize=(12, 8))
+            
+            # Plot both datasets
+            if not btc_df.empty:
+                btc_df['value'].plot(ax=ax, color='orange', linewidth=2, label='Bitcoin')
+            
+            if not sp500_df.empty:
+                sp500_df['value'].plot(ax=ax, color='blue', linewidth=2, label='S&P 500')
+            
+            # Add zero line
+            ax.axhline(y=0, color='gray', linestyle='--', alpha=0.7)
+            
+            # Format chart
+            ax.set_title(f'BTC vs S&P 500 Year-to-Date Performance ({year})')
+            ax.set_ylabel('YTD Change (%)')
+            ax.grid(True, alpha=0.3)
+            
+            # Format y-axis as percentage
+            ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f'{x:.1f}%'))
+            
+            # Format x-axis to show months
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%b'))
+            ax.xaxis.set_major_locator(mdates.MonthLocator())
+            
+            # Add legend
+            ax.legend(loc='best')
+            
+            # Get final values for annotation
+            if not btc_df.empty:
+                final_btc = btc_df['value'].iloc[-1]
+                ax.annotate(f"{final_btc:.1f}%", 
+                          xy=(btc_df.index[-1], final_btc),
+                          xytext=(5, 5), textcoords='offset points')
+            
+            if not sp500_df.empty:
+                final_sp500 = sp500_df['value'].iloc[-1]
+                ax.annotate(f"{final_sp500:.1f}%", 
+                          xy=(sp500_df.index[-1], final_sp500),
+                          xytext=(5, -15), textcoords='offset points')
+            
+            # Save to buffer
+            buf = io.BytesIO()
+            plt.tight_layout()
+            plt.savefig(buf, format='png', dpi=150)
+            plt.close(fig)
+            buf.seek(0)
+            
+            return buf.getvalue()
+            
+        except Exception as e:
+            logger.error(f"Error creating YTD comparison chart: {e}", exc_info=True)
+            return None
+
+    async def _generate_portfolio_composition_chart(self, chat_id: int):
+        """Generate and send portfolio composition pie chart"""
+        try:
+            # Get positions from MongoDB for configured pairs
+            allowed_symbols = set(self.config['trading']['pairs'])
+            positions = await self.mongo_client.get_position_stats(allowed_symbols)
+            
+            if not positions or len(positions) == 0:
+                await self.app.bot.send_message(
+                    chat_id=chat_id,
+                    text="No portfolio data available for composition chart.",
+                    reply_markup=self.markup
+                )
+                return
+                
+            # Get USDT balance
+            usdt_balance = await self.binance_client.get_balance('USDT')
+            
+            # Get current prices for all positions to calculate current values
+            portfolio_data = []
+            total_value = float(usdt_balance)  # Start with USDT balance
+            asset_values = {'USDT': float(usdt_balance)}
+            
+            for symbol, position in positions.items():
+                if float(position['total_quantity']) <= 0:
+                    continue
+                    
+                try:
+                    # Get current price for the symbol
+                    ticker = await self.binance_client.client.get_symbol_ticker(symbol=symbol)
+                    current_price = float(ticker['price'])
+                    
+                    # Calculate current value of the position
+                    position_value = float(position['total_quantity']) * current_price
+                    
+                    # Add to total portfolio value
+                    total_value += position_value
+                    
+                    # Store the value for this asset
+                    base_asset = symbol.replace('USDT', '')
+                    asset_values[base_asset] = position_value
+                    
+                except Exception as e:
+                    logger.error(f"Error getting price for {symbol}: {e}")
+            
+            # Generate the chart
+            chart_bytes = await self._create_portfolio_composition_chart(asset_values, total_value)
+            
+            if not chart_bytes:
+                await self.app.bot.send_message(
+                    chat_id=chat_id,
+                    text="Failed to generate portfolio composition chart.",
+                    reply_markup=self.markup
+                )
+                return
+                
+            # Format a detailed text for the caption
+            caption_lines = ["📊 Portfolio Composition"]
+            for asset, value in sorted(asset_values.items(), key=lambda x: x[1], reverse=True):
+                percentage = (value / total_value * 100) if total_value > 0 else 0
+                caption_lines.append(f"{asset}: ${value:.2f} ({percentage:.1f}%)")
+            
+            caption_lines.append(f"\nTotal Portfolio Value: ${total_value:.2f}")
+            
+            # Send chart to user
+            await self.app.bot.send_photo(
+                chat_id=chat_id,
+                photo=chart_bytes,
+                caption="\n".join(caption_lines),
+                reply_markup=self.markup
+            )
+            
+        except Exception as e:
+            logger.error(f"Error generating portfolio composition chart: {e}", exc_info=True)
+            await self.app.bot.send_message(
+                chat_id=chat_id,
+                text=f"❌ Error generating portfolio composition chart: {str(e)}",
+                reply_markup=self.markup
+            )
+            
+    async def _create_portfolio_composition_chart(self, asset_values: dict, total_value: float) -> Optional[bytes]:
+        """Create portfolio composition pie chart"""
+        try:
+            import matplotlib.pyplot as plt
+            import numpy as np
+            import io
+            from matplotlib.patches import Wedge
+            
+            # Remove assets with very small percentages to avoid cluttering
+            filtered_assets = {}
+            other_value = 0
+            
+            for asset, value in asset_values.items():
+                percentage = (value / total_value * 100) if total_value > 0 else 0
+                if percentage >= 1.0:  # Only show assets that are at least 1% of portfolio
+                    filtered_assets[asset] = value
+                else:
+                    other_value += value
+                    
+            # Add an "Other" category if needed
+            if other_value > 0:
+                filtered_assets["Other"] = other_value
+                
+            # Sort by value for better presentation
+            sorted_items = sorted(filtered_assets.items(), key=lambda x: x[1], reverse=True)
+            
+            # Create labels and values
+            labels = [item[0] for item in sorted_items]
+            values = [item[1] for item in sorted_items]
+            percentages = [(value / total_value * 100) if total_value > 0 else 0 for value in values]
+            
+            # Generate colors - ensure USDT is a specific color if present
+            colors = plt.cm.tab20.colors[:len(labels)]
+            if 'USDT' in labels:
+                usdt_index = labels.index('USDT')
+                # Use a specific color for USDT - light green
+                colors = list(colors)
+                colors[usdt_index] = (0.2, 0.8, 0.2, 1.0)  # RGBA for green
+            
+            # Create figure
+            plt.figure(figsize=(10, 8))
+            
+            # Create a slightly more visually appealing pie chart with shadow and explode effect
+            explode = [0.05] * len(labels)  # Small explode effect for all pieces
+            if 'USDT' in labels:
+                usdt_index = labels.index('USDT')
+                explode[usdt_index] = 0.1  # Larger explode for USDT
+            
+            # Create the pie chart with percentages displayed in legend
+            patches, texts, autotexts = plt.pie(
+                values, 
+                labels=None,  # We'll add custom legend
+                explode=explode,
+                shadow=True,
+                startangle=90,
+                colors=colors,
+                autopct='%1.1f%%',
+                pctdistance=0.85,
+                wedgeprops=dict(width=0.5, edgecolor='w')
+            )
+            
+            # Customize the appearance of percentage text
+            for autotext in autotexts:
+                autotext.set_color('white')
+                autotext.set_fontsize(10)
+                autotext.set_fontweight('bold')
+            
+            # Create a custom legend with both asset and percentage
+            legend_labels = [f"{label} (${value:.2f})" for label, value in zip(labels, values)]
+            plt.legend(
+                patches,
+                legend_labels,
+                loc="center left",
+                bbox_to_anchor=(1, 0.5),
+                frameon=False
+            )
+            
+            plt.title("Portfolio Composition", fontsize=16, pad=20)
+            plt.tight_layout()
+            
+            # Save to buffer
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+            plt.close()
+            buf.seek(0)
+            
+            return buf.getvalue()
+            
+        except Exception as e:
+            logger.error(f"Error creating portfolio composition chart: {e}", exc_info=True)
+            return None

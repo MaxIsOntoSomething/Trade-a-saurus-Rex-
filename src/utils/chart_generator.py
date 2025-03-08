@@ -10,6 +10,7 @@ import io
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 from matplotlib.ticker import FuncFormatter
+import matplotlib.dates as mdates
 
 logger = logging.getLogger(__name__)
 
@@ -511,6 +512,185 @@ class ChartGenerator:
             
         except Exception as e:
             logger.error(f"Error generating ROI comparison chart: {e}", exc_info=True)
+            return None
+
+    async def generate_ytd_comparison_chart(self, 
+                                    btc_data: Dict,
+                                    sp500_data: Dict,
+                                    year: int = None) -> Optional[bytes]:
+        """Generate year-to-date comparison chart between Bitcoin and S&P 500"""
+        try:
+            if not year:
+                year = datetime.now().year
+            
+            if not btc_data or len(btc_data) < 2:
+                logger.error("Not enough BTC data for YTD comparison")
+                return None
+                
+            if not sp500_data or len(sp500_data) < 2:
+                logger.error("Not enough S&P 500 data for YTD comparison")
+                return None
+            
+            # Create DataFrames
+            btc_df = pd.DataFrame([
+                {'date': date, 'value': value} for date, value in btc_data.items()
+            ])
+            btc_df['date'] = pd.to_datetime(btc_df['date'])
+            btc_df.set_index('date', inplace=True)
+            
+            sp500_df = pd.DataFrame([
+                {'date': date, 'value': value} for date, value in sp500_data.items()
+            ])
+            sp500_df['date'] = pd.to_datetime(sp500_df['date'])
+            sp500_df.set_index('date', inplace=True)
+            
+            # Create figure
+            fig, ax = plt.subplots(figsize=(12, 8))
+            
+            # Plot BTC data
+            btc_df['value'].plot(ax=ax, color='orange', linewidth=2, label='Bitcoin')
+            
+            # Plot S&P 500 data
+            sp500_df['value'].plot(ax=ax, color='blue', linewidth=2, label='S&P 500')
+            
+            # Add zero line
+            ax.axhline(y=0, color='gray', linestyle='--', alpha=0.7)
+            
+            # Format chart
+            ax.set_title(f'Bitcoin vs S&P 500 Performance ({year} Year-to-Date)')
+            ax.set_ylabel('Year-to-Date Change (%)')
+            ax.grid(True, alpha=0.3)
+            
+            # Format y-axis as percentage
+            ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f'{x:.1f}%'))
+            
+            # Format x-axis to show months
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%b'))
+            ax.xaxis.set_major_locator(mdates.MonthLocator())
+            
+            # Add legend
+            ax.legend(loc='best')
+            
+            # Get final values
+            final_btc = btc_df['value'].iloc[-1]
+            final_sp500 = sp500_df['value'].iloc[-1]
+            
+            # Add text with performance comparison
+            comparison_text = (
+                f"YTD Performance:\n"
+                f"Bitcoin: {final_btc:.2f}%\n"
+                f"S&P 500: {final_sp500:.2f}%\n"
+                f"Difference: {(final_btc - final_sp500):.2f}%"
+            )
+            
+            # Add text box with performance summary
+            props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
+            ax.text(0.02, 0.98, comparison_text, transform=ax.transAxes, fontsize=10,
+                  verticalalignment='top', bbox=props)
+            
+            # Save to buffer
+            buf = io.BytesIO()
+            plt.tight_layout()
+            plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+            plt.close(fig)
+            buf.seek(0)
+            
+            return buf.getvalue()
+            
+        except Exception as e:
+            logger.error(f"Error generating YTD comparison chart: {e}", exc_info=True)
+            return None
+
+    async def generate_portfolio_composition_chart(self, 
+                                          asset_values: Dict, 
+                                          total_value: float) -> Optional[bytes]:
+        """Generate pie chart showing portfolio asset allocation"""
+        try:
+            if not asset_values or len(asset_values) == 0:
+                logger.error("No assets data for portfolio composition chart")
+                return None
+                
+            # Remove assets with very small percentages to avoid cluttering
+            filtered_assets = {}
+            other_value = 0
+            
+            for asset, value in asset_values.items():
+                percentage = (value / total_value * 100) if total_value > 0 else 0
+                if percentage >= 1.0:  # Only show assets that are at least 1% of portfolio
+                    filtered_assets[asset] = value
+                else:
+                    other_value += value
+                    
+            # Add an "Other" category if needed
+            if other_value > 0:
+                filtered_assets["Other"] = other_value
+                
+            # Sort by value for better presentation
+            sorted_items = sorted(filtered_assets.items(), key=lambda x: x[1], reverse=True)
+            
+            # Create labels and values
+            labels = [item[0] for item in sorted_items]
+            values = [item[1] for item in sorted_items]
+            
+            # Configure plot
+            plt.figure(figsize=(10, 8))
+            
+            # Generate colors - ensure USDT is a specific color if present
+            colors = plt.cm.tab20.colors[:len(labels)]
+            if 'USDT' in labels:
+                usdt_index = labels.index('USDT')
+                # Use a specific color for USDT
+                colors = list(colors)
+                colors[usdt_index] = (0.2, 0.8, 0.2, 1.0)
+            
+            # Create explode effect for pie slices
+            explode = [0.05] * len(labels)
+            if 'USDT' in labels:
+                usdt_index = labels.index('USDT')
+                explode[usdt_index] = 0.1
+                
+            # Create pie chart
+            patches, texts, autotexts = plt.pie(
+                values,
+                labels=None,
+                explode=explode,
+                shadow=True,
+                startangle=90,
+                colors=colors,
+                autopct='%1.1f%%',
+                pctdistance=0.85,
+                wedgeprops=dict(width=0.5, edgecolor='w')
+            )
+            
+            # Customize the text appearance
+            for autotext in autotexts:
+                autotext.set_color('white')
+                autotext.set_fontsize(10)
+                autotext.set_fontweight('bold')
+                
+            # Create legend with values
+            legend_labels = [f"{label} (${value:.2f})" for label, value in zip(labels, values)]
+            plt.legend(
+                patches,
+                legend_labels,
+                loc="center left",
+                bbox_to_anchor=(1, 0.5),
+                frameon=False
+            )
+            
+            plt.title("Portfolio Composition", fontsize=16, pad=20)
+            plt.tight_layout()
+            
+            # Save to buffer
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+            plt.close()
+            buf.seek(0)
+            
+            return buf.getvalue()
+            
+        except Exception as e:
+            logger.error(f"Error generating portfolio composition chart: {e}", exc_info=True)
             return None
 
     def format_info_text(self, order: Order, reference_price: Optional[Decimal] = None) -> str:

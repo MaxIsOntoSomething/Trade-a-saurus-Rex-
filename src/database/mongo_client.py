@@ -837,4 +837,43 @@ class MongoClient:
             logger.error(f"Error calculating portfolio performance: {e}", exc_info=True)
             return {}
 
+    async def get_portfolio_composition(self, allowed_symbols: set = None) -> dict:
+        """
+        Get detailed portfolio composition including current values for pie chart
+        Returns a dictionary with symbols and their current values
+        """
+        try:
+            # Prepare match stage to filter only filled orders
+            match_stage = {"status": "filled"}
+            if allowed_symbols:
+                match_stage["symbol"] = {"$in": list(allowed_symbols)}
+                
+            # Aggregate to get total quantities by symbol
+            pipeline = [
+                {"$match": match_stage},
+                {"$group": {
+                    "_id": "$symbol",
+                    "total_quantity": {"$sum": {"$toDecimal": "$quantity"}},
+                }},
+                {"$project": {
+                    "symbol": "$_id",
+                    "total_quantity": {"$toString": "$total_quantity"}
+                }}
+            ]
+            
+            # Process results into dictionary
+            result = {}
+            async for doc in self.orders.aggregate(pipeline):
+                symbol = doc["_id"]
+                if symbol not in result:
+                    result[symbol] = {
+                        "total_quantity": Decimal(doc["total_quantity"]),
+                    }
+                    
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error getting portfolio composition: {e}", exc_info=True)
+            return {}
+
     # ...rest of existing code...
