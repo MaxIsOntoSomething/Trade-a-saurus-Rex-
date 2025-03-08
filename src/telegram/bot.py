@@ -1375,13 +1375,14 @@ Menu:
                                        reference_price: float, price_change: float):
         """Send notification when a threshold is triggered"""
         message = (
-            f"🎯 Threshold Triggered!\n\n"
+            f"🎯 Threshold Triggered - Price Drop!\n\n"
             f"Symbol: {symbol}\n"
             f"Timeframe: {timeframe.value}\n"
             f"Threshold: {threshold}%\n"
             f"Reference Price: ${reference_price:,.2f}\n"
             f"Current Price: ${current_price:,.2f}\n"
-            f"Change: {price_change:+.2f}%"
+            f"Change: {price_change:+.2f}%\n"
+            f"Action: Buying opportunity detected"
         )
         
         for user_id in self.allowed_users:

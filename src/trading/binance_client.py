@@ -354,26 +354,27 @@ class BinanceClient:
                 logger.warning(f"No reference price for {symbol} on {timeframe.value}")
                 return []
                 
-            # Calculate absolute price change percentage
-            price_change = abs(((current_price - reference_price) / reference_price) * 100)
+            # Calculate raw price change percentage (no absolute value)
+            price_change = ((current_price - reference_price) / reference_price) * 100
             
-            # Debug log for price change
+            # Debug log for price change - show direction
             logger.debug(f"{symbol} {timeframe.value} price change: {price_change:.2f}%")
             
             # Get thresholds for the timeframe from config
             timeframe_thresholds = self.config['trading']['thresholds'][timeframe.value]
             
             # Get already triggered thresholds for this symbol and timeframe
-            # Ensure proper access to the triggered thresholds data structure
             triggered = set()
             if symbol in self.triggered_thresholds and timeframe.value in self.triggered_thresholds[symbol]:
                 triggered = self.triggered_thresholds[symbol][timeframe.value]
             
             # Check which thresholds are triggered but not yet processed
+            # Only trigger on price decreases (negative price_change)
             newly_triggered = []
             for threshold in timeframe_thresholds:
-                if price_change >= threshold and threshold not in triggered:
-                    logger.info(f"Threshold triggered for {symbol}: {threshold}% on {timeframe.value}")
+                # Only trigger when price_change is negative (price decrease) and exceeds threshold
+                if price_change < 0 and abs(price_change) >= threshold and threshold not in triggered:
+                    logger.info(f"Threshold triggered for {symbol}: {threshold}% on {timeframe.value} (Price decrease of {price_change:.2f}%)")
                     newly_triggered.append(threshold)
                     
                     # Mark threshold as triggered
