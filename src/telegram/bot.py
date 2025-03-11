@@ -464,35 +464,59 @@ Menu:
             if ref_price is not None:
                 ref_price = Decimal(str(ref_price))
             
-            chart_data = await self.binance_client.generate_trade_chart(order)
-            if not chart_data:
-                logger.error("Failed to generate chart data")
-                return
-                
-            # Create detailed caption with fixed format specifier
+            # Create detailed caption - this will be used for both chart and fallback text message
             caption = (
                 f"🦖 ROARRR! Trade Complete! 💥\n\n"
                 f"Order ID: {order.order_id}\n"
                 f"Symbol: {order.symbol}\n"
                 f"Amount: {float(order.quantity):.8f} {order.symbol.replace('USDT', '')}\n"
                 f"Price: ${float(order.price):.2f}\n"
-                f"Total: ${float(order.price * order.quantity):.2f} USDT\n"  
-                f"Fees: ${float(order.fees):.4f} {order.fee_asset}\n"  # Fixed double colon here
+                f"Total: ${float(order.price * order.quantity):.2f} USDT\n"  # Fixed double colon "::" -> ":"
+                f"Fees: ${float(order.fees):.4f} {order.fee_asset}\n"
                 f"Threshold: {order.threshold if order.threshold else 'Manual'}\n"
                 f"Timeframe: {self._get_timeframe_value(order.timeframe)}\n\n"
                 f"Check /profits to see your updated portfolio."
             )
-            
-            # Send single message with chart and all info
+
+            # Try to generate chart data
+            chart_data = None
+            try:
+                chart_data = await self.binance_client.generate_trade_chart(order)
+                logger.info(f"Chart generated successfully for order {order.order_id}")
+            except Exception as e:
+                logger.error(f"Error generating chart for ROAR message: {e}")
+                chart_data = None
+
+            # Send the message - with chart if available, as text if not
             for user_id in self.allowed_users:
                 try:
-                    await self.app.bot.send_photo(
-                        chat_id=user_id,
-                        photo=chart_data,
-                        caption=caption
-                    )
+                    if chart_data:
+                        # Send with chart if available
+                        await self.app.bot.send_photo(
+                            chat_id=user_id,
+                            photo=chart_data,
+                            caption=caption
+                        )
+                        logger.info(f"Sent ROAR with chart to user {user_id}")
+                    else:
+                        # Send text-only message if chart generation failed
+                        text_message = caption + "\n\n⚠️ (Chart generation failed - not enough historical data)"
+                        await self.app.bot.send_message(
+                            chat_id=user_id,
+                            text=text_message
+                        )
+                        logger.info(f"Sent text-only ROAR to user {user_id} due to chart failure")
                 except Exception as e:
-                    logger.error(f"Failed to send roar to {user_id}: {e}")
+                    logger.error(f"Failed to send ROAR to {user_id}: {e}")
+                    # Last resort fallback - try to send minimal message
+                    try:
+                        minimal_msg = f"🦖 Trade Complete! {order.symbol} at ${float(order.price):.2f}"
+                        await self.app.bot.send_message(
+                            chat_id=user_id,
+                            text=minimal_msg
+                        )
+                    except Exception:
+                        pass  # If even this fails, we've logged the error above
                     
             # Cleanup old roar notifications periodically
             if len(self.sent_roars) > 1000:
@@ -500,6 +524,15 @@ Menu:
                 
         except Exception as e:
             logger.error(f"Failed to send roar: {e}")
+            # Final fallback - try to send a minimal notification
+            for user_id in self.allowed_users:
+                try:
+                    await self.app.bot.send_message(
+                        chat_id=user_id,
+                        text=f"🦖 ROAR! {order.symbol} trade completed. Check /profits for details."
+                    )
+                except Exception as e2:
+                    logger.error(f"Even fallback roar failed for {user_id}: {e2}")
 
     async def show_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show all available commands with descriptions"""
