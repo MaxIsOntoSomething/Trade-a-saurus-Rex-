@@ -126,6 +126,19 @@ MIT License
 ### 🚀 Work in Progress  
 - ⚙️ **Futures Integration** ⏳ (In Progress)  
 - 🔗 **Bybit Integration** ⏳ (In Progress)  
+- 📈 **Binance Futures Trading** ⏳ (In Progress)  
+  - 🔧 Update config to support three Binance API keys (Mainnet Spot & Futures, Testnet Spot, Testnet Futures).  
+  - 📝 Implement Binance Futures trading in a separate Python file.  
+  - 🔄 Adjust Telegram commands to support Futures mode.  
+  - 📊 Modify database to store Binance Futures trades.  
+  - 📉 Update chart generation for Futures trades.  
+  - 🎯 Introduce percentage-based Take Profit (TP) and Stop Loss (SL) system.  
+  - 📉 Add "Only Lower Entries" setting to prevent increasing average entry price.  
+  - ⚙️ Allow leverage and margin mode configuration via config/env variables.  
+  - 🛠️ Implement three new Telegram commands:  
+    - 📌 **Leverage Command** (Max 5x)  
+    - 📌 **Margin Mode Command** (Switch between Isolated & Cross)  
+    - 📌 **Order Amount Command** (Min 10 USDT per order)  
 
 ### ✅ Finished  
 - ✅ **Telegram - Open Orders Command**  
@@ -134,17 +147,19 @@ MIT License
 - ✅ **Reset Updates Send**  
 - ✅ **MongoDB Integration**  
 - ✅ **Migrating from SQLite**  
-- ✅ **Docker Support**
-- ✅ **Threshold Persistence**
-- ✅ **Balance History Charts**
-- ✅ **Format String Fixes**
+- ✅ **Docker Support**  
+- ✅ **Threshold Persistence**  
+- ✅ **Balance History Charts**  
+- ✅ **Format String Fixes**  
 
 ### 📌 Planned  
 - 📌 **Weekly & Monthly Summary (Optional)**  
-- 📌 **Hyperliquid Integration**
-- 📌 **Backtest Option to Test Performance**
-- 📌 **Report with real Balance 5k+**
-- 📌 **More Detailed Explanation of Bot Readme**
+- 📌 **Hyperliquid Integration**  
+- 📌 **Backtest Option to Test Performance**  
+- 📌 **Report with real Balance 5k+**  
+- 📌 **More Detailed Explanation of Bot**
+
+ Readme**
 
 ## Analysis
 
