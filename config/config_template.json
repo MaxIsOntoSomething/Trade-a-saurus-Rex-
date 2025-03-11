@@ -1,8 +1,14 @@
 {
     "binance": {
-        "api_key": "api_key",
-        "api_secret": "api_secret",
-        "testnet": true
+        "spot_testnet": {
+            "api_key": "your_testnet_api_key",
+            "api_secret": "your_testnet_api_secret"
+        },
+        "mainnet": {
+            "api_key": "your_mainnet_api_key",
+            "api_secret": "your_mainnet_api_secret"
+        },
+        "use_testnet": true
     },
     "telegram": {
         "bot_token": "bot_token",
@@ -20,7 +26,7 @@
         "thresholds": {
             "daily": [1, 2, 5],
             "weekly": [5, 10, 15],
-            "monthly": [] // Empty array means no monthly threshold remove comment for code to work
+            "monthly": [10, 20, 30]
         },
         "reserve_balance": 500  
     }

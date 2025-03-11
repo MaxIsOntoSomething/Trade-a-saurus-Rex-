@@ -40,7 +40,11 @@ class BinanceClient:
         self.mongo_client = mongo_client
         self.config = config
         
-        # Set reserve balance and base currency directly from config (NEW CODE)
+        # Set API environment info
+        environment = "TESTNET" if testnet else "MAINNET"
+        logger.info(f"[INIT] Using Binance {environment} API")
+        
+        # Set reserve balance and base currency directly from config
         self.base_currency = None
         self.reserve_balance = 0
         if config and 'trading' in config:
@@ -598,6 +602,9 @@ class BinanceClient:
             ticker = await self.client.get_symbol_ticker(symbol=symbol)
             price = Decimal(ticker['price'])
             
+            # Original requested amount (for logging if adjustment needed)
+            original_amount = amount
+            
             # Calculate quantity based on USDT amount
             quantity = Decimal(str(amount)) / price
             
@@ -610,16 +617,34 @@ class BinanceClient:
             quantity = self._adjust_quantity_to_lot_size(symbol, quantity)
             price = Decimal(str(round(price, price_precision)))
             
+            # Calculate order value after adjustments
+            order_value = price * quantity
+            
+            # Check minimum notional
+            min_notional = MIN_NOTIONAL.get(symbol, MIN_NOTIONAL['DEFAULT'])
+            if order_value < Decimal(str(min_notional)):
+                # Auto-increase quantity to meet minimum notional requirement
+                logger.warning(f"Order value ${float(order_value):.2f} below minimum notional ${min_notional}. Adjusting quantity...")
+                
+                # Calculate required quantity to meet minimum notional
+                required_quantity = Decimal(str(min_notional)) / price
+                required_quantity = Decimal(str(round(required_quantity, quantity_precision)))
+                required_quantity = self._adjust_quantity_to_lot_size(symbol, required_quantity)
+                
+                # Update the quantity and log the adjustment
+                adjusted_amount = float(required_quantity * price)
+                logger.info(f"Adjusted order amount from ${original_amount:.2f} to ${adjusted_amount:.2f} to meet minimum notional")
+                quantity = required_quantity
+                
+                # If this order would now violate reserve balance, check again
+                if not is_manual and adjusted_amount > original_amount and not await self.check_reserve_balance(adjusted_amount):
+                    raise ValueError(f"Adjusted order (${adjusted_amount:.2f}) would violate reserve balance")
+            
             # Log order details before placement
             logger.info(f"Placing order: {symbol} quantity={quantity} price=${price}")
             
             # Calculate fees
             fees, fee_asset = await self.calculate_fees(symbol, price, quantity)
-            
-            # Check minimum notional
-            min_notional = MIN_NOTIONAL.get(symbol, MIN_NOTIONAL['DEFAULT'])
-            if price * quantity < Decimal(str(min_notional)):
-                raise ValueError(f"Order value below minimum notional: {min_notional} USDT")
             
             # Only update triggered thresholds if it's not a manual trade
             if not is_manual and threshold and symbol in self.triggered_thresholds and timeframe:
@@ -712,11 +737,8 @@ class BinanceClient:
         return None
 
     async def get_candles_for_chart(self, symbol: str, timeframe: TimeFrame, count: int = 15) -> List[Dict]:
-        """Get historical candles for chart generation with proper alignment"""
+        """Get historical candles for chart generation with flexible data handling"""
         try:
-            # Get reference timestamp first
-            ref_timestamp = await self.get_reference_timestamp(timeframe)
-            
             # Map timeframes to intervals and milliseconds
             interval_map = {
                 TimeFrame.DAILY: ('1d', 24 * 60 * 60 * 1000),
@@ -726,72 +748,111 @@ class BinanceClient:
             
             interval, ms_per_candle = interval_map[timeframe]
             
-            # Calculate start and end times
-            end_time = ref_timestamp + ms_per_candle  # Include the reference candle
-            start_time = end_time - (count * ms_per_candle)
-            
-            # Get candles with specific time range
+            # First attempt: Get recent candles without time constraints
+            logger.info(f"Fetching {count} candles for {symbol} on {timeframe.value} timeframe")
             await self.rate_limiter.acquire()
+            
+            # Start with a simple request for the most recent candles
             klines = await self.client.get_klines(
                 symbol=symbol,
                 interval=interval,
-                startTime=start_time,
-                endTime=end_time,
-                limit=count + 2  # Get extra candles to ensure coverage
+                limit=count + 5  # Request extra candles to handle potential gaps
             )
             
             if not klines:
-                logger.error(f"No candles returned for {symbol} {timeframe.value}")
-                return []
+                logger.warning(f"No candles returned for {symbol} {timeframe.value}")
+                # Try alternative interval for new pairs
+                alternative_interval = '1h' if timeframe == TimeFrame.DAILY else '4h'
+                logger.info(f"Trying alternative interval {alternative_interval} for {symbol}")
+                
+                # Get more frequent candles and aggregate them if needed
+                alternative_klines = await self.client.get_klines(
+                    symbol=symbol,
+                    interval=alternative_interval,
+                    limit=100  # Get more candles at a higher frequency
+                )
+                
+                if not alternative_klines:
+                    logger.error(f"Still no candles available for {symbol}")
+                    return []
+                    
+                # Use alternative candles directly (just a few for chart visualization)
+                klines = alternative_klines[-count:] if len(alternative_klines) > count else alternative_klines
             
-            # Process and validate candles
+            # Process and convert candles
             candles = []
             for k in klines:
-                candle_time = k[0]
-                if start_time <= candle_time <= end_time:
-                    candles.append({
-                        'timestamp': candle_time,
-                        'open': float(k[1]),
-                        'high': float(k[2]),
-                        'low': float(k[3]),
-                        'close': float(k[4]),
-                        'volume': float(k[5])
-                    })
+                candles.append({
+                    'timestamp': k[0],
+                    'open': float(k[1]),
+                    'high': float(k[2]),
+                    'low': float(k[3]),
+                    'close': float(k[4]),
+                    'volume': float(k[5])
+                })
             
-            # Ensure we have the right number of candles
+            # Set minimum required candles for a proper chart
+            min_candles_required = 3
+            
+            # Check if we have enough candles, but DON'T try to generate synthetic ones
+            if len(candles) < min_candles_required:
+                logger.warning(f"Only {len(candles)} candles available for {symbol} {timeframe.value} - not enough for proper chart visualization")
+                # Return the candles we have without trying to generate synthetic ones
+                # The calling code will handle the case where there aren't enough candles
+            
+            # Limit to requested count if we have more
             candles = candles[-count:] if len(candles) > count else candles
             
-            # Log candle alignment info
-            logger.info(f"Got {len(candles)} candles for {symbol} {timeframe.value}")
-            logger.info(f"Time range: {datetime.fromtimestamp(start_time/1000)} to {datetime.fromtimestamp(end_time/1000)}")
+            # Log actual candles retrieved
+            candle_dates = [datetime.fromtimestamp(c['timestamp']/1000).strftime('%Y-%m-%d') for c in candles]
+            logger.info(f"Got {len(candles)} candles for {symbol} {timeframe.value}: {', '.join(candle_dates)}")
             
             return candles
             
         except Exception as e:
-            logger.error(f"Failed to get candles for chart: {e}")
+            logger.error(f"Failed to get candles for chart: {e}", exc_info=True)
             return []
 
     async def generate_trade_chart(self, order: Order) -> Optional[bytes]:
-        """Generate chart for a trade"""
+        """Generate chart for a trade with improved error handling"""
         try:
+            # Get candles for chart
             candles = await self.get_candles_for_chart(
                 order.symbol,
                 order.timeframe
             )
             
-            if not candles:
+            # If we got fewer than 3 candles, we can't make a good chart
+            if len(candles) < 3:
+                logger.warning(f"Insufficient data: Only {len(candles)} candles available for {order.symbol} {order.timeframe.value} chart - minimum 3 required")
                 return None
                 
             ref_price = self.reference_prices.get(order.symbol, {}).get(order.timeframe)
             
-            return await self.chart_generator.generate_trade_chart(
-                candles,
-                order,
-                Decimal(str(ref_price)) if ref_price else None
-            )
-            
+            # Attempt to generate chart with available candles
+            try:
+                return await self.chart_generator.generate_trade_chart(
+                    candles,
+                    order,
+                    Decimal(str(ref_price)) if ref_price else None
+                )
+            except Exception as chart_error:
+                logger.error(f"Chart generation error for {order.symbol}: {chart_error}")
+                
+                # If chart generation fails, try with fewer features as fallback
+                try:
+                    logger.info("Trying simplified chart generation")
+                    return await self.chart_generator.generate_simple_chart(
+                        candles,
+                        order,
+                        Decimal(str(ref_price)) if ref_price else None
+                    )
+                except Exception as simple_error:
+                    logger.error(f"Simplified chart generation also failed: {simple_error}")
+                    return None
+                    
         except Exception as e:
-            logger.error(f"Failed to generate trade chart: {e}")
+            logger.error(f"Failed to prepare data for trade chart: {e}")
             return None
 
     async def get_historical_prices(self, symbol: str, days: int = 30) -> List[Dict]:
@@ -1082,7 +1143,7 @@ class BinanceClient:
             return ytd_data
             
         except Exception as e:
-            logger.error(f"Error getting BTC YTD performance: {e}", exc_info=True)
+            logger.error(f"Error getting BTC YTD performance: {e}")
             return {}
 
     async def generate_ytd_comparison_chart(self) -> Optional[bytes]:

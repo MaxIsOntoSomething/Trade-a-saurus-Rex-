@@ -24,9 +24,9 @@ config_logger = setup_logging()
 logger = logging.getLogger(__name__)
 
 def validate_config(config: dict) -> bool:
-    """Validate configuration parameters"""
+    """Validate configuration parameters with updated structure"""
     required_fields = {
-        'binance': ['api_key', 'api_secret', 'testnet'],
+        'binance': ['spot_testnet', 'mainnet', 'use_testnet'],
         'telegram': ['bot_token', 'allowed_users'],
         'mongodb': ['uri', 'database'],
         'trading': ['base_currency', 'order_amount', 'cancel_after_hours', 
@@ -36,22 +36,34 @@ def validate_config(config: dict) -> bool:
     try:
         for section, fields in required_fields.items():
             if section not in config:
-                raise ValueError(f"Missing section: {section}")
+                logger.error(f"Missing section: {section}")
+                return False
+            
             for field in fields:
                 if field not in config[section]:
-                    raise ValueError(f"Missing field: {section}.{field}")
+                    logger.error(f"Missing field: {section}.{field}")
+                    return False
+                    
+        # Additional validation for nested API keys
+        if 'api_key' not in config['binance']['spot_testnet'] or 'api_secret' not in config['binance']['spot_testnet']:
+            logger.error("Missing Binance spot testnet API credentials")
+            return False
+            
+        if 'api_key' not in config['binance']['mainnet'] or 'api_secret' not in config['binance']['mainnet']:
+            logger.error("Missing Binance mainnet API credentials")
+            return False
+            
         return True
     except Exception as e:
         logger.error(f"Configuration validation failed: {e}")
         return False
 
 def load_config_from_env() -> dict:
-    """Load configuration from environment variables"""
+    """Load configuration from environment variables with support for both API sets"""
     # Load reserve balance with proper parsing
     try:
         reserve_balance = os.getenv('TRADING_RESERVE_BALANCE')
         if reserve_balance:
-            # Handle scientific notation and large numbers
             reserve_balance = float(reserve_balance.replace(',', ''))
             logger.info(f"[CONFIG] Loaded reserve balance from ENV: ${reserve_balance:,.2f}")
         else:
@@ -61,12 +73,18 @@ def load_config_from_env() -> dict:
         logger.error(f"[CONFIG] Error parsing reserve balance: {e}")
         reserve_balance = 500  # Fallback to default
 
-    # Rest of the config loading
+    # Rest of the config loading with spot_testnet/mainnet API keys
     config = {
         'binance': {
-            'api_key': os.getenv('BINANCE_API_KEY'),
-            'api_secret': os.getenv('BINANCE_API_SECRET'),
-            'testnet': os.getenv('BINANCE_TESTNET', 'true').lower() == 'true'
+            'spot_testnet': {
+                'api_key': os.getenv('BINANCE_SPOT_TESTNET_API_KEY'),
+                'api_secret': os.getenv('BINANCE_SPOT_TESTNET_API_SECRET')
+            },
+            'mainnet': {
+                'api_key': os.getenv('BINANCE_MAINNET_API_KEY'),
+                'api_secret': os.getenv('BINANCE_MAINNET_API_SECRET')
+            },
+            'use_testnet': os.getenv('BINANCE_USE_TESTNET', 'true').lower() == 'true'
         },
         'telegram': {
             'bot_token': os.getenv('TELEGRAM_BOT_TOKEN'),
@@ -150,7 +168,7 @@ async def check_initial_connection(binance_client: BinanceClient, config: dict) 
         return False
 
 async def initialize_services(config):
-    """Initialize all services"""
+    """Initialize all services with updated Binance API structure"""
     try:
         # Initialize MongoDB client
         mongo_client = MongoClient(
@@ -159,19 +177,23 @@ async def initialize_services(config):
         )
         await mongo_client.init_indexes()  # Initialize database indexes
         
-        # Initialize Binance client without finnhub api key
+        # Determine which API keys to use based on use_testnet setting
+        use_testnet = config['binance']['use_testnet']
+        api_env = 'spot_testnet' if use_testnet else 'mainnet'
+        
+        # Initialize Binance client with the appropriate API keys
         binance_client = BinanceClient(
-            api_key=config['binance']['api_key'],
-            api_secret=config['binance']['api_secret'],
-            testnet=config['binance']['testnet'],
+            api_key=config['binance'][api_env]['api_key'],
+            api_secret=config['binance'][api_env]['api_secret'],
+            testnet=use_testnet,
             mongo_client=mongo_client,
-            config=config  # Pass config directly to ensure reserve balance is set
+            config=config
         )
         
         # Initialize client connection
         await binance_client.initialize()
         
-        # Log reserve balance after initialization to verify (NEW CODE)
+        # Log reserve balance after initialization to verify
         logger.info(f"[VERIFY] Reserve balance after BinanceClient init: ${binance_client.reserve_balance:,.2f}")
         
         # Initialize Telegram bot
@@ -226,6 +248,7 @@ async def main():
         logger.info(f"[CONFIG] Reserve Balance: ${config['trading']['reserve_balance']:,.2f}")
         logger.info(f"[CONFIG] Trading Pairs: {', '.join(config['trading']['pairs'])}")
         logger.info(f"[CONFIG] Order Amount: ${config['trading']['order_amount']:,.2f}")
+        logger.info(f"[CONFIG] Environment: {'TESTNET' if config['binance']['use_testnet'] else 'MAINNET'}")
         logger.info("=" * 50)
 
         if not validate_config(config):

@@ -723,3 +723,63 @@ class ChartGenerator:
         except Exception as e:
             logger.error(f"Error formatting info text: {e}", exc_info=True)  # Added stack trace
             return "Error generating trade information"
+
+    async def generate_simple_chart(self, candles, order, reference_price=None):
+        """Generate a simplified chart with minimal features when full chart generation fails"""
+        try:
+            import matplotlib.pyplot as plt
+            import matplotlib.dates as mdates
+            from matplotlib.ticker import FuncFormatter
+            import io
+            from datetime import datetime
+            import numpy as np
+            
+            # Convert candle timestamps to datetime objects
+            dates = [datetime.fromtimestamp(candle['timestamp']/1000) for candle in candles]
+            closes = [candle['close'] for candle in candles]
+            
+            # Create a simple line chart (no candlesticks)
+            fig, ax = plt.subplots(figsize=(10, 6))
+            
+            # Plot simple price line
+            ax.plot(dates, closes, 'b-', linewidth=2)
+            
+            # Add order price as horizontal line
+            ax.axhline(y=float(order.price), color='r', linestyle='--', alpha=0.8, label=f"Order Price: ${float(order.price):,.2f}")
+            
+            # Add reference price if available
+            if reference_price is not None:
+                ax.axhline(y=float(reference_price), color='g', linestyle='--', alpha=0.8, label=f"Reference: ${float(reference_price):,.2f}")
+            
+            # Format x-axis to show clean dates
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+            plt.xticks(rotation=45)
+            
+            # Format y-axis to show dollar prices
+            ax.yaxis.set_major_formatter(FuncFormatter(lambda x, p: f'${x:,.2f}'))
+            
+            # Add labels and title
+            ax.set_title(f"{order.symbol} - {order.timeframe.value} Chart", fontsize=16)
+            ax.set_xlabel("Date", fontsize=12)
+            ax.set_ylabel("Price (USD)", fontsize=12)
+            
+            # Add legend
+            ax.legend(loc='upper left')
+            
+            # Add grid
+            ax.grid(True, alpha=0.3)
+            
+            # Make layout tight
+            plt.tight_layout()
+            
+            # Save the chart to bytes
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', dpi=100)
+            plt.close(fig)
+            buf.seek(0)
+            
+            return buf.getvalue()
+            
+        except Exception as e:
+            logger.error(f"Error in simplified chart generation: {e}", exc_info=True)
+            return None
