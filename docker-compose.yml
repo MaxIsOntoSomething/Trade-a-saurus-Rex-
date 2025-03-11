@@ -1,3 +1,5 @@
+version: '3'
+
 services:
   bot:
     build: .
@@ -7,13 +9,19 @@ services:
       - ./logs:/app/logs
     environment:
       - RUNNING_IN_DOCKER=true
-      - MONGODB_URI=mongodb://mongodb:27017
-      - MONGODB_DATABASE=tradeasaurus
-      - BINANCE_API_KEY=${BINANCE_API_KEY}
-      - BINANCE_API_SECRET=${BINANCE_API_SECRET}
-      - BINANCE_TESTNET=${BINANCE_TESTNET:-true}
+      # Binance Configuration
+      - BINANCE_SPOT_TESTNET_API_KEY=${BINANCE_SPOT_TESTNET_API_KEY}
+      - BINANCE_SPOT_TESTNET_API_SECRET=${BINANCE_SPOT_TESTNET_API_SECRET}
+      - BINANCE_MAINNET_API_KEY=${BINANCE_MAINNET_API_KEY}
+      - BINANCE_MAINNET_API_SECRET=${BINANCE_MAINNET_API_SECRET}
+      - BINANCE_USE_TESTNET=${BINANCE_USE_TESTNET}
+      # Telegram Configuration
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_ALLOWED_USERS=${TELEGRAM_ALLOWED_USERS}
+      # MongoDB Configuration
+      - MONGODB_URI=mongodb://mongodb:27017
+      - MONGODB_DATABASE=tradeasaurus
+      # Trading Configuration
       - TRADING_BASE_CURRENCY=${TRADING_BASE_CURRENCY:-USDT}
       - TRADING_ORDER_AMOUNT=${TRADING_ORDER_AMOUNT:-100}
       - TRADING_CANCEL_HOURS=${TRADING_CANCEL_HOURS:-8}
@@ -27,7 +35,7 @@ services:
     restart: unless-stopped
 
   mongodb:
-    image: mongo:latest
+    image: mongo:5.0
     container_name: tradeasaurus-mongo
     volumes:
       - mongodb_data:/data/db
