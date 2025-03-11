@@ -7,7 +7,7 @@ from telegram.ext import (
 )
 from datetime import datetime, timedelta
 import logging
-from decimal import Decimal  # Add this import
+from decimal import Decimal, InvalidOperation  # Add InvalidOperation for exception handling
 from typing import List, Optional, Dict  # Add Dict import
 from ..types.models import Order, OrderStatus, TimeFrame, OrderType, TradeDirection  # Update imports
 from ..trading.binance_client import BinanceClient
@@ -41,7 +41,7 @@ DINO_ASCII = r'''
                          Trade-a-saurus Rex 🦖📈'''
 
 # Add states for conversation handler
-SYMBOL, ORDER_TYPE, LEVERAGE, DIRECTION, AMOUNT, PRICE, FEES = range(7)
+SYMBOL, ORDER_TYPE, LEVERAGE, DIRECTION, AMOUNT, PRICE = range(6)
 
 class VisualizationType:
     DAILY_VOLUME = "daily_volume"
@@ -106,8 +106,7 @@ Status: Ready to ROAR! 🦖
                 LEVERAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_trade_leverage)],
                 DIRECTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_trade_direction)],
                 AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_trade_amount)],
-                PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_trade_fees)],
-                FEES: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_trade_final)]
+                PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_trade_final)]
             },
             fallbacks=[CommandHandler("cancel", self.add_trade_cancel)],
         )
@@ -717,57 +716,64 @@ Menu:
             await update.message.reply_text(f"Error: {str(e)}")
             return AMOUNT
 
-    async def add_trade_fees(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle amount and ask for fees"""
+    async def add_trade_final(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Complete trade creation with auto-calculated fees"""
         try:
-            price = Decimal(update.message.text)
+            # Clean the price input to handle both dots and commas as decimal separators
+            price_text = update.message.text.replace(',', '.')
+            
+            try:
+                price = Decimal(price_text)
+            except (InvalidOperation, ValueError):  # Replace DecimalException with InvalidOperation
+                raise ValueError("Price must be a valid number")
+                
             if price <= 0:
                 raise ValueError("Price must be positive")
                 
             user_data = self.temp_trade_data[update.effective_user.id]
             user_data['price'] = price
             
-            await update.message.reply_text("Enter the trading fees in USDT (e.g., 0.25):")
-            return FEES
-            
-        except ValueError as e:
-            await update.message.reply_text(f"Please enter a valid price: {str(e)}")
-            return PRICE
-
-    async def add_trade_final(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Complete trade creation with fees"""
-        try:
-            fees = Decimal(update.message.text)
-            if fees < 0:
-                raise ValueError("Fees cannot be negative")
-                
-            user_data = self.temp_trade_data[update.effective_user.id]
-            
             # Generate unique order ID
             order_id = f"MANUAL_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+            
+            # Calculate quantity from amount/price
+            quantity = user_data['amount'] / price
+            
+            # Get order type and leverage for fee calculation
+            order_type = user_data['order_type'].value
+            leverage = user_data.get('leverage', 1)  # Default to 1 if not set (for spot trades)
+            
+            # Calculate fees automatically using the BinanceClient's fee calculation
+            fees, fee_asset = await self.binance_client.calculate_fees(
+                user_data['symbol'], 
+                price, 
+                quantity,
+                order_type,
+                leverage
+            )
             
             # Create order object
             order = Order(
                 symbol=user_data['symbol'],
                 status=OrderStatus.FILLED,  # Manual trades are always filled
                 order_type=user_data['order_type'],
-                price=user_data['price'],
-                quantity=user_data['amount'] / user_data['price'],
+                price=price,
+                quantity=quantity,
                 timeframe=TimeFrame.DAILY,  # Default to daily for manual trades
                 order_id=order_id,
                 created_at=datetime.utcnow(),
                 updated_at=datetime.utcnow(),
                 filled_at=datetime.utcnow(),
-                leverage=user_data.get('leverage'),
+                leverage=leverage,
                 direction=user_data.get('direction'),
                 fees=fees,
-                fee_asset='USDT'
+                fee_asset=fee_asset
             )
             
             # Save to database
             await self.mongo_client.insert_manual_trade(order)
             
-            # Send confirmation
+            # Send confirmation with auto-calculated fees
             direction_info = f"\nDirection: {order.direction.value}" if order.direction else ""
             leverage_info = f"\nLeverage: {order.leverage}x" if order.leverage else ""
             
@@ -779,8 +785,8 @@ Menu:
                 f"{leverage_info}\n"
                 f"Amount: {float(order.quantity):.8f}\n"
                 f"Price: ${float(order.price):.2f}\n"
-                f"Fees: ${float(order.fees):.2f}\n"
-                f"Total Value: ${float(order.price * order.quantity):.2f}",  # Fixed double colon here
+                f"Auto-calculated Fees: ${float(order.fees):.4f} {order.fee_asset}\n"
+                f"Total Value: ${float(order.price * order.quantity):.2f}",
                 reply_markup=self.markup  # Restore original keyboard
             )
             
@@ -789,8 +795,8 @@ Menu:
             return ConversationHandler.END
             
         except ValueError as e:
-            await update.message.reply_text(f"Please enter valid fees: {str(e)}")
-            return FEES
+            await update.message.reply_text(f"Please enter a valid price: {str(e)}")
+            return PRICE
         except Exception as e:
             logger.error(f"Error creating manual trade: {e}")
             await update.message.reply_text(
@@ -959,82 +965,87 @@ Menu:
             await update.message.reply_text("Please enter a valid direction (LONG/SHORT)")
             return DIRECTION
 
-    async def add_trade_fees(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle fees input and create the trade"""
+    async def add_trade_final(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Complete trade creation with auto-calculated fees"""
         try:
-            price = Decimal(update.message.text)
+            # Clean the price input to handle both dots and commas as decimal separators
+            price_text = update.message.text.replace(',', '.')
+            
+            try:
+                price = Decimal(price_text)
+            except (InvalidOperation, ValueError):  # Replace DecimalException with InvalidOperation
+                raise ValueError("Price must be a valid number")
+                
             if price <= 0:
                 raise ValueError("Price must be positive")
                 
             user_data = self.temp_trade_data[update.effective_user.id]
             user_data['price'] = price
             
-            await update.message.reply_text(
-                "What were the trading fees? (in USDT, e.g., 0.25)"
-            )
-            return FEES
-            
-        except ValueError as e:
-            await update.message.reply_text(f"Please enter a valid price: {str(e)}")
-            return PRICE
-
-    async def add_trade_final(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Complete trade creation with fees"""
-        try:
-            fees = Decimal(update.message.text)
-            if fees < 0:
-                raise ValueError("Fees cannot be negative")
-                
-            user_data = self.temp_trade_data[update.effective_user.id]
-            
             # Generate unique order ID
             order_id = f"MANUAL_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+            
+            # Calculate quantity from amount/price
+            quantity = user_data['amount'] / price
+            
+            # Get order type and leverage for fee calculation
+            order_type = user_data['order_type'].value
+            leverage = user_data.get('leverage', 1)  # Default to 1 if not set (for spot trades)
+            
+            # Calculate fees automatically using the BinanceClient's fee calculation
+            fees, fee_asset = await self.binance_client.calculate_fees(
+                user_data['symbol'], 
+                price, 
+                quantity,
+                order_type,
+                leverage
+            )
             
             # Create order object
             order = Order(
                 symbol=user_data['symbol'],
-                status=OrderStatus.FILLED,
+                status=OrderStatus.FILLED,  # Manual trades are always filled
                 order_type=user_data['order_type'],
-                price=user_data['price'],
-                quantity=user_data['amount'] / user_data['price'],
+                price=price,
+                quantity=quantity,
                 timeframe=TimeFrame.DAILY,  # Default to daily for manual trades
                 order_id=order_id,
                 created_at=datetime.utcnow(),
                 updated_at=datetime.utcnow(),
                 filled_at=datetime.utcnow(),
-                leverage=user_data.get('leverage'),
+                leverage=leverage,
                 direction=user_data.get('direction'),
                 fees=fees,
-                fee_asset='USDT'
+                fee_asset=fee_asset
             )
             
-            # Save to database using manual trade method
-            if await self.mongo_client.insert_manual_trade(order):
-                direction_info = f"\nDirection: {order.direction.value}" if order.direction else ""
-                leverage_info = f"\nLeverage: {order.leverage}x" if order.leverage else ""
-                
-                await update.message.reply_text(
-                    f"✅ Manual trade added:\n"
-                    f"Symbol: {order.symbol}\n"
-                    f"Type: {order.order_type.value}"
-                    f"{direction_info}"
-                    f"{leverage_info}\n"
-                    f"Amount: {float(order.quantity):.8f}\n"
-                    f"Price: ${float(order.price):.2f}\n"
-                    f"Fees: ${float(order.fees):.2f}\n"
-                    f"Total Value: ${float(order.price * order.quantity)::.2f}",  # Fixed double colon here
-                    reply_markup=self.markup  # Restore original keyboard
-                )
-            else:
-                await update.message.reply_text("❌ Failed to save trade")
+            # Save to database
+            await self.mongo_client.insert_manual_trade(order)
+            
+            # Send confirmation with auto-calculated fees
+            direction_info = f"\nDirection: {order.direction.value}" if order.direction else ""
+            leverage_info = f"\nLeverage: {order.leverage}x" if order.leverage else ""
+            
+            await update.message.reply_text(
+                f"✅ Manual trade added:\n"
+                f"Symbol: {order.symbol}\n"
+                f"Type: {order.order_type.value}"
+                f"{direction_info}"
+                f"{leverage_info}\n"
+                f"Amount: {float(order.quantity):.8f}\n"
+                f"Price: ${float(order.price):.2f}\n"
+                f"Auto-calculated Fees: ${float(order.fees):.4f} {order.fee_asset}\n"
+                f"Total Value: ${float(order.price * order.quantity):.2f}",
+                reply_markup=self.markup  # Restore original keyboard
+            )
             
             # Cleanup
             del self.temp_trade_data[update.effective_user.id]
             return ConversationHandler.END
             
         except ValueError as e:
-            await update.message.reply_text(f"Please enter valid fees: {str(e)}")
-            return FEES
+            await update.message.reply_text(f"Please enter a valid price: {str(e)}")
+            return PRICE
         except Exception as e:
             logger.error(f"Error creating manual trade: {e}")
             await update.message.reply_text(

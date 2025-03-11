@@ -9,7 +9,7 @@ import aiohttp
 import json
 from ..types.models import Order, OrderStatus, TimeFrame, OrderType  # Add OrderType
 from ..utils.rate_limiter import RateLimiter
-from ..types.constants import PRECISION, MIN_NOTIONAL, TIMEFRAME_INTERVALS, TRADING_FEES
+from ..types.constants import PRECISION, MIN_NOTIONAL, TIMEFRAME_INTERVALS, TRADING_FEES, ORDER_TYPE_FEES
 from ..utils.chart_generator import ChartGenerator
 from ..utils.yahoo_scrapooooor_sp500 import YahooSP500Scraper  # Import the new Yahoo scraper
 
@@ -37,10 +37,16 @@ class BinanceClient:
         logger.setLevel(logging.DEBUG)
         self.telegram_bot = telegram_bot
         self.chart_generator = ChartGenerator()
-        self.reserve_balance = None
-        self.base_currency = None
         self.mongo_client = mongo_client
         self.config = config
+        
+        # Set reserve balance and base currency directly from config (NEW CODE)
+        self.base_currency = None
+        self.reserve_balance = 0
+        if config and 'trading' in config:
+            self.base_currency = config['trading'].get('base_currency', 'USDT')
+            self.reserve_balance = float(config['trading'].get('reserve_balance', 0))
+            logger.info(f"[INIT] Config loaded directly: Base Currency={self.base_currency}, Reserve=${self.reserve_balance:,.2f}")
         
         # Initialize Yahoo SP500 scraper
         self.yahoo_scraper = YahooSP500Scraper()
@@ -108,15 +114,20 @@ class BinanceClient:
             testnet=self.testnet
         )
 
-        # Set reserve balance directly from config with debug logging
+        # Set reserve balance directly from config with debug logging (UPDATED CODE)
         if self.telegram_bot and self.telegram_bot.config:
-            self.base_currency = self.telegram_bot.config['trading']['base_currency']
-            self.reserve_balance = float(self.telegram_bot.config['trading'].get('reserve_balance', 0))
+            # Use values from telegram_bot only if they weren't already set from config
+            if not self.base_currency or self.base_currency == 'USDT':
+                self.base_currency = self.telegram_bot.config['trading'].get('base_currency', 'USDT')
+            if self.reserve_balance <= 0:
+                self.reserve_balance = float(self.telegram_bot.config['trading'].get('reserve_balance', 0))
+                
             logger.info(f"[INIT] Base Currency: {self.base_currency}")
             logger.info(f"[INIT] Reserve Balance: ${self.reserve_balance:,.2f}")
         else:
-            logger.warning("[INIT] No config found for reserve balance!")
-            self.reserve_balance = 0  # Set default value instead of None
+            # Only log a warning if we haven't already set values from direct config
+            if not self.config:
+                logger.warning("[INIT] No config found for reserve balance!")
 
         # Initialize restored threshold info
         self.restored_threshold_info = []
@@ -937,17 +948,36 @@ class BinanceClient:
             logger.error(f"Error adjusting quantity for {symbol}: {e}")
             return quantity
 
-    async def calculate_fees(self, symbol: str, price: Decimal, quantity: Decimal) -> Tuple[Decimal, str]:
-        """Calculate trading fees for an order"""
+    async def calculate_fees(self, symbol: str, price: Decimal, quantity: Decimal, order_type: str = "spot", leverage: int = 1) -> Tuple[Decimal, str]:
+        """Calculate trading fees for an order based on order type and leverage"""
         try:
-            # Get fee rate for the symbol or use default
-            fee_rate = Decimal(str(TRADING_FEES.get(symbol, TRADING_FEES['DEFAULT'])))
+            # Normalize order_type to lowercase
+            order_type = order_type.lower() if isinstance(order_type, str) else "spot"
             
-            # Calculate fee amount
-            fee_amount = price * quantity * fee_rate
+            # Get fee rate based on order type or use the symbol-specific rate if available
+            if symbol in TRADING_FEES:
+                fee_rate = Decimal(str(TRADING_FEES[symbol]))
+            else:
+                # Use order type specific fee rate
+                fee_rate = Decimal(str(ORDER_TYPE_FEES.get(order_type, TRADING_FEES['DEFAULT'])))
             
-            # Default fee asset is USDT for spot trades
+            # Calculate trade value
+            trade_value = price * quantity
+            
+            # For futures trades, account for leverage in fee calculation
+            if order_type == "futures" and leverage > 1:
+                # In futures trading, fees apply to the effective position size (with leverage)
+                effective_value = trade_value * Decimal(str(leverage))
+                fee_amount = effective_value * fee_rate
+                logger.info(f"Calculated futures fees with leverage {leverage}x: Value=${float(trade_value):.2f}, Effective=${float(effective_value):.2f}")
+            else:
+                # Standard fee calculation for spot trades
+                fee_amount = trade_value * fee_rate
+            
+            # Default fee asset is USDT for most trades
             fee_asset = "USDT"
+            
+            logger.info(f"Calculated fees for {symbol} ({order_type}): {float(fee_amount):.4f} {fee_asset} (rate: {float(fee_rate)*100:.4f}%)")
             
             return fee_amount, fee_asset
         except Exception as e:

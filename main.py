@@ -165,11 +165,14 @@ async def initialize_services(config):
             api_secret=config['binance']['api_secret'],
             testnet=config['binance']['testnet'],
             mongo_client=mongo_client,
-            config=config
+            config=config  # Pass config directly to ensure reserve balance is set
         )
         
         # Initialize client connection
         await binance_client.initialize()
+        
+        # Log reserve balance after initialization to verify (NEW CODE)
+        logger.info(f"[VERIFY] Reserve balance after BinanceClient init: ${binance_client.reserve_balance:,.2f}")
         
         # Initialize Telegram bot
         telegram_bot = TelegramBot(
@@ -185,6 +188,9 @@ async def initialize_services(config):
         
         # Initialize telegram bot
         await telegram_bot.initialize()
+        
+        # Verify reserve balance one more time after all initialization (NEW CODE)
+        logger.info(f"[VERIFY] Final reserve balance: ${binance_client.reserve_balance:,.2f}")
         
         # Initialize OrderManager
         order_manager = OrderManager(

@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 from ..types.models import Order, OrderStatus, TimeFrame, OrderType, TradeDirection  # Add imports
 from ..types.constants import TAX_RATE, PRICE_PRECISION
-from decimal import Decimal, ROUND_DOWN, DecimalException
+from decimal import Decimal, ROUND_DOWN, InvalidOperation  # Replace DecimalException with InvalidOperation
 import logging
 import numpy as np  # Add missing numpy import
 
@@ -366,7 +366,7 @@ class MongoClient:
 
             return order
             
-        except (ValueError, KeyError, TypeError, DecimalException) as e:
+        except (ValueError, KeyError, TypeError, InvalidOperation) as e:  # Replace DecimalException with InvalidOperation
             logger.error(f"Error converting document {doc.get('order_id', 'unknown')}: {e}")
             return None
 
@@ -539,7 +539,7 @@ class MongoClient:
                         "quantity": Decimal(doc["quantity"]),
                         "order_id": doc["order_id"]
                     })
-                except (KeyError, ValueError, DecimalException) as e:
+                except (KeyError, ValueError, InvalidOperation) as e:  # Changed from DecimalException to InvalidOperation
                     logger.error(f"Error parsing order {doc.get('order_id', 'unknown')}: {e}")
             
             return results

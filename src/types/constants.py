@@ -36,9 +36,15 @@ PRICE_PRECISION = {
     'QUANTITY': 8
 }
 
-# Fee settings
+# Update trading fees based on provided rates
 TRADING_FEES = {
-    'MAKER': 0.001,  # 0.1% maker fee
-    'TAKER': 0.001,  # 0.1% taker fee
-    'DEFAULT': 0.001  # Default fee for testnet
+    'DEFAULT': 0.001,  # 0.10% default for spot
+    'SPOT': 0.001,     # 0.10% for spot trading
+    'FUTURES': 0.002  # 0.02% for futures trading (updated to correct rate)
+}
+
+# Add order type specific fees
+ORDER_TYPE_FEES = {
+    'spot': 0.001,     # 0.10% for spot
+    'futures': 0.002  # 0.02% for futures (updated to correct rate)
 }
