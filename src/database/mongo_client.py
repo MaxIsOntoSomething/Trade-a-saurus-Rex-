@@ -1,151 +1,202 @@
 import motor.motor_asyncio
-from datetime import datetime, timedelta
-from typing import List, Optional, Dict, Any
-from ..types.models import Order, OrderStatus, TimeFrame, OrderType, TradeDirection  # Add imports
-from ..types.constants import TAX_RATE, PRICE_PRECISION
-from decimal import Decimal, ROUND_DOWN, InvalidOperation  # Replace DecimalException with InvalidOperation
 import logging
+from datetime import datetime, timedelta
+from decimal import Decimal
+from typing import List, Dict, Optional, Union, Tuple
+from ..types.models import Order, OrderStatus, TimeFrame, OrderType, OrderDirection, MarginMode, PositionSide
+from ..types.constants import TAX_RATE, PRICE_PRECISION
+from decimal import ROUND_DOWN, InvalidOperation  # Replace DecimalException with InvalidOperation
 import numpy as np  # Add missing numpy import
 
 logger = logging.getLogger(__name__)
 
 class MongoClient:
     def __init__(self, uri: str, database: str):
+        """Initialize MongoDB client with connection URI and database name"""
+        self.uri = uri
+        self.database_name = database
         self.client = motor.motor_asyncio.AsyncIOMotorClient(uri)
         self.db = self.client[database]
+        
+        # Initialize collections
         self.orders = self.db.orders
-        self.balance_history = self.db.balance_history  # Add balance_history collection
-        self.threshold_state = self.db.threshold_state  # Add collection for threshold state
-        self.thresholds = self.db.thresholds  # Add this line for thresholds collection
-        self.reference_prices = self.db.reference_prices  # Add this line for reference prices collection
+        self.triggered_thresholds = self.db.triggered_thresholds
+        self.reference_prices = self.db.reference_prices
+        self.balance_history = self.db.balance_history
+        
+        # New collections for futures trading
+        self.pnl_history = self.db.pnl_history
+        self.funding_history = self.db.funding_history
+        self.margin_calls = self.db.margin_calls
+        
+        logger.info(f"MongoDB client initialized with database: {database}")
 
     async def init_indexes(self):
+        """Initialize database indexes"""
+        try:
+            # Create indexes for orders collection
         await self.orders.create_index("order_id", unique=True)
-        await self.orders.create_index("status")
         await self.orders.create_index("symbol")
+            await self.orders.create_index("status")
         await self.orders.create_index("created_at")
-        
-        # Add index for balance history
-        await self.balance_history.create_index("timestamp")
-        
-        # Add index for threshold state
-        await self.threshold_state.create_index([("symbol", 1), ("timeframe", 1)], unique=True)
-        
-        # Add index for thresholds collection
-        await self.thresholds.create_index([("symbol", 1), ("timeframe", 1), ("threshold", 1)], unique=True)
-        
-        # Add index for reference prices
-        await self.reference_prices.create_index([("symbol", 1), ("timeframe", 1)], unique=True)
+            await self.orders.create_index("filled_at")
+            await self.orders.create_index("order_type")  # Index for order type (spot/futures)
+            await self.orders.create_index("direction")   # Index for direction (long/short)
+            await self.orders.create_index("leverage")    # Index for leverage
+            await self.orders.create_index("tp_order_id") # Index for TP order ID
+            await self.orders.create_index("sl_order_id") # Index for SL order ID
+            
+            # Create indexes for triggered thresholds collection
+            await self.thresholds.create_index([("symbol", 1), ("timeframe", 1)], unique=True)
+            
+            # Create indexes for reference prices collection
+            await self.reference_prices.create_index("timestamp")
+            
+            # Create indexes for balance history collection
+            await self.balance_history.create_index("timestamp")
+            
+            # Create indexes for pnl_history collection
+            await self.pnl_history.create_index("order_id")
         
         logger.info("Database indexes initialized")
+        except Exception as e:
+            logger.error(f"Failed to initialize database indexes: {e}")
+            raise
 
     def _validate_order_data(self, order: Order) -> bool:
         """Validate order data before insertion"""
-        required_fields = {
-            'symbol': str,
-            'status': OrderStatus,
-            'order_type': OrderType,  # Add order_type validation
-            'price': (Decimal, float),
-            'quantity': (Decimal, float),
-            'order_id': str,
-            'created_at': datetime,
-            'updated_at': datetime
-        }
-        
-        # Optional fields with their types
-        optional_fields = {
-            'leverage': (int, type(None)),
-            'direction': (TradeDirection, type(None)),
-            'fees': (Decimal, float),
-            'fee_asset': str
-        }
-        
         try:
             # Check required fields
-            for field, expected_type in required_fields.items():
-                value = getattr(order, field)
-                if not isinstance(value, expected_type):
-                    logger.error(f"Invalid type for {field}: expected {expected_type}, got {type(value)}")
+            if not order.symbol or not order.price or not order.quantity:
+                logger.error("Missing required order fields")
                     return False
                     
-            # Check optional fields if present
-            for field, expected_type in optional_fields.items():
-                value = getattr(order, field, None)
-                if value is not None and not isinstance(value, expected_type):
-                    logger.error(f"Invalid type for optional field {field}: expected {expected_type}, got {type(value)}")
+            # Validate order type
+            if not isinstance(order.order_type, OrderType):
+                logger.error(f"Invalid order type: {order.order_type}")
+                return False
+                
+            # Validate order status
+            if not isinstance(order.status, OrderStatus):
+                logger.error(f"Invalid order status: {order.status}")
+                return False
+                
+            # Validate timeframe if present
+            if order.timeframe and not isinstance(order.timeframe, TimeFrame):
+                logger.error(f"Invalid timeframe: {order.timeframe}")
+                return False
+                
+            # Validate direction if present (for futures orders)
+            if order.direction and not isinstance(order.direction, OrderDirection):
+                logger.error(f"Invalid direction: {order.direction}")
+                return False
+                
+            # Validate leverage for futures orders
+            if order.order_type == OrderType.FUTURES and order.leverage is None:
+                logger.error("Missing leverage for futures order")
+                return False
+                
+            # Validate direction for futures orders
+            if order.order_type == OrderType.FUTURES and order.direction is None:
+                logger.error("Missing direction for futures order")
                     return False
                     
             return True
-        except AttributeError as e:
-            logger.error(f"Missing required field: {e}")
+        except Exception as e:
+            logger.error(f"Order validation error: {e}")
             return False
 
     async def insert_order(self, order: Order) -> Optional[str]:
-        """Insert order with validation"""
+        """Insert a new order into the database"""
+        try:
+            # Validate order data
         if not self._validate_order_data(order):
-            logger.error("Order validation failed")
             return None
 
-        try:
-            order_dict = {
+            # Convert order to document
+            doc = {
+                "order_id": order.order_id,
                 "symbol": order.symbol,
-                "status": order.status.value,
                 "price": str(order.price),
                 "quantity": str(order.quantity),
-                "threshold": float(order.threshold),
-                "timeframe": order.timeframe.value,
-                "order_id": order.order_id,
+                "order_type": order.order_type.value,
+                "status": order.status.value,
                 "created_at": order.created_at,
-                "updated_at": order.updated_at,
-                "fees": str(order.fees),
-                "fee_asset": order.fee_asset,
-                "is_manual": bool(order.is_manual),
                 "filled_at": order.filled_at,
                 "cancelled_at": order.cancelled_at,
-                "metadata": {  # Add metadata for better tracking
-                    "inserted_at": datetime.utcnow(),
-                    "last_checked": datetime.utcnow(),
-                    "check_count": 0,
-                    "error_count": 0
-                }
+                "is_manual": order.is_manual,
+                "fee": str(order.fee) if order.fee else None,
+                "fee_currency": order.fee_currency,
+                "timeframe": order.timeframe.value if order.timeframe else None,
+                "threshold": order.threshold,
+                "reference_price": str(order.reference_price) if order.reference_price else None
             }
             
-            result = await self.orders.insert_one(order_dict)
+            # Add futures-specific fields
+            if order.order_type == OrderType.FUTURES:
+                doc.update({
+                    "leverage": order.leverage,
+                    "direction": order.direction.value if order.direction else None,
+                    "margin_mode": order.margin_mode if hasattr(order, 'margin_mode') else "isolated",
+                    "position_side": order.position_side if hasattr(order, 'position_side') else "BOTH"
+                })
+                
+            # Add TP/SL fields if present
+            if hasattr(order, 'tp_price') and order.tp_price:
+                doc["tp_price"] = str(order.tp_price)
+            if hasattr(order, 'sl_price') and order.sl_price:
+                doc["sl_price"] = str(order.sl_price)
+            if hasattr(order, 'tp_percentage') and order.tp_percentage:
+                doc["tp_percentage"] = order.tp_percentage
+            if hasattr(order, 'sl_percentage') and order.sl_percentage:
+                doc["sl_percentage"] = order.sl_percentage
+            if hasattr(order, 'tp_order_id') and order.tp_order_id:
+                doc["tp_order_id"] = order.tp_order_id
+            if hasattr(order, 'sl_order_id') and order.sl_order_id:
+                doc["sl_order_id"] = order.sl_order_id
+                
+            # Insert document
+            result = await self.orders.insert_one(doc)
+            
+            if result.inserted_id:
+                logger.info(f"Inserted order {order.order_id} for {order.symbol}")
             return str(result.inserted_id)
+            else:
+                logger.error(f"Failed to insert order {order.order_id}")
+                return None
             
         except Exception as e:
-            logger.error(f"Failed to insert order: {e}")
+            logger.error(f"Error inserting order: {e}")
             return None
 
     async def insert_manual_trade(self, order: Order) -> Optional[str]:
-        """Insert a manually executed trade"""
+        """Insert a manual trade into the database"""
         try:
-            order_dict = {
-                "symbol": order.symbol,
-                "status": OrderStatus.FILLED.value,  # Always FILLED for manual trades
-                "order_type": order.order_type.value,
-                "price": str(order.price),
-                "quantity": str(order.quantity),
-                "timeframe": order.timeframe.value,
-                "order_id": order.order_id,
-                "created_at": order.created_at,
-                "updated_at": order.updated_at,
-                "filled_at": order.filled_at,
-                "fees": str(order.fees),
-                "fee_asset": order.fee_asset,
-                "threshold": "Manual",  # Add manual threshold marker
-            }
+            # Validate order data
+            if not self._validate_order_data(order):
+                return None
+                
+            # Ensure it's marked as manual
+            order.is_manual = True
             
-            # Add futures-specific fields if applicable
+            # Convert order to dictionary
+            order_dict = order.to_dict()
+            
+            # Add additional fields for futures orders
             if order.order_type == OrderType.FUTURES:
-                order_dict.update({
-                    "leverage": order.leverage,
-                    "direction": order.direction.value
-                })
-            
+                order_dict["is_futures"] = True
+                order_dict["margin_value"] = str(order.get_margin_value())
+            else:
+                order_dict["is_futures"] = False
+                
+            # Insert order
             result = await self.orders.insert_one(order_dict)
+            
+            if result.inserted_id:
+                logger.info(f"Inserted manual trade {order.order_id} into database")
             return str(result.inserted_id)
             
+            return None
         except Exception as e:
             logger.error(f"Failed to insert manual trade: {e}")
             return None
@@ -209,106 +260,246 @@ class MongoClient:
         return orders
 
     async def get_performance_stats(self) -> dict:
-        """Get trading performance statistics"""
-        pipeline = [
-            {"$match": {"status": "filled"}},
-            {"$group": {
-                "_id": "$symbol",
-                "total_orders": {"$sum": 1},
-                "avg_price": {"$avg": {"$toDecimal": "$price"}},
-                "total_quantity": {"$sum": {"$toDecimal": "$quantity"}}
-            }}
-        ]
-        
-        stats = {}
-        async for result in self.orders.aggregate(pipeline):
-            stats[result["_id"]] = {
-                "total_orders": result["total_orders"],
-                "avg_price": float(result["avg_price"]),
-                "total_quantity": float(result["total_quantity"])
+        """Get performance statistics for all trades"""
+        try:
+            # Get all filled orders
+            filled_orders = self.orders.find({"status": OrderStatus.FILLED.value})
+            
+            # Initialize stats
+            stats = {
+                "total_orders": 0,
+                "filled_orders": 0,
+                "cancelled_orders": 0,
+                "total_volume": 0,
+                "avg_order_size": 0,
+                "spot_orders": 0,
+                "futures_orders": 0,
+                "futures_long": 0,
+                "futures_short": 0,
+                "avg_leverage": 0,
+                "total_fees": 0,
+                "total_pnl": 0,
+                "win_rate": 0,
+                "symbols": {}
             }
+            
+            # Get total orders count
+            stats["total_orders"] = await self.orders.count_documents({})
+            stats["filled_orders"] = await self.orders.count_documents({"status": OrderStatus.FILLED.value})
+            stats["cancelled_orders"] = await self.orders.count_documents({"status": OrderStatus.CANCELLED.value})
+            
+            # Get order type counts
+            stats["spot_orders"] = await self.orders.count_documents({"order_type": OrderType.SPOT.value})
+            stats["futures_orders"] = await self.orders.count_documents({"order_type": OrderType.FUTURES.value})
+            
+            # Get futures direction counts
+            stats["futures_long"] = await self.orders.count_documents({
+                "order_type": OrderType.FUTURES.value,
+                "direction": OrderDirection.LONG.value
+            })
+            stats["futures_short"] = await self.orders.count_documents({
+                "order_type": OrderType.FUTURES.value,
+                "direction": OrderDirection.SHORT.value
+            })
+            
+            # Process filled orders
+            total_volume = Decimal('0')
+            total_fees = Decimal('0')
+            total_pnl = Decimal('0')
+            total_leverage = 0
+            leverage_count = 0
+            winning_trades = 0
+            closed_trades = 0
+            
+            async for doc in filled_orders:
+                # Calculate volume
+                price = Decimal(doc["price"])
+                quantity = Decimal(doc["quantity"])
+                volume = price * quantity
+                total_volume += volume
+                
+                # Track fees
+                if "fee" in doc and doc["fee"]:
+                    fee = Decimal(doc["fee"])
+                    total_fees += fee
+                
+                # Track PnL for futures
+                if doc["order_type"] == OrderType.FUTURES.value and "pnl" in doc and doc["pnl"]:
+                    pnl = Decimal(doc["pnl"])
+                    total_pnl += pnl
+                    
+                    closed_trades += 1
+                    if pnl > 0:
+                        winning_trades += 1
+                
+                # Track leverage
+                if doc["order_type"] == OrderType.FUTURES.value and "leverage" in doc:
+                    total_leverage += doc["leverage"]
+                    leverage_count += 1
+                
+                # Track by symbol
+                symbol = doc["symbol"]
+                if symbol not in stats["symbols"]:
+                    stats["symbols"][symbol] = {
+                        "total_orders": 0,
+                        "filled_orders": 0,
+                        "cancelled_orders": 0,
+                        "volume": 0,
+                        "spot_orders": 0,
+                        "futures_orders": 0,
+                        "futures_long": 0,
+                        "futures_short": 0,
+                        "pnl": 0
+                    }
+                
+                stats["symbols"][symbol]["total_orders"] += 1
+                stats["symbols"][symbol]["filled_orders"] += 1
+                stats["symbols"][symbol]["volume"] += float(volume)
+                
+                if doc["order_type"] == OrderType.SPOT.value:
+                    stats["symbols"][symbol]["spot_orders"] += 1
+                else:
+                    stats["symbols"][symbol]["futures_orders"] += 1
+                    
+                    if doc.get("direction") == OrderDirection.LONG.value:
+                        stats["symbols"][symbol]["futures_long"] += 1
+                    elif doc.get("direction") == OrderDirection.SHORT.value:
+                        stats["symbols"][symbol]["futures_short"] += 1
+                        
+                    if "pnl" in doc and doc["pnl"]:
+                        stats["symbols"][symbol]["pnl"] += float(Decimal(doc["pnl"]))
+            
+            # Calculate averages and totals
+            stats["total_volume"] = float(total_volume)
+            stats["total_fees"] = float(total_fees)
+            stats["total_pnl"] = float(total_pnl)
+            
+            if stats["filled_orders"] > 0:
+                stats["avg_order_size"] = float(total_volume) / stats["filled_orders"]
+            
+            if leverage_count > 0:
+                stats["avg_leverage"] = total_leverage / leverage_count
+            
+            if closed_trades > 0:
+                stats["win_rate"] = (winning_trades / closed_trades) * 100
+            
         return stats
+            
+        except Exception as e:
+            logger.error(f"Error getting performance stats: {e}")
+            return {}
 
     async def get_position_stats(self, allowed_symbols: set = None) -> dict:
-        """Get detailed position statistics including profits"""
-        match_stage = {"status": "filled"}
+        """Get statistics about current positions"""
+        try:
+            # Get all filled orders
+            query = {"status": OrderStatus.FILLED.value}
+            
+            # Filter by allowed symbols if provided
         if allowed_symbols:
-            match_stage["symbol"] = {"$in": list(allowed_symbols)}
-
-        pipeline = [
-            {"$match": match_stage},
-            {"$group": {
-                "_id": "$symbol",
-                "total_quantity": {"$sum": {"$toDecimal": "$quantity"}},
-                "total_cost": {
-                    "$sum": {
-                        "$multiply": [
-                            {"$toDecimal": "$quantity"},
-                            {"$toDecimal": "$price"}
-                        ]
-                    }
-                },
-                "orders": {"$push": {
-                    "price": "$price",
-                    "quantity": "$quantity",
-                    "filled_at": "$filled_at"
-                }},
-                "order_count": {"$sum": 1}
-            }},
-            {"$project": {
-                "symbol": "$_id",
-                "total_quantity": {"$toString": "$total_quantity"},
-                "total_cost": {"$toString": "$total_cost"},
-                "avg_entry_price": {
-                    "$toString": {
-                        "$divide": ["$total_cost", "$total_quantity"]
-                    }
-                },
-                "orders": 1,
-                "order_count": 1
-            }}
-        ]
-
+                query["symbol"] = {"$in": list(allowed_symbols)}
+                
+            orders = await self.orders.find(query).to_list(None)
+            
+            # Group by symbol
         positions = {}
-        async for doc in self.orders.aggregate(pipeline):
-            positions[doc["_id"]] = {
-                "total_quantity": Decimal(doc["total_quantity"]),
-                "total_cost": Decimal(doc["total_cost"]),
-                "avg_entry_price": Decimal(doc["avg_entry_price"]),
-                "order_count": doc["order_count"],
-                "orders": doc["orders"]
-            }
+            for order_doc in orders:
+                order = self._document_to_order(order_doc)
+                if not order:
+                    continue
+                    
+                symbol = order.symbol
+                
+                if symbol not in positions:
+                    positions[symbol] = {
+                        "symbol": symbol,
+                        "quantity": Decimal("0"),
+                        "total_cost": Decimal("0"),
+                        "avg_price": Decimal("0"),
+                        "orders": [],
+                        "is_futures": order.order_type == OrderType.FUTURES,
+                        "leverage": order.leverage if order.order_type == OrderType.FUTURES else None,
+                        "direction": order.direction.value if order.direction else "long"
+                    }
+                
+                # Update position data
+                position = positions[symbol]
+                
+                # For futures, handle long and short positions differently
+                if order.order_type == OrderType.FUTURES:
+                    # Update position type if not already set
+                    position["is_futures"] = True
+                    position["leverage"] = order.leverage
+                    position["direction"] = order.direction.value if order.direction else "long"
+                    
+                    # For shorts, quantity is negative
+                    if order.direction == OrderDirection.SHORT:
+                        position["quantity"] -= order.quantity
+                    else:
+                        position["quantity"] += order.quantity
+                else:
+                    # For spot, always add quantity
+                    position["quantity"] += order.quantity
+                
+                # Update cost and orders
+                position["total_cost"] += order.price * order.quantity
+                position["orders"].append(order_doc)
+            
+            # Calculate average price for each position
+            for symbol, position in positions.items():
+                if position["quantity"] != 0:
+                    position["avg_price"] = position["total_cost"] / abs(position["quantity"])
+                
+                # Convert Decimal to float for JSON serialization
+                position["quantity"] = float(position["quantity"])
+                position["total_cost"] = float(position["total_cost"])
+                position["avg_price"] = float(position["avg_price"])
+            
         return positions
+        except Exception as e:
+            logger.error(f"Error getting position stats: {e}")
+            return {}
 
     def calculate_profit_loss(self, position: dict, current_price: Decimal) -> dict:
-        """Calculate profit/loss for a position including fees"""
-        current_value = position["total_quantity"] * current_price
-        total_fees = sum(Decimal(str(order.get('fees', 0))) for order in position['orders'])
-        
-        # Include fees in profit calculation
-        absolute_pl = current_value - position["total_cost"] - total_fees
-        percentage_pl = (absolute_pl / position["total_cost"]) * 100
-
-        # Apply tax if profitable
-        tax_amount = Decimal('0')
-        if absolute_pl > 0:
-            tax_amount = absolute_pl * Decimal(str(TAX_RATE))
-            absolute_pl -= tax_amount
-
+        """Calculate profit/loss for a position"""
+        try:
+            # Extract position data
+            avg_price = Decimal(str(position["avg_price"]))
+            quantity = Decimal(str(position["quantity"]))
+            is_futures = position.get("is_futures", False)
+            leverage = Decimal(str(position.get("leverage", 1)))
+            direction = position.get("direction", "long")
+            
+            # Calculate profit/loss
+            if is_futures:
+                # For futures, consider direction and leverage
+                if direction == "long":
+                    price_diff = current_price - avg_price
+                else:  # short
+                    price_diff = avg_price - current_price
+                    
+                # Calculate PnL with leverage
+                pnl = price_diff * abs(quantity) * leverage
+                pnl_percentage = (price_diff / avg_price) * Decimal("100") * leverage
+            else:
+                # For spot, simple calculation
+                pnl = (current_price - avg_price) * quantity
+                pnl_percentage = ((current_price - avg_price) / avg_price) * Decimal("100")
+            
+            # Return results
         return {
-            "current_value": current_value.quantize(
-                Decimal('0.01'), rounding=ROUND_DOWN
-            ),
-            "absolute_pl": absolute_pl.quantize(
-                Decimal('0.01'), rounding=ROUND_DOWN
-            ),
-            "percentage_pl": percentage_pl.quantize(
-                Decimal('0.01'), rounding=ROUND_DOWN
-            ),
-            "tax_amount": tax_amount.quantize(
-                Decimal('0.01'), rounding=ROUND_DOWN
-            ),
-            "total_fees": total_fees.quantize(Decimal('0.01'), rounding=ROUND_DOWN),
+                "pnl": float(pnl),
+                "pnl_percentage": float(pnl_percentage),
+                "current_value": float(current_price * abs(quantity)),
+                "cost_basis": float(avg_price * abs(quantity))
+            }
+        except Exception as e:
+            logger.error(f"Error calculating profit/loss: {e}")
+            return {
+                "pnl": 0,
+                "pnl_percentage": 0,
+                "current_value": 0,
+                "cost_basis": 0
         }
 
     def generate_profit_diagram(self, position: dict, current_price: Decimal) -> str:
@@ -329,45 +520,68 @@ class MongoClient:
         return diagram
 
     def _document_to_order(self, doc: dict) -> Optional[Order]:
-        """Convert MongoDB document to Order object with error handling"""
+        """Convert a document to an Order object"""
         try:
-            # Updated required fields list
-            required_fields = ['symbol', 'status', 'price', 'quantity', 
-                             'order_id', 'created_at', 'updated_at']
+            # Convert string fields to appropriate types
+            price = Decimal(doc.get('price', '0'))
+            quantity = Decimal(doc.get('quantity', '0'))
+            fee = Decimal(doc.get('fee')) if doc.get('fee') else None
+            reference_price = Decimal(doc.get('reference_price')) if doc.get('reference_price') else None
             
-            if not all(field in doc for field in required_fields):
-                missing = [field for field in required_fields if field not in doc]
-                logger.error(f"Document missing required fields: {missing}")
-                return None
-
-            # Create order with mandatory fields
+            # Convert enum fields
+            order_type = OrderType(doc.get('order_type', 'spot'))
+            status = OrderStatus(doc.get('status', 'pending'))
+            timeframe = TimeFrame(doc.get('timeframe')) if doc.get('timeframe') else None
+            
+            # Convert direction for futures orders
+            direction = None
+            if doc.get('direction'):
+                direction = OrderDirection(doc.get('direction'))
+            
+            # Create order object
             order = Order(
-                symbol=doc["symbol"],
-                status=OrderStatus(doc["status"]),
-                order_type=OrderType(doc.get("order_type", "spot")),  # Default to spot
-                price=Decimal(doc["price"]),
-                quantity=Decimal(doc["quantity"]),
-                timeframe=TimeFrame(doc.get("timeframe", "daily")),  # Default to daily
-                order_id=doc["order_id"],
-                created_at=doc["created_at"],
-                updated_at=doc["updated_at"],
-                filled_at=doc.get("filled_at"),
-                cancelled_at=doc.get("cancelled_at"),
-                fees=Decimal(doc.get("fees", "0")),
-                fee_asset=doc.get("fee_asset", "USDT"),
-                threshold=float(doc["threshold"]) if doc.get("threshold") not in [None, "Manual"] else None
+                order_id=doc.get('order_id'),
+                symbol=doc.get('symbol'),
+                price=price,
+                quantity=quantity,
+                order_type=order_type,
+                status=status,
+                created_at=doc.get('created_at'),
+                filled_at=doc.get('filled_at'),
+                cancelled_at=doc.get('cancelled_at'),
+                is_manual=doc.get('is_manual', False),
+                fee=fee,
+                fee_currency=doc.get('fee_currency'),
+                timeframe=timeframe,
+                threshold=doc.get('threshold'),
+                reference_price=reference_price,
+                leverage=doc.get('leverage'),
+                direction=direction
             )
-
-            # Add futures-specific fields if present
-            if doc.get("leverage") is not None:
-                order.leverage = int(doc["leverage"])
-            if doc.get("direction"):
-                order.direction = TradeDirection(doc["direction"])
+            
+            # Add futures-specific fields
+            if order_type == OrderType.FUTURES:
+                order.margin_mode = doc.get('margin_mode', 'isolated')
+                order.position_side = doc.get('position_side', 'BOTH')
+            
+            # Add TP/SL fields if present
+            if 'tp_price' in doc and doc['tp_price']:
+                order.tp_price = Decimal(doc['tp_price'])
+            if 'sl_price' in doc and doc['sl_price']:
+                order.sl_price = Decimal(doc['sl_price'])
+            if 'tp_percentage' in doc:
+                order.tp_percentage = doc['tp_percentage']
+            if 'sl_percentage' in doc:
+                order.sl_percentage = doc['sl_percentage']
+            if 'tp_order_id' in doc:
+                order.tp_order_id = doc['tp_order_id']
+            if 'sl_order_id' in doc:
+                order.sl_order_id = doc['sl_order_id']
 
             return order
             
-        except (ValueError, KeyError, TypeError, InvalidOperation) as e:  # Replace DecimalException with InvalidOperation
-            logger.error(f"Error converting document {doc.get('order_id', 'unknown')}: {e}")
+        except Exception as e:
+            logger.error(f"Error converting document to order: {e}")
             return None
 
     async def cleanup_stale_orders(self, hours: int = 24) -> int:
@@ -875,5 +1089,750 @@ class MongoClient:
         except Exception as e:
             logger.error(f"Error getting portfolio composition: {e}", exc_info=True)
             return {}
+
+    async def get_tp_sl_orders(self, main_order_id: str) -> Dict[str, Optional[Order]]:
+        """Get TP/SL orders for a main order"""
+        try:
+            # Get main order
+            main_order_doc = await self.orders.find_one({"order_id": main_order_id})
+            if not main_order_doc:
+                logger.error(f"Main order {main_order_id} not found")
+                return {"tp_order": None, "sl_order": None}
+            
+            # Get TP/SL order IDs
+            tp_order_id = main_order_doc.get("tp_order_id")
+            sl_order_id = main_order_doc.get("sl_order_id")
+            
+            # Get TP/SL orders
+            tp_order_doc = await self.orders.find_one({"order_id": tp_order_id}) if tp_order_id else None
+            sl_order_doc = await self.orders.find_one({"order_id": sl_order_id}) if sl_order_id else None
+            
+            # Convert to Order objects
+            tp_order = self._document_to_order(tp_order_doc) if tp_order_doc else None
+            sl_order = self._document_to_order(sl_order_doc) if sl_order_doc else None
+            
+            return {
+                "tp_order": tp_order,
+                "sl_order": sl_order
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting TP/SL orders: {e}")
+            return {"tp_order": None, "sl_order": None}
+    
+    async def link_tp_sl_orders(self, main_order_id: str, tp_order_id: Optional[str], sl_order_id: Optional[str], 
+                              tp_price: Optional[Decimal] = None, sl_price: Optional[Decimal] = None) -> bool:
+        """Link TP/SL orders to a main order"""
+        try:
+            update_dict = {}
+            
+            if tp_order_id:
+                update_dict["tp_order_id"] = tp_order_id
+            if sl_order_id:
+                update_dict["sl_order_id"] = sl_order_id
+            if tp_price:
+                update_dict["tp_price"] = str(tp_price)
+            if sl_price:
+                update_dict["sl_price"] = str(sl_price)
+            
+            if not update_dict:
+                return False
+            
+            result = await self.orders.update_one(
+                {"order_id": main_order_id},
+                {"$set": update_dict}
+            )
+            
+            return result.modified_count > 0
+            
+        except Exception as e:
+            logger.error(f"Error linking TP/SL orders: {e}")
+            return False
+    
+    async def unlink_tp_sl_orders(self, main_order_id: str) -> bool:
+        """Unlink TP/SL orders from a main order"""
+        try:
+            result = await self.orders.update_one(
+                {"order_id": main_order_id},
+                {"$unset": {
+                    "tp_order_id": "",
+                    "sl_order_id": "",
+                    "tp_price": "",
+                    "sl_price": ""
+                }}
+            )
+            
+            return result.modified_count > 0
+            
+        except Exception as e:
+            logger.error(f"Error unlinking TP/SL orders: {e}")
+            return False
+    
+    async def get_orders_with_tp_sl(self) -> List[Dict]:
+        """Get all orders with TP/SL orders"""
+        try:
+            orders = await self.orders.find({
+                "status": OrderStatus.FILLED.value,
+                "$or": [
+                    {"tp_order_id": {"$exists": True}},
+                    {"sl_order_id": {"$exists": True}}
+                ]
+            }).to_list(None)
+            
+            return orders
+            
+        except Exception as e:
+            logger.error(f"Error getting orders with TP/SL: {e}")
+            return []
+    
+    async def update_tp_sl_status(self, main_order_id: str, tp_filled: bool = False, sl_filled: bool = False) -> bool:
+        """Update TP/SL status for a main order"""
+        try:
+            update_dict = {}
+            
+            if tp_filled:
+                update_dict["tp_filled"] = True
+                update_dict["tp_filled_at"] = datetime.utcnow()
+            
+            if sl_filled:
+                update_dict["sl_filled"] = True
+                update_dict["sl_filled_at"] = datetime.utcnow()
+            
+            if not update_dict:
+                return False
+            
+            result = await self.orders.update_one(
+                {"order_id": main_order_id},
+                {"$set": update_dict}
+            )
+            
+            return result.modified_count > 0
+            
+        except Exception as e:
+            logger.error(f"Error updating TP/SL status: {e}")
+            return False
+
+    async def get_futures_positions(self, symbol: Optional[str] = None) -> List[Dict]:
+        """Get all open futures positions"""
+        try:
+            # Build query
+            query = {
+                "order_type": OrderType.FUTURES.value,
+                "status": OrderStatus.FILLED.value
+            }
+            
+            # Add symbol filter if provided
+            if symbol:
+                query["symbol"] = symbol
+                
+            # Get all filled futures orders
+            cursor = self.orders.find(query)
+            
+            # Group by symbol and direction to get positions
+            positions = {}
+            async for doc in cursor:
+                order = self._document_to_order(doc)
+                if not order:
+                    continue
+                    
+                # Create a unique key for each position (symbol + direction)
+                key = f"{order.symbol}_{order.direction.value if order.direction else 'long'}"
+                
+                if key not in positions:
+                    positions[key] = {
+                        "symbol": order.symbol,
+                        "direction": order.direction.value if order.direction else "long",
+                        "leverage": order.leverage,
+                        "margin_mode": order.margin_mode,
+                        "position_side": order.position_side,
+                        "quantity": Decimal('0'),
+                        "entry_price": Decimal('0'),
+                        "orders": []
+                    }
+                
+                # Add order to position
+                positions[key]["orders"].append({
+                    "order_id": order.order_id,
+                    "price": float(order.price),
+                    "quantity": float(order.quantity),
+                    "created_at": order.created_at,
+                    "filled_at": order.filled_at
+                })
+                
+                # Update position quantity and entry price
+                positions[key]["quantity"] += order.quantity
+                
+                # Calculate weighted average entry price
+                total_value = Decimal('0')
+                total_qty = Decimal('0')
+                for ord in positions[key]["orders"]:
+                    qty = Decimal(str(ord["quantity"]))
+                    price = Decimal(str(ord["price"]))
+                    total_value += qty * price
+                    total_qty += qty
+                
+                if total_qty > 0:
+                    positions[key]["entry_price"] = total_value / total_qty
+                
+            # Convert to list and format for response
+            result = []
+            for pos in positions.values():
+                # Skip positions with zero quantity
+                if pos["quantity"] == 0:
+                    continue
+                    
+                # Format decimal values
+                pos["quantity"] = float(pos["quantity"])
+                pos["entry_price"] = float(pos["entry_price"])
+                
+                result.append(pos)
+                
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error getting futures positions: {e}")
+            return []
+
+    async def update_position_tp_sl(self, order_id: str, tp_price: Optional[Decimal] = None, 
+                               sl_price: Optional[Decimal] = None, tp_order_id: Optional[str] = None, 
+                               sl_order_id: Optional[str] = None) -> bool:
+        """Update a futures position with TP/SL information"""
+        try:
+            update_data = {}
+            
+            # Add TP/SL prices if provided
+            if tp_price is not None:
+                update_data["tp_price"] = str(tp_price)
+            if sl_price is not None:
+                update_data["sl_price"] = str(sl_price)
+                
+            # Add TP/SL order IDs if provided
+            if tp_order_id is not None:
+                update_data["tp_order_id"] = tp_order_id
+            if sl_order_id is not None:
+                update_data["sl_order_id"] = sl_order_id
+                
+            # Skip if no data to update
+            if not update_data:
+                logger.warning(f"No TP/SL data provided for order {order_id}")
+                return False
+                
+            # Update order
+            result = await self.orders.update_one(
+                {"order_id": order_id},
+                {"$set": update_data}
+            )
+            
+            if result.modified_count > 0:
+                logger.info(f"Updated TP/SL for order {order_id}")
+                return True
+            else:
+                logger.warning(f"No order found with ID {order_id}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error updating position TP/SL: {e}")
+            return False
+
+    async def get_futures_stats(self) -> Dict:
+        """Get statistics for futures trading"""
+        try:
+            # Get all futures orders
+            futures_orders = self.orders.find({"order_type": OrderType.FUTURES.value})
+            
+            # Initialize stats
+            stats = {
+                "total_orders": 0,
+                "filled_orders": 0,
+                "cancelled_orders": 0,
+                "long_positions": 0,
+                "short_positions": 0,
+                "avg_leverage": 0,
+                "total_pnl": 0,
+                "win_rate": 0,
+                "symbols": {},
+                "leverage_distribution": {}
+            }
+            
+            # Process orders
+            total_leverage = 0
+            winning_trades = 0
+            closed_trades = 0
+            
+            async for doc in futures_orders:
+                stats["total_orders"] += 1
+                
+                # Count by status
+                if doc["status"] == OrderStatus.FILLED.value:
+                    stats["filled_orders"] += 1
+                elif doc["status"] == OrderStatus.CANCELLED.value:
+                    stats["cancelled_orders"] += 1
+                
+                # Count by direction
+                if doc.get("direction") == OrderDirection.LONG.value:
+                    stats["long_positions"] += 1
+                elif doc.get("direction") == OrderDirection.SHORT.value:
+                    stats["short_positions"] += 1
+                
+                # Track leverage
+                leverage = doc.get("leverage", 1)
+                total_leverage += leverage
+                
+                # Update leverage distribution
+                leverage_key = str(leverage)
+                if leverage_key not in stats["leverage_distribution"]:
+                    stats["leverage_distribution"][leverage_key] = 0
+                stats["leverage_distribution"][leverage_key] += 1
+                
+                # Track symbols
+                symbol = doc["symbol"]
+                if symbol not in stats["symbols"]:
+                    stats["symbols"][symbol] = {
+                        "total_orders": 0,
+                        "filled_orders": 0,
+                        "cancelled_orders": 0,
+                        "pnl": 0
+                    }
+                
+                stats["symbols"][symbol]["total_orders"] += 1
+                
+                if doc["status"] == OrderStatus.FILLED.value:
+                    stats["symbols"][symbol]["filled_orders"] += 1
+                elif doc["status"] == OrderStatus.CANCELLED.value:
+                    stats["symbols"][symbol]["cancelled_orders"] += 1
+                
+                # Calculate PnL for closed positions
+                if doc.get("pnl") is not None:
+                    pnl = Decimal(doc["pnl"])
+                    stats["total_pnl"] += float(pnl)
+                    stats["symbols"][symbol]["pnl"] += float(pnl)
+                    
+                    closed_trades += 1
+                    if pnl > 0:
+                        winning_trades += 1
+            
+            # Calculate averages
+            if stats["total_orders"] > 0:
+                stats["avg_leverage"] = total_leverage / stats["total_orders"]
+            
+            if closed_trades > 0:
+                stats["win_rate"] = (winning_trades / closed_trades) * 100
+            
+            return stats
+            
+        except Exception as e:
+            logger.error(f"Error getting futures stats: {e}")
+            return {}
+
+    async def record_futures_pnl(self, order_id: str, pnl: Decimal, close_price: Decimal, 
+                              close_time: datetime = None) -> bool:
+        """Record PnL for a closed futures position"""
+        try:
+            # Set close time to now if not provided
+            if close_time is None:
+                close_time = datetime.utcnow()
+                
+            # Update order with PnL information
+            result = await self.orders.update_one(
+                {"order_id": order_id},
+                {"$set": {
+                    "pnl": str(pnl),
+                    "close_price": str(close_price),
+                    "close_time": close_time
+                }}
+            )
+            
+            if result.modified_count > 0:
+                logger.info(f"Recorded PnL of {pnl} for order {order_id}")
+                
+                # Get order details
+                order_doc = await self.orders.find_one({"order_id": order_id})
+                if order_doc:
+                    # Record in PnL history collection
+                    await self.pnl_history.insert_one({
+                        "order_id": order_id,
+                        "symbol": order_doc["symbol"],
+                        "direction": order_doc.get("direction"),
+                        "leverage": order_doc.get("leverage", 1),
+                        "entry_price": order_doc["price"],
+                        "close_price": str(close_price),
+                        "quantity": order_doc["quantity"],
+                        "pnl": str(pnl),
+                        "entry_time": order_doc["filled_at"],
+                        "close_time": close_time,
+                        "duration_hours": (close_time - order_doc["filled_at"]).total_seconds() / 3600 if order_doc["filled_at"] else 0
+                    })
+                
+                return True
+            else:
+                logger.warning(f"No order found with ID {order_id}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error recording futures PnL: {e}")
+            return False
+
+    async def get_pnl_history(self, days: int = 30, symbol: Optional[str] = None) -> List[Dict]:
+        """Get PnL history for futures positions"""
+        try:
+            # Calculate start date
+            start_date = datetime.utcnow() - timedelta(days=days)
+            
+            # Build query
+            query = {"close_time": {"$gte": start_date}}
+            if symbol:
+                query["symbol"] = symbol
+                
+            # Get PnL history
+            cursor = self.pnl_history.find(query).sort("close_time", -1)
+            
+            # Process results
+            result = []
+            async for doc in cursor:
+                # Convert decimal strings to float
+                pnl = float(Decimal(doc["pnl"]))
+                entry_price = float(Decimal(doc["entry_price"]))
+                close_price = float(Decimal(doc["close_price"]))
+                quantity = float(Decimal(doc["quantity"]))
+                
+                # Calculate ROI
+                roi = (pnl / (entry_price * quantity)) * 100 if entry_price * quantity > 0 else 0
+                
+                # Add to result
+                result.append({
+                    "order_id": doc["order_id"],
+                    "symbol": doc["symbol"],
+                    "direction": doc["direction"],
+                    "leverage": doc["leverage"],
+                    "entry_price": entry_price,
+                    "close_price": close_price,
+                    "quantity": quantity,
+                    "pnl": pnl,
+                    "roi": roi,
+                    "entry_time": doc["entry_time"],
+                    "close_time": doc["close_time"],
+                    "duration_hours": doc["duration_hours"]
+                })
+                
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error getting PnL history: {e}")
+            return []
+
+    async def record_funding_payment(self, symbol: str, rate: Decimal, payment: Decimal, 
+                                timestamp: datetime = None) -> bool:
+        """Record a funding rate payment for a futures position"""
+        try:
+            # Set timestamp to now if not provided
+            if timestamp is None:
+                timestamp = datetime.utcnow()
+                
+            # Insert funding payment record
+            await self.funding_history.insert_one({
+                "symbol": symbol,
+                "rate": str(rate),
+                "payment": str(payment),
+                "timestamp": timestamp
+            })
+            
+            logger.info(f"Recorded funding payment of {payment} for {symbol} at rate {rate}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error recording funding payment: {e}")
+            return False
+
+    async def record_margin_call(self, symbol: str, position_size: Decimal, margin_level: Decimal, 
+                            required_margin: Decimal, timestamp: datetime = None) -> bool:
+        """Record a margin call for a futures position"""
+        try:
+            # Set timestamp to now if not provided
+            if timestamp is None:
+                timestamp = datetime.utcnow()
+                
+            # Insert margin call record
+            await self.margin_calls.insert_one({
+                "symbol": symbol,
+                "position_size": str(position_size),
+                "margin_level": str(margin_level),
+                "required_margin": str(required_margin),
+                "timestamp": timestamp
+            })
+            
+            logger.info(f"Recorded margin call for {symbol} with margin level {margin_level}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error recording margin call: {e}")
+            return False
+
+    async def get_funding_history(self, days: int = 30, symbol: Optional[str] = None) -> List[Dict]:
+        """Get funding rate payment history"""
+        try:
+            # Calculate start date
+            start_date = datetime.utcnow() - timedelta(days=days)
+            
+            # Build query
+            query = {"timestamp": {"$gte": start_date}}
+            if symbol:
+                query["symbol"] = symbol
+                
+            # Get funding history
+            cursor = self.funding_history.find(query).sort("timestamp", -1)
+            
+            # Process results
+            result = []
+            async for doc in cursor:
+                # Convert decimal strings to float
+                rate = float(Decimal(doc["rate"]))
+                payment = float(Decimal(doc["payment"]))
+                
+                # Add to result
+                result.append({
+                    "symbol": doc["symbol"],
+                    "rate": rate,
+                    "payment": payment,
+                    "timestamp": doc["timestamp"]
+                })
+                
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error getting funding history: {e}")
+            return []
+
+    async def get_margin_call_history(self, days: int = 30, symbol: Optional[str] = None) -> List[Dict]:
+        """Get margin call history"""
+        try:
+            # Calculate start date
+            start_date = datetime.utcnow() - timedelta(days=days)
+            
+            # Build query
+            query = {"timestamp": {"$gte": start_date}}
+            if symbol:
+                query["symbol"] = symbol
+                
+            # Get margin call history
+            cursor = self.margin_calls.find(query).sort("timestamp", -1)
+            
+            # Process results
+            result = []
+            async for doc in cursor:
+                # Convert decimal strings to float
+                position_size = float(Decimal(doc["position_size"]))
+                margin_level = float(Decimal(doc["margin_level"]))
+                required_margin = float(Decimal(doc["required_margin"]))
+                
+                # Add to result
+                result.append({
+                    "symbol": doc["symbol"],
+                    "position_size": position_size,
+                    "margin_level": margin_level,
+                    "required_margin": required_margin,
+                    "timestamp": doc["timestamp"]
+                })
+                
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error getting margin call history: {e}")
+            return []
+
+    async def update_margin_mode(self, order_id: str, margin_mode: str) -> bool:
+        """Update the margin mode for a futures position"""
+        try:
+            # Validate margin mode
+            if margin_mode not in ["isolated", "cross"]:
+                logger.error(f"Invalid margin mode: {margin_mode}")
+                return False
+                
+            # Update order
+            result = await self.orders.update_one(
+                {"order_id": order_id, "order_type": OrderType.FUTURES.value},
+                {"$set": {"margin_mode": margin_mode}}
+            )
+            
+            if result.modified_count > 0:
+                logger.info(f"Updated margin mode to {margin_mode} for order {order_id}")
+                return True
+            else:
+                logger.warning(f"No futures order found with ID {order_id}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error updating margin mode: {e}")
+            return False
+
+    async def update_leverage(self, order_id: str, leverage: int) -> bool:
+        """Update the leverage for a futures position"""
+        try:
+            # Validate leverage
+            if leverage < 1 or leverage > 125:
+                logger.error(f"Invalid leverage: {leverage}")
+                return False
+                
+            # Update order
+            result = await self.orders.update_one(
+                {"order_id": order_id, "order_type": OrderType.FUTURES.value},
+                {"$set": {"leverage": leverage}}
+            )
+            
+            if result.modified_count > 0:
+                logger.info(f"Updated leverage to {leverage}x for order {order_id}")
+                return True
+            else:
+                logger.warning(f"No futures order found with ID {order_id}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error updating leverage: {e}")
+            return False
+
+    async def get_position_entry_price(self, symbol: str, direction: OrderDirection) -> Optional[Decimal]:
+        """Get the average entry price for a futures position"""
+        try:
+            # Build query
+            query = {
+                "symbol": symbol,
+                "order_type": OrderType.FUTURES.value,
+                "status": OrderStatus.FILLED.value,
+                "direction": direction.value
+            }
+            
+            # Get all filled orders for this position
+            cursor = self.orders.find(query)
+            
+            # Calculate weighted average entry price
+            total_value = Decimal('0')
+            total_qty = Decimal('0')
+            
+            async for doc in cursor:
+                price = Decimal(doc["price"])
+                quantity = Decimal(doc["quantity"])
+                total_value += price * quantity
+                total_qty += quantity
+                
+            if total_qty > 0:
+                return total_value / total_qty
+            else:
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error getting position entry price: {e}")
+            return None
+
+    async def get_futures_orders(self, days: int = 7, symbol: str = None) -> List[Dict]:
+        """
+        Get futures orders from the last N days
+        
+        Args:
+            days: Number of days to look back
+            symbol: Optional symbol to filter by
+            
+        Returns:
+            List of futures orders
+        """
+        try:
+            # Calculate start date
+            start_date = datetime.utcnow() - timedelta(days=days)
+            
+            # Build query
+            query = {
+                "order_type": OrderType.FUTURES.value,
+                "created_at": {"$gte": start_date}
+            }
+            
+            # Add symbol filter if provided
+            if symbol:
+                query["symbol"] = symbol
+            
+            # Query for futures orders
+            cursor = self.orders.find(query).sort("created_at", -1)
+            
+            # Convert cursor to list
+            orders = await cursor.to_list(length=100)
+            
+            # Process orders
+            processed_orders = []
+            for order in orders:
+                # Convert ObjectId to string
+                order["_id"] = str(order["_id"])
+                
+                # Convert decimal strings to float
+                if 'price' in order and order['price']:
+                    order['price'] = float(order['price'])
+                if 'quantity' in order and order['quantity']:
+                    order['quantity'] = float(order['quantity'])
+                if 'fee' in order and order['fee']:
+                    order['fee'] = float(order['fee'])
+                if 'leverage' in order and order['leverage']:
+                    order['leverage'] = int(order['leverage'])
+                if 'tp_price' in order and order['tp_price']:
+                    order['tp_price'] = float(order['tp_price'])
+                if 'sl_price' in order and order['sl_price']:
+                    order['sl_price'] = float(order['sl_price'])
+                
+                processed_orders.append(order)
+                
+            logger.info(f"Retrieved {len(processed_orders)} futures orders from the last {days} days")
+            return processed_orders
+            
+        except Exception as e:
+            logger.error(f"Error getting futures orders: {e}")
+            return []
+
+    async def get_open_futures_positions(self) -> List[Dict]:
+        """
+        Get open futures positions
+        
+        Returns:
+            List of open futures positions
+        """
+        try:
+            # Query for open futures positions
+            query = {
+                "order_type": OrderType.FUTURES.value,
+                "status": OrderStatus.FILLED.value,
+                "position_closed": {"$ne": True}
+            }
+            
+            # Query for futures orders
+            cursor = self.orders.find(query).sort("created_at", -1)
+            
+            # Convert cursor to list
+            positions = await cursor.to_list(length=100)
+            
+            # Process positions
+            processed_positions = []
+            for position in positions:
+                # Convert ObjectId to string
+                position["_id"] = str(position["_id"])
+                
+                # Convert decimal strings to float
+                if 'price' in position and position['price']:
+                    position['price'] = float(position['price'])
+                    position['entry_price'] = float(position['price'])  # Add entry_price for clarity
+                if 'quantity' in position and position['quantity']:
+                    position['quantity'] = float(position['quantity'])
+                if 'fee' in position and position['fee']:
+                    position['fee'] = float(position['fee'])
+                if 'leverage' in position and position['leverage']:
+                    position['leverage'] = int(position['leverage'])
+                if 'liquidation_price' in position and position['liquidation_price']:
+                    position['liquidation_price'] = float(position['liquidation_price'])
+                if 'tp_price' in position and position['tp_price']:
+                    position['tp_price'] = float(position['tp_price'])
+                if 'sl_price' in position and position['sl_price']:
+                    position['sl_price'] = float(position['sl_price'])
+                
+                processed_positions.append(position)
+                
+            logger.info(f"Retrieved {len(processed_positions)} open futures positions")
+            return processed_positions
+            
+        except Exception as e:
+            logger.error(f"Error getting open futures positions: {e}")
+            return []
 
     # ...rest of existing code...

@@ -1,8 +1,12 @@
 {
     "binance": {
         "spot_testnet": {
-            "api_key": "your_testnet_api_key",
-            "api_secret": "your_testnet_api_secret"
+            "api_key": "your_spot_testnet_api_key",
+            "api_secret": "your_spot_testnet_api_secret"
+        },
+        "futures_testnet": {
+            "api_key": "your_futures_testnet_api_key",
+            "api_secret": "your_futures_testnet_api_secret"
         },
         "mainnet": {
             "api_key": "your_mainnet_api_key",
@@ -28,7 +32,15 @@
             "weekly": [5, 10, 15],
             "monthly": [10, 20, 30]
         },
-        "reserve_balance": 500  
+        "reserve_balance": 500,
+        "tp_sl_enabled": true,
+        "tp_percentage": "5%",
+        "sl_percentage": "3%",
+        "only_lower_entries": true,
+        "futures": {
+            "default_leverage": 3,
+            "default_margin_mode": "isolated"
+        }
     }
 }
 

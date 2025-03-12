@@ -22,26 +22,63 @@ class OrderManager:
         self.config = config
         self.running = False
         self.monitor_task = None
+        self.tp_sl_monitor_task = None  # New task for TP/SL monitoring
         self.check_interval = 60  # 60 seconds between checks
         logger.setLevel(logging.DEBUG)  # Add this line
         self.clear_command = 'cls' if platform.system() == 'Windows' else 'clear'
+        
+        # TP/SL configuration
+        self.tp_sl_enabled = config['trading'].get('tp_sl_enabled', False)
+        
+        # Parse TP percentage - handle string with % sign
+        tp_config = config['trading'].get('tp_percentage', 5.0)
+        if isinstance(tp_config, str) and tp_config.endswith('%'):
+            tp_config = tp_config[:-1]  # Remove % sign
+        self.default_tp_percentage = float(tp_config)
+        
+        # Parse SL percentage - handle string with % sign
+        sl_config = config['trading'].get('sl_percentage', 3.0)
+        if isinstance(sl_config, str) and sl_config.endswith('%'):
+            sl_config = sl_config[:-1]  # Remove % sign
+        self.default_sl_percentage = float(sl_config)
+        
+        # Log TP/SL configuration
+        logger.info(f"TP/SL Configuration: Enabled={self.tp_sl_enabled}, TP={self.default_tp_percentage}%, SL={self.default_sl_percentage}%")
         
     async def start(self):
         """Start the order manager"""
         self.running = True
         logger.info("Starting order monitoring...")
-        # Don't await the task, just create and return it
+        # Create and start the main monitoring task
         self.monitor_task = asyncio.create_task(self.monitor_thresholds())
-        return self.monitor_task  # Return the task instead of awaiting it
+        
+        # Create and start the TP/SL monitoring task if enabled
+        if self.tp_sl_enabled:
+            logger.info("Starting TP/SL monitoring...")
+            self.tp_sl_monitor_task = asyncio.create_task(self.monitor_tp_sl())
+        else:
+            logger.info("TP/SL monitoring is disabled")
+        
+        return self.monitor_task
         
     async def stop(self):
         """Stop the order manager"""
         logger.info("Stopping order monitoring...")
         self.running = False
+        
+        # Cancel main monitoring task
         if self.monitor_task:
             self.monitor_task.cancel()
             try:
                 await self.monitor_task
+            except asyncio.CancelledError:
+                pass
+        
+        # Cancel TP/SL monitoring task
+        if self.tp_sl_monitor_task:
+            self.tp_sl_monitor_task.cancel()
+            try:
+                await self.tp_sl_monitor_task
             except asyncio.CancelledError:
                 pass
             
@@ -193,22 +230,81 @@ class OrderManager:
                 logger.error(f"Error in monitoring: {e}", exc_info=True)
                 await asyncio.sleep(10)
             
-    async def create_order(self, symbol: str, timeframe: TimeFrame, threshold: float):
-        """Create and store a new order"""
+    async def monitor_tp_sl(self):
+        """Monitor TP/SL orders"""
+        logger.info("Starting TP/SL monitoring loop")
+        
+        while self.running:
+            try:
+                # Skip if trading is paused
+                if hasattr(self.binance_client, 'telegram_bot') and self.binance_client.telegram_bot.is_paused:
+                    logger.info("Trading is paused, skipping TP/SL monitoring")
+                    await asyncio.sleep(30)
+                    continue
+                
+                # Check TP/SL orders
+                if self.binance_client.tp_sl_manager:
+                    await self.binance_client.tp_sl_manager.monitor_tp_sl_orders()
+                
+                # Sleep for a while
+                await asyncio.sleep(15)  # Check every 15 seconds
+                
+            except Exception as e:
+                logger.error(f"Error in TP/SL monitoring: {e}", exc_info=True)
+                await asyncio.sleep(30)  # Longer sleep on error
+
+    async def create_order(self, symbol: str, timeframe: TimeFrame, threshold: float, 
+                         order_type: str = "spot", leverage: int = 1, 
+                         direction: str = "long", tp_percentage: float = None, 
+                         sl_percentage: float = None):
+        """Create and store a new order with optional TP/SL"""
         try:
+            # Convert direction string to OrderDirection enum
+            from ..types.models import OrderDirection
+            order_direction = OrderDirection.LONG if direction.lower() == "long" else OrderDirection.SHORT
+            
+            # Use provided TP/SL percentages or default values if TP/SL is enabled
+            if self.tp_sl_enabled:
+                if tp_percentage is None:
+                    tp_percentage = self.default_tp_percentage
+                if sl_percentage is None:
+                    sl_percentage = self.default_sl_percentage
+            else:
+                # If TP/SL is disabled, set percentages to None
+                tp_percentage = None
+                sl_percentage = None
+            
+            # Place the order
             order = await self.binance_client.place_limit_buy_order(
                 symbol=symbol,
                 amount=self.config['trading']['order_amount'],
                 threshold=threshold,
-                timeframe=timeframe
+                timeframe=timeframe,
+                order_type=order_type,
+                leverage=leverage,
+                direction=order_direction,
+                tp_percentage=tp_percentage,
+                sl_percentage=sl_percentage
             )
             
-            await self.mongo_client.insert_order(order)
-            await self.telegram_bot.send_order_notification(order)
+            if order:
+                # Insert order into database
+                await self.mongo_client.insert_order(order)
+                
+                # Send notification
+                await self.telegram_bot.send_order_notification(order)
+                
+                logger.info(f"Created order for {symbol}" + 
+                           (f" with TP={tp_percentage}%, SL={sl_percentage}%" if self.tp_sl_enabled else ""))
+                return order
+            else:
+                logger.error(f"Failed to create order for {symbol}")
+                return None
             
         except Exception as e:
             logger.error(f"Failed to create order: {e}")
-            
+            return None
+
     async def monitor_orders(self):
         """Monitor and update status of pending orders"""
         try:
@@ -247,6 +343,19 @@ class OrderManager:
                             await self.telegram_bot.send_balance_update(
                                 order.symbol, balance_change
                             )
+                        
+                        # Place TP/SL orders for the filled order if enabled
+                        if self.tp_sl_enabled and self.binance_client.tp_sl_manager:
+                            logger.info(f"Placing TP/SL orders for filled order {order.order_id} with TP={self.default_tp_percentage}%, SL={self.default_sl_percentage}%")
+                            tp_sl_result = await self.binance_client.tp_sl_manager.place_tp_sl_orders(
+                                order, self.default_tp_percentage, self.default_sl_percentage
+                            )
+                            
+                            if tp_sl_result['tp_order'] and tp_sl_result['sl_order']:
+                                logger.info(f"Successfully placed TP/SL orders for filled order {order.order_id}")
+                            else:
+                                logger.warning(f"Failed to place TP/SL orders for filled order {order.order_id}")
+                        
                         # Send only ROAR notification for filled orders
                         await self.telegram_bot.send_roar(order)
                         

@@ -4,27 +4,102 @@ from decimal import Decimal
 from datetime import datetime, timedelta
 import asyncio
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 import aiohttp
 import json
-from ..types.models import Order, OrderStatus, TimeFrame, OrderType  # Add OrderType
+from ..types.models import Order, OrderStatus, TimeFrame, OrderType, OrderDirection, MarginMode, PositionSide  # Add OrderType and OrderDirection
 from ..utils.rate_limiter import RateLimiter
 from ..types.constants import PRECISION, MIN_NOTIONAL, TIMEFRAME_INTERVALS, TRADING_FEES, ORDER_TYPE_FEES
 from ..utils.chart_generator import ChartGenerator
 from ..utils.yahoo_scrapooooor_sp500 import YahooSP500Scraper  # Import the new Yahoo scraper
+from ..database.mongo_client import MongoClient
+from .binance_futures import BinanceFuturesClient  # Import the new futures client
+from .tp_sl_manager import TPSLManager  # Import the new TP/SL manager
+import time
+import pandas as pd
+import numpy as np
+from binance.um_futures import UMFutures  # Add UMFutures import
 
 logger = logging.getLogger(__name__)
 
 class BinanceClient:
     def __init__(self, api_key: str, api_secret: str, telegram_bot=None, mongo_client=None, config=None, testnet: bool = True):
+        """Initialize Binance client with API credentials"""
         self.api_key = api_key
         self.api_secret = api_secret
         self.testnet = testnet
+        self.telegram_bot = telegram_bot
+        self.mongo_client = mongo_client
+        self.config = config
         self.client = None
+        self.exchange_info = None
+        self.symbol_info = {}
+        self.is_initialized = False
+        self.is_futures_enabled = False
+        self.futures_client = None
+        self.tp_sl_manager = None
+        
+        # Initialize trading parameters from config
+        if config:
+            # Set reserve balance
+            self.reserve_balance = config['trading'].get('reserve_balance', 500)
+            
+            # Set order amount
+            self.order_amount = config['trading'].get('order_amount', 100)
+            
+            # Set TP/SL configuration
+            self.tp_sl_enabled = config['trading'].get('tp_sl_enabled', False)
+            
+            # Parse TP percentage - handle string with % sign
+            tp_config = config['trading'].get('tp_percentage', 5.0)
+            if isinstance(tp_config, str) and tp_config.endswith('%'):
+                tp_config = tp_config[:-1]  # Remove % sign
+            self.default_tp_percentage = float(tp_config)
+            
+            # Parse SL percentage - handle string with % sign
+            sl_config = config['trading'].get('sl_percentage', 3.0)
+            if isinstance(sl_config, str) and sl_config.endswith('%'):
+                sl_config = sl_config[:-1]  # Remove % sign
+            self.default_sl_percentage = float(sl_config)
+            
+            # Set lower entries configuration
+            self.only_lower_entries = config['trading'].get('only_lower_entries', True)
+            
+            # Set futures-specific configuration
+            futures_config = config['trading'].get('futures', {})
+            self.default_leverage = futures_config.get('default_leverage', 3)
+            self.default_margin_mode = futures_config.get('default_margin_mode', 'isolated')
+            
+            # Validate futures settings
+            if self.default_leverage < 1:
+                logger.warning(f"Invalid leverage value {self.default_leverage}, setting to minimum of 1")
+                self.default_leverage = 1
+            elif self.default_leverage > 5:
+                logger.warning(f"Leverage exceeds maximum of 5x, capping at 5")
+                self.default_leverage = 5
+                
+            if self.default_margin_mode not in ['isolated', 'cross']:
+                logger.warning(f"Invalid margin mode {self.default_margin_mode}, setting to 'isolated'")
+                self.default_margin_mode = 'isolated'
+        else:
+            # Default values if no config provided
+            self.reserve_balance = 500
+            self.order_amount = 100
+            self.tp_sl_enabled = False
+            self.default_tp_percentage = 5.0
+            self.default_sl_percentage = 3.0
+            self.only_lower_entries = True
+            self.default_leverage = 3
+            self.default_margin_mode = 'isolated'
+            
+        # Initialize rate limiting
+        self.request_count = 0
+        self.last_request_time = time.time()
+        self.max_requests_per_minute = 1200  # Default Binance rate limit
+        
         self.reference_prices = {}
         self.triggered_thresholds = {}
         self.rate_limiter = RateLimiter()
-        self.symbol_info = {}
         self.last_reset = {
             tf: datetime.utcnow() for tf in TimeFrame
         }
@@ -35,10 +110,50 @@ class BinanceClient:
             TimeFrame.MONTHLY: None
         }
         logger.setLevel(logging.DEBUG)
-        self.telegram_bot = telegram_bot
         self.chart_generator = ChartGenerator()
-        self.mongo_client = mongo_client
-        self.config = config
+        self.trading_enabled = True
+        self.last_balance = None
+        self.last_balance_check = None
+        self.reserve_balance = 500  # Default reserve balance
+        self.futures_client = None  # Will be initialized with the main client
+        self.tp_sl_manager = None  # Will be initialized after client initialization
+        
+        # TP/SL configuration
+        self.tp_sl_enabled = False
+        self.default_tp_percentage = 5.0
+        self.default_sl_percentage = 3.0
+        
+        # Lower Entry Price Protection
+        self.only_lower_entries = True  # Default to enabled
+        
+        # Set reserve balance from config if available
+        if config and 'trading' in config:
+            try:
+                self.reserve_balance = float(config['trading'].get('reserve_balance', 500))
+                logger.info(f"Set reserve balance to ${self.reserve_balance:,.2f}")
+                
+                # Set TP/SL configuration from config
+                self.tp_sl_enabled = config['trading'].get('tp_sl_enabled', False)
+                
+                # Parse TP percentage - handle string with % sign
+                tp_config = config['trading'].get('tp_percentage', 5.0)
+                if isinstance(tp_config, str) and tp_config.endswith('%'):
+                    tp_config = tp_config[:-1]  # Remove % sign
+                self.default_tp_percentage = float(tp_config)
+                
+                # Parse SL percentage - handle string with % sign
+                sl_config = config['trading'].get('sl_percentage', 3.0)
+                if isinstance(sl_config, str) and sl_config.endswith('%'):
+                    sl_config = sl_config[:-1]  # Remove % sign
+                self.default_sl_percentage = float(sl_config)
+                
+                # Set only_lower_entries from config
+                self.only_lower_entries = config['trading'].get('only_lower_entries', True)
+                
+                logger.info(f"TP/SL configuration: Enabled={self.tp_sl_enabled}, TP={self.default_tp_percentage}%, SL={self.default_sl_percentage}%")
+                logger.info(f"Lower Entry Price Protection: {self.only_lower_entries}")
+            except (ValueError, TypeError) as e:
+                logger.error(f"Error setting configuration from config: {e}")
         
         # Set API environment info
         environment = "TESTNET" if testnet else "MAINNET"
@@ -46,11 +161,9 @@ class BinanceClient:
         
         # Set reserve balance and base currency directly from config
         self.base_currency = None
-        self.reserve_balance = 0
         if config and 'trading' in config:
             self.base_currency = config['trading'].get('base_currency', 'USDT')
-            self.reserve_balance = float(config['trading'].get('reserve_balance', 0))
-            logger.info(f"[INIT] Config loaded directly: Base Currency={self.base_currency}, Reserve=${self.reserve_balance:,.2f}")
+            logger.info(f"[INIT] Config loaded directly: Base Currency={self.base_currency}")
         
         # Initialize Yahoo SP500 scraper
         self.yahoo_scraper = YahooSP500Scraper()
@@ -111,46 +224,50 @@ class BinanceClient:
             return False
 
     async def initialize(self):
-        """Initialize client with reserve balance and base currency"""
-        self.client = await AsyncClient.create(
-            api_key=self.api_key,
-            api_secret=self.api_secret,
-            testnet=self.testnet
-        )
-
-        # Set reserve balance directly from config with debug logging (UPDATED CODE)
-        if self.telegram_bot and self.telegram_bot.config:
-            # Use values from telegram_bot only if they weren't already set from config
-            if not self.base_currency or self.base_currency == 'USDT':
-                self.base_currency = self.telegram_bot.config['trading'].get('base_currency', 'USDT')
-            if self.reserve_balance <= 0:
-                self.reserve_balance = float(self.telegram_bot.config['trading'].get('reserve_balance', 0))
+        """Initialize the Binance client and fetch exchange information"""
+        try:
+            # Initialize Binance client
+            if self.testnet:
+                logger.info("Initializing Binance client in TESTNET mode")
+                self.client = AsyncClient(self.api_key, self.api_secret, testnet=True)
+            else:
+                logger.info("Initializing Binance client in PRODUCTION mode")
+                self.client = AsyncClient(self.api_key, self.api_secret, testnet=False)
                 
-            logger.info(f"[INIT] Base Currency: {self.base_currency}")
-            logger.info(f"[INIT] Reserve Balance: ${self.reserve_balance:,.2f}")
+            # Initialize futures client if API keys are provided
+            if self.api_key and self.api_secret:
+                try:
+                    self.futures_client = BinanceFuturesClient(self.client)
+                    self.is_futures_enabled = True
+                    logger.info("Futures trading enabled")
+                except Exception as e:
+                    logger.error(f"Failed to initialize futures client: {e}")
+                    self.is_futures_enabled = False
+            
+            # Fetch exchange information
+            await self._update_exchange_info()
+            
+            # Initialize TP/SL manager if enabled
+            if self.tp_sl_enabled:
+                logger.info(f"TP/SL manager initialized with TP={self.default_tp_percentage}%, SL={self.default_sl_percentage}%")
+                self.tp_sl_manager = TPSLManager(self, self.mongo_client)
         else:
-            # Only log a warning if we haven't already set values from direct config
-            if not self.config:
-                logger.warning("[INIT] No config found for reserve balance!")
-
-        # Initialize restored threshold info
-        self.restored_threshold_info = []
-
-        # Get exchange info for precision
-        exchange_info = await self.client.get_exchange_info()
-        for symbol in exchange_info['symbols']:
-            self.symbol_info[symbol['symbol']] = {
-                'baseAssetPrecision': symbol['baseAssetPrecision'],
-                'quotePrecision': symbol['quotePrecision'],
-                'filters': {f['filterType']: f for f in symbol['filters']}
-            }
+                logger.info("TP/SL is disabled")
+                
+            # Log futures settings if enabled
+            if self.is_futures_enabled:
+                logger.info(f"Futures settings: Leverage={self.default_leverage}x, Margin Mode={self.default_margin_mode.upper()}")
             
-        # Restore triggered thresholds from database
-        if self.mongo_client:
-            self.restored_threshold_info = await self.restore_threshold_state()
+            self.is_initialized = True
+            logger.info("Binance client initialized successfully")
             
-        # Add initial balance check
+            # Check initial balance
         await self.check_initial_balance()
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error initializing Binance client: {e}")
+            return False
 
     async def restore_threshold_state(self):
         """Restore triggered thresholds from database on startup"""
@@ -589,142 +706,268 @@ class BinanceClient:
     async def place_limit_buy_order(self, symbol: str, amount: float, 
                                   threshold: Optional[float] = None,
                                   timeframe: Optional[TimeFrame] = None,
-                                  is_manual: bool = False) -> Order:
-        """Place a limit buy order with reserve balance check"""
-        # Check reserve balance first
-        if not is_manual and not await self.check_reserve_balance(amount):
-            raise ValueError("Order would violate reserve balance")
-
-        await self.rate_limiter.acquire()
-        
+                                  is_manual: bool = False,
+                                  order_type: str = "spot",
+                                  leverage: int = None,
+                                  direction: OrderDirection = OrderDirection.LONG,
+                                  tp_percentage: Optional[float] = None,
+                                  sl_percentage: Optional[float] = None) -> Order:
+        """Place a limit buy order with the specified parameters"""
         try:
+            # Use default leverage if not specified
+            if leverage is None and order_type.lower() == "futures":
+                leverage = self.default_leverage
+                
+            # Use default margin mode for futures orders
+            margin_mode = self.default_margin_mode if order_type.lower() == "futures" else None
+            
             # Get current price
-            ticker = await self.client.get_symbol_ticker(symbol=symbol)
-            price = Decimal(ticker['price'])
+            current_price = await self.get_current_price(symbol)
+            if not current_price:
+                logger.error(f"Failed to get current price for {symbol}")
+                return None
+                
+            # Calculate price based on threshold
+            if threshold:
+                # For spot orders or long futures, we buy below current price
+                if order_type.lower() == "spot" or direction == OrderDirection.LONG:
+                    price = current_price * (1 - threshold / 100)
+                # For short futures, we sell above current price
+                else:
+                    price = current_price * (1 + threshold / 100)
+            else:
+                # Use current price if no threshold specified
+                price = current_price
+                
+            # Convert to Decimal for precision
+            price_decimal = Decimal(str(price))
             
-            # Original requested amount (for logging if adjustment needed)
-            original_amount = amount
+            # Calculate quantity based on amount and price
+            quantity = Decimal(str(amount)) / price_decimal
             
-            # Calculate quantity based on USDT amount
-            quantity = Decimal(str(amount)) / price
-            
-            # Get and apply precision
-            quantity_precision = self._get_quantity_precision(symbol)
-            price_precision = self._get_price_precision(symbol)
-            
-            # Round quantity to precision and adjust for lot size
-            quantity = Decimal(str(round(quantity, quantity_precision)))
+            # Adjust quantity to lot size
             quantity = self._adjust_quantity_to_lot_size(symbol, quantity)
-            price = Decimal(str(round(price, price_precision)))
-            
-            # Calculate order value after adjustments
-            order_value = price * quantity
-            
-            # Check minimum notional
-            min_notional = MIN_NOTIONAL.get(symbol, MIN_NOTIONAL['DEFAULT'])
-            if order_value < Decimal(str(min_notional)):
-                # Auto-increase quantity to meet minimum notional requirement
-                logger.warning(f"Order value ${float(order_value):.2f} below minimum notional ${min_notional}. Adjusting quantity...")
-                
-                # Calculate required quantity to meet minimum notional
-                required_quantity = Decimal(str(min_notional)) / price
-                required_quantity = Decimal(str(round(required_quantity, quantity_precision)))
-                required_quantity = self._adjust_quantity_to_lot_size(symbol, required_quantity)
-                
-                # Update the quantity and log the adjustment
-                adjusted_amount = float(required_quantity * price)
-                logger.info(f"Adjusted order amount from ${original_amount:.2f} to ${adjusted_amount:.2f} to meet minimum notional")
-                quantity = required_quantity
-                
-                # If this order would now violate reserve balance, check again
-                if not is_manual and adjusted_amount > original_amount and not await self.check_reserve_balance(adjusted_amount):
-                    raise ValueError(f"Adjusted order (${adjusted_amount:.2f}) would violate reserve balance")
-            
-            # Log order details before placement
-            logger.info(f"Placing order: {symbol} quantity={quantity} price=${price}")
             
             # Calculate fees
-            fees, fee_asset = await self.calculate_fees(symbol, price, quantity)
-            
-            # Only update triggered thresholds if it's not a manual trade
-            if not is_manual and threshold and symbol in self.triggered_thresholds and timeframe:
-                self.mark_threshold_triggered(symbol, timeframe.value, threshold)
-            
-            # Generate unique order ID
-            order_id = str(int(datetime.utcnow().timestamp() * 1000))
-            
-            if not is_manual:
-                # Place order on Binance
-                order_response = await self.client.create_order(
-                    symbol=symbol,
-                    side='BUY',
-                    type='LIMIT',
-                    timeInForce='GTC',
-                    quantity=float(quantity),
-                    price=float(price)
-                )
-                order_id = str(order_response['orderId'])
-            
-            # Create order object with all required fields
-            order = Order(
-                symbol=symbol,
-                status=OrderStatus.PENDING if not is_manual else OrderStatus.FILLED,
-                order_type=OrderType.SPOT,
-                price=price,
-                quantity=quantity,
-                timeframe=timeframe or TimeFrame.DAILY,
-                order_id=order_id,
-                created_at=datetime.utcnow(),
-                updated_at=datetime.utcnow(),
-                filled_at=datetime.utcnow() if is_manual else None,
-                fees=fees,
-                fee_asset=fee_asset,
-                threshold=threshold  # This is now handled by the Order class
+            fee, fee_currency = await self.calculate_fees(
+                symbol, price_decimal, quantity, order_type, leverage
             )
+            
+            # Create order object
+            order = Order(
+                order_id=None,  # Will be set after order is placed
+                symbol=symbol,
+                price=price_decimal,
+                quantity=quantity,
+                order_type=OrderType.SPOT if order_type.lower() == "spot" else OrderType.FUTURES,
+                status=OrderStatus.PENDING,
+                created_at=datetime.utcnow(),
+                filled_at=None,
+                cancelled_at=None,
+                threshold=threshold,
+                timeframe=timeframe,
+                reference_price=Decimal(str(current_price)) if current_price else None,
+                is_manual=is_manual,
+                fee=fee,
+                fee_currency=fee_currency,
+                leverage=leverage,
+                direction=direction,
+                margin_mode=margin_mode,
+                position_side="BOTH"  # Default to BOTH for now
+            )
+            
+            # Set TP/SL if provided
+            if self.tp_sl_enabled:
+                if tp_percentage is not None:
+                    # Calculate TP price based on direction
+                    if order.order_type == OrderType.FUTURES and order.direction == OrderDirection.SHORT:
+                        # For short positions, TP is below entry
+                        tp_price = price_decimal * (1 - tp_percentage / 100)
+                    else:
+                        # For long positions and spot, TP is above entry
+                        tp_price = price_decimal * (1 + tp_percentage / 100)
+                    
+                    # Set TP attributes
+                    order.tp_price = tp_price
+                    order.tp_percentage = tp_percentage
+                
+                if sl_percentage is not None:
+                    # Calculate SL price based on direction
+                    if order.order_type == OrderType.FUTURES and order.direction == OrderDirection.SHORT:
+                        # For short positions, SL is above entry
+                        sl_price = price_decimal * (1 + sl_percentage / 100)
+                    else:
+                        # For long positions and spot, SL is below entry
+                        sl_price = price_decimal * (1 - sl_percentage / 100)
+                    
+                    # Set SL attributes
+                    order.sl_price = sl_price
+                    order.sl_percentage = sl_percentage
+            
+            # Place the order
+            if order.order_type == OrderType.SPOT:
+                # Place spot order
+                params = {
+                    'symbol': symbol,
+                    'side': 'BUY',
+                    'type': 'LIMIT',
+                    'timeInForce': 'GTC',
+                    'quantity': float(quantity),
+                    'price': float(price_decimal)
+                }
+                
+                response = await self.client.create_order(**params)
+                order.order_id = response['orderId']
+                
+            else:
+                # Place futures order
+                if not self.is_futures_enabled:
+                    logger.error("Futures trading is not enabled")
+                    return None
+                
+                # Set leverage for the symbol
+                try:
+                    await self.set_leverage(symbol, leverage)
+                except Exception as e:
+                    logger.error(f"Error setting leverage for {symbol}: {e}")
+                
+                # Set margin mode for the symbol
+                try:
+                    await self.set_margin_type(symbol, margin_mode)
+                except Exception as e:
+                    logger.error(f"Error setting margin mode for {symbol}: {e}")
+                
+                # Determine side based on direction
+                side = 'BUY' if direction == OrderDirection.LONG else 'SELL'
+                
+                # Place futures order
+                params = {
+                    'symbol': symbol,
+                    'side': side,
+                    'type': 'LIMIT',
+                    'timeInForce': 'GTC',
+                    'quantity': float(quantity),
+                    'price': float(price_decimal),
+                    'reduceOnly': False,
+                    'newOrderRespType': 'RESULT'
+                }
+                
+                response = await self._make_request('POST', '/fapi/v1/order', params, is_futures=True, signed=True)
+                order.order_id = response['orderId']
+            
+            logger.info(f"Placed {order.order_type.value} {'LONG' if direction == OrderDirection.LONG else 'SHORT'} order for {symbol} at {float(price_decimal):.2f}")
             
             return order
             
-        except BinanceAPIException as e:
-            logger.error(f"Failed to place order: {e}")
-            raise
         except Exception as e:
-            logger.error(f"Error placing order: {str(e)}")
-            raise
+            logger.error(f"Error placing limit buy order: {e}")
+            return None
 
     async def cancel_order(self, symbol: str, order_id: str) -> bool:
-        """Cancel an order"""
+        """Cancel an order on Binance"""
         try:
-            await self.client.cancel_order(symbol=symbol, orderId=order_id)
+            # First, check if this is a futures order
+            order_doc = await self.mongo_client.orders.find_one({"order_id": order_id})
+            
+            if order_doc and order_doc.get("order_type") == OrderType.FUTURES.value:
+                # Use futures client to cancel
+                if self.futures_client:
+                    return await self.futures_client.cancel_order(symbol, order_id)
+                else:
+                    logger.error("Futures client not initialized")
+                    return False
+            
+            # Otherwise, cancel spot order
+            response = await self.client.cancel_order(
+                symbol=symbol,
+                orderId=order_id
+            )
+            
+            if response and 'orderId' in response:
+                logger.info(f"Cancelled order {order_id} for {symbol}")
             return True
+                
+            return False
         except BinanceAPIException as e:
-            logger.error(f"Failed to cancel order: {e}")
+            # If order does not exist, consider it cancelled
+            if e.code == -2011:  # "Unknown order sent."
+                logger.warning(f"Order {order_id} already cancelled or filled")
+                return True
+                
+            logger.error(f"Failed to cancel order {order_id}: {e}")
             return False
             
     async def check_order_status(self, symbol: str, order_id: str) -> Optional[OrderStatus]:
         """Check the status of an order"""
         try:
-            order = await self.client.get_order(symbol=symbol, orderId=order_id)
-            if order['status'] == 'FILLED':
+            # First, check if this is a futures order
+            order_doc = await self.mongo_client.orders.find_one({"order_id": order_id})
+            
+            if order_doc and order_doc.get("order_type") == OrderType.FUTURES.value:
+                # Use futures client to check status
+                if self.futures_client:
+                    return await self.futures_client.get_order_status(symbol, order_id)
+                else:
+                    logger.error("Futures client not initialized")
+                    return None
+            
+            # Otherwise, check spot order
+            order = await self.client.get_order(
+                symbol=symbol,
+                orderId=order_id
+            )
+            
+            if not order:
+                return None
+                
+            status = order.get('status', '')
+            
+            if status == 'FILLED':
                 return OrderStatus.FILLED
-            elif order['status'] == 'CANCELED':
+            elif status == 'CANCELED':
                 return OrderStatus.CANCELLED
+            elif status == 'REJECTED':
+                return OrderStatus.CANCELLED
+            elif status == 'EXPIRED':
+                return OrderStatus.CANCELLED
+            else:
             return OrderStatus.PENDING
+                
         except BinanceAPIException as e:
-            logger.error(f"Failed to check order status: {e}")
+            logger.error(f"Failed to check order status for {order_id}: {e}")
             return None
             
     async def get_balance(self, symbol: str = 'USDT') -> Decimal:
-        """Get balance for a specific asset"""
-        await self.rate_limiter.acquire()
+        """Get balance of specific asset"""
         try:
+            # Get both spot and futures balances
+            spot_balance = Decimal('0')
+            futures_balance = Decimal('0')
+            
+            # Get spot balance
             account = await self.client.get_account()
+            if account and 'balances' in account:
             for balance in account['balances']:
-                if (balance['asset'] == symbol):
-                    return Decimal(balance['free'])
-            return Decimal('0')
-        except BinanceAPIException as e:
+                    if balance['asset'] == symbol:
+                        spot_balance = Decimal(balance['free']) + Decimal(balance['locked'])
+                        break
+            
+            # Get futures balance if futures client is initialized
+            if self.futures_client:
+                futures_balance = await self.futures_client.get_balance(symbol)
+            
+            # Return combined balance
+            total_balance = spot_balance + futures_balance
+            
+            # Update last balance
+            self.last_balance = total_balance
+            self.last_balance_check = datetime.now()
+            
+            return total_balance
+            
+        except Exception as e:
             logger.error(f"Failed to get balance: {e}")
-            raise
+            return Decimal('0')
             
     async def get_balance_changes(self, symbol: str = 'USDT') -> Optional[Decimal]:
         """Get balance changes since last check"""
@@ -953,14 +1196,26 @@ class BinanceClient:
             return False
 
     async def get_current_price(self, symbol: str) -> float:
-        """Get the current price for a symbol"""
+        """
+        Get current price for a symbol
+        
+        Args:
+            symbol: Trading pair symbol (e.g. BTCUSDT)
+            
+        Returns:
+            Current price as float
+        """
         try:
-            await self.rate_limiter.acquire()
+            # Get ticker price
             ticker = await self.client.get_symbol_ticker(symbol=symbol)
-            return float(ticker['price'])
+            price = float(ticker['price'])
+            
+            logger.debug(f"Current price for {symbol}: {price}")
+            return price
+            
         except Exception as e:
-            logger.error(f"Failed to get current price for {symbol}: {e}")
-            return None
+            logger.error(f"Error getting current price for {symbol}: {e}")
+            return 0.0
 
     def _get_quantity_precision(self, symbol: str) -> int:
         """Get the quantity precision for a symbol"""
@@ -1010,40 +1265,26 @@ class BinanceClient:
             return quantity
 
     async def calculate_fees(self, symbol: str, price: Decimal, quantity: Decimal, order_type: str = "spot", leverage: int = 1) -> Tuple[Decimal, str]:
-        """Calculate trading fees for an order based on order type and leverage"""
+        """Calculate fees for a trade"""
         try:
-            # Normalize order_type to lowercase
-            order_type = order_type.lower() if isinstance(order_type, str) else "spot"
+            # Get fee rate based on order type
+            if order_type == "futures":
+                fee_rate = Decimal(str(ORDER_TYPE_FEES.get('futures', TRADING_FEES.get('FUTURES', 0.002))))
+                
+                # For futures, fee is on the notional value, not the margin
+                notional_value = price * quantity
+                fee = notional_value * fee_rate
+                
+            else:  # spot
+                fee_rate = Decimal(str(ORDER_TYPE_FEES.get('spot', TRADING_FEES.get('SPOT', 0.001))))
+                fee = price * quantity * fee_rate
             
-            # Get fee rate based on order type or use the symbol-specific rate if available
-            if symbol in TRADING_FEES:
-                fee_rate = Decimal(str(TRADING_FEES[symbol]))
-            else:
-                # Use order type specific fee rate
-                fee_rate = Decimal(str(ORDER_TYPE_FEES.get(order_type, TRADING_FEES['DEFAULT'])))
+            # Return fee and currency
+            return fee, 'USDT'
             
-            # Calculate trade value
-            trade_value = price * quantity
-            
-            # For futures trades, account for leverage in fee calculation
-            if order_type == "futures" and leverage > 1:
-                # In futures trading, fees apply to the effective position size (with leverage)
-                effective_value = trade_value * Decimal(str(leverage))
-                fee_amount = effective_value * fee_rate
-                logger.info(f"Calculated futures fees with leverage {leverage}x: Value=${float(trade_value):.2f}, Effective=${float(effective_value):.2f}")
-            else:
-                # Standard fee calculation for spot trades
-                fee_amount = trade_value * fee_rate
-            
-            # Default fee asset is USDT for most trades
-            fee_asset = "USDT"
-            
-            logger.info(f"Calculated fees for {symbol} ({order_type}): {float(fee_amount):.4f} {fee_asset} (rate: {float(fee_rate)*100:.4f}%)")
-            
-            return fee_amount, fee_asset
         except Exception as e:
             logger.error(f"Error calculating fees: {e}")
-            return Decimal('0'), "USDT"  # Default safe values
+            return Decimal('0'), 'USDT'
 
     async def get_historical_benchmark(self, symbol: str, days: int = 90) -> Dict:
         """Get historical performance data for a benchmark asset"""
@@ -1064,7 +1305,6 @@ class BinanceClient:
                     date = price_data['timestamp'].strftime('%Y-%m-%d')
                     current_price = float(price_data['price'])
                     roi = ((current_price - base_price) / base_price) * 100
-                    result[date] = roi
                     
                 return result
                 
@@ -1087,8 +1327,6 @@ class BinanceClient:
             
     async def _get_simulated_sp500_data(self, days: int = 90) -> Dict:
         """Generate simulated S&P 500 data when API is unavailable"""
-        import numpy as np
-        
         logger.info("Generating simulated S&P 500 data")
         today = datetime.utcnow()
         base_value = 4000.0  # Starting value
@@ -1174,4 +1412,431 @@ class BinanceClient:
             logger.error(f"Error generating YTD comparison chart: {e}", exc_info=True)
             return None
 
-    # ...rest of existing code...
+    async def get_position_info(self, symbol: str) -> Dict:
+        """Get current position information for a futures symbol"""
+        try:
+            # Check if we're in futures mode
+            if not self.futures_client:
+                logger.warning("Futures trading is not enabled")
+                return {}
+                
+            # Make API call to get position information
+            endpoint = "/fapi/v2/positionRisk"
+            params = {"symbol": symbol}
+            
+            response = await self._make_request("GET", endpoint, params, is_futures=True, signed=True)
+            
+            if response and isinstance(response, list) and len(response) > 0:
+                position = response[0]
+                
+                # Calculate ROE (Return on Equity)
+                entry_price = float(position.get("entryPrice", 0))
+                mark_price = float(position.get("markPrice", 0))
+                leverage = float(position.get("leverage", 1))
+                position_amt = float(position.get("positionAmt", 0))
+                
+                # Skip if no position
+                if position_amt == 0 or entry_price == 0:
+                    return {}
+                
+                # Calculate ROE based on position direction
+                if position_amt > 0:  # Long position
+                    roe = ((mark_price / entry_price) - 1) * 100 * leverage
+                else:  # Short position
+                    roe = ((entry_price / mark_price) - 1) * 100 * leverage
+                
+                return {
+                    "symbol": position.get("symbol"),
+                    "position_amount": position_amt,
+                    "entry_price": entry_price,
+                    "mark_price": mark_price,
+                    "unrealized_pnl": float(position.get("unRealizedProfit", 0)),
+                    "leverage": float(position.get("leverage", 1)),
+                    "margin_type": position.get("marginType", "isolated").lower(),
+                    "isolated_margin": float(position.get("isolatedMargin", 0)),
+                    "position_side": position.get("positionSide", "BOTH"),
+                    "margin_ratio": float(position.get("marginRatio", 0)) * 100,  # Convert to percentage
+                    "liquidation_price": float(position.get("liquidationPrice", 0)),
+                    "roe": roe  # Return on Equity (%)
+                }
+            else:
+                logger.warning(f"Failed to get position info for {symbol}")
+                return {}
+                
+        except Exception as e:
+            logger.error(f"Error getting position info: {e}")
+            return {}
+
+    async def get_all_positions(self) -> List[Dict]:
+        """Get all open futures positions"""
+        try:
+            # Check if we're in futures mode
+            if not self.futures_client:
+                logger.warning("Futures trading is not enabled")
+                return []
+                
+            # Make API call to get all positions
+            endpoint = "/fapi/v2/positionRisk"
+            
+            response = await self._make_request("GET", endpoint, {}, is_futures=True, signed=True)
+            
+            if response and isinstance(response, list):
+                # Filter out positions with zero amount
+                positions = [pos for pos in response if float(pos.get("positionAmt", 0)) != 0]
+                
+                # Format positions
+                formatted_positions = []
+                for position in positions:
+                    # Calculate ROE (Return on Equity)
+                    entry_price = float(position.get("entryPrice", 0))
+                    mark_price = float(position.get("markPrice", 0))
+                    leverage = float(position.get("leverage", 1))
+                    position_amt = float(position.get("positionAmt", 0))
+                    
+                    # Calculate ROE based on position direction
+                    if position_amt > 0:  # Long position
+                        roe = ((mark_price / entry_price) - 1) * 100 * leverage
+                        direction = "LONG"
+                    else:  # Short position
+                        roe = ((entry_price / mark_price) - 1) * 100 * leverage
+                        direction = "SHORT"
+                    
+                    formatted_positions.append({
+                        "symbol": position.get("symbol"),
+                        "position_amount": position_amt,
+                        "entry_price": entry_price,
+                        "mark_price": mark_price,
+                        "unrealized_pnl": float(position.get("unRealizedProfit", 0)),
+                        "leverage": leverage,
+                        "margin_type": position.get("marginType", "isolated").lower(),
+                        "isolated_margin": float(position.get("isolatedMargin", 0)),
+                        "position_side": position.get("positionSide", "BOTH"),
+                        "margin_ratio": float(position.get("marginRatio", 0)) * 100,  # Convert to percentage
+                        "liquidation_price": float(position.get("liquidationPrice", 0)),
+                        "roe": roe,  # Return on Equity (%)
+                        "direction": direction
+                    })
+                
+                return formatted_positions
+            else:
+                logger.warning("Failed to get positions")
+                return []
+                
+        except Exception as e:
+            logger.error(f"Error getting all positions: {e}")
+            return []
+
+    async def get_funding_rate(self, symbol: str) -> Dict:
+        """Get current funding rate for a futures symbol"""
+        try:
+            # Check if we're in futures mode
+            if not self.futures_client:
+                logger.warning("Futures trading is not enabled")
+                return {"funding_rate": 0, "next_funding_time": None}
+                
+            # Make API call to get funding rate
+            endpoint = "/fapi/v1/premiumIndex"
+            params = {"symbol": symbol}
+            
+            response = await self._make_request("GET", endpoint, params, is_futures=True)
+            
+            if response and "lastFundingRate" in response:
+                return {
+                    "symbol": response.get("symbol"),
+                    "funding_rate": float(response.get("lastFundingRate", 0)),
+                    "mark_price": float(response.get("markPrice", 0)),
+                    "next_funding_time": datetime.fromtimestamp(response.get("nextFundingTime", 0) / 1000) if response.get("nextFundingTime") else None
+                }
+            else:
+                logger.warning(f"Failed to get funding rate for {symbol}")
+                return {"funding_rate": 0, "next_funding_time": None}
+                
+        except Exception as e:
+            logger.error(f"Error getting funding rate: {e}")
+            return {"funding_rate": 0, "next_funding_time": None}
+
+    async def _update_exchange_info(self):
+        """Update exchange information for symbols"""
+        try:
+            exchange_info = await self.client.get_exchange_info()
+            
+            # Process symbol info
+            for symbol_info in exchange_info['symbols']:
+                symbol = symbol_info['symbol']
+                
+                # Extract filters
+                filters = {}
+                for filter_info in symbol_info['filters']:
+                    filter_type = filter_info['filterType']
+                    filters[filter_type] = filter_info
+                
+                # Store symbol info
+                self.symbol_info[symbol] = {
+                    'baseAsset': symbol_info['baseAsset'],
+                    'quoteAsset': symbol_info['quoteAsset'],
+                    'filters': filters
+                }
+            
+            logger.info(f"Updated exchange info for {len(self.symbol_info)} symbols")
+            
+        except Exception as e:
+            logger.error(f"Failed to update exchange info: {e}")
+
+    async def place_tp_sl_orders(self, order_id: str, tp_percentage: float = None, sl_percentage: float = None) -> bool:
+        """Place TP/SL orders for an existing order"""
+        try:
+            # Check if TP/SL is enabled
+            if not self.tp_sl_enabled:
+                logger.warning("TP/SL is disabled, skipping TP/SL order placement")
+                return False
+                
+            # Check if TP/SL manager is initialized
+            if not self.tp_sl_manager:
+                logger.error("TP/SL manager not initialized")
+                return False
+            
+            # Get order from database
+            order_doc = await self.mongo_client.orders.find_one({"order_id": order_id})
+            if not order_doc:
+                logger.error(f"Order {order_id} not found")
+                return False
+            
+            # Convert to Order object
+            order = self.mongo_client._document_to_order(order_doc)
+            if not order:
+                logger.error(f"Failed to convert order {order_id}")
+                return False
+            
+            # Check if order is filled
+            if order.status != OrderStatus.FILLED:
+                logger.warning(f"Cannot place TP/SL orders for unfilled order {order_id}")
+                return False
+            
+            # Use provided percentages or defaults
+            if tp_percentage is None:
+                tp_percentage = order_doc.get("tp_percentage", self.default_tp_percentage)
+            if sl_percentage is None:
+                sl_percentage = order_doc.get("sl_percentage", self.default_sl_percentage)
+            
+            # Place TP/SL orders
+            result = await self.tp_sl_manager.place_tp_sl_orders(
+                order, tp_percentage, sl_percentage
+            )
+            
+            return result['tp_order'] is not None and result['sl_order'] is not None
+            
+        except Exception as e:
+            logger.error(f"Error placing TP/SL orders: {e}")
+            return False
+    
+    async def update_tp_sl_levels(self, order_id: str, tp_percentage: Optional[float] = None, sl_percentage: Optional[float] = None) -> bool:
+        """Update TP/SL levels for an existing order"""
+        try:
+            if not self.tp_sl_manager:
+                logger.error("TP/SL manager not initialized")
+                return False
+            
+            return await self.tp_sl_manager.update_tp_sl_levels(
+                order_id, tp_percentage, sl_percentage
+            )
+            
+        except Exception as e:
+            logger.error(f"Error updating TP/SL levels: {e}")
+            return False
+    
+    async def cancel_tp_sl_orders(self, order_id: str) -> bool:
+        """Cancel TP/SL orders for an existing order"""
+        try:
+            if not self.tp_sl_manager:
+                logger.error("TP/SL manager not initialized")
+                return False
+            
+            return await self.tp_sl_manager.cancel_tp_sl_orders(order_id)
+            
+        except Exception as e:
+            logger.error(f"Error cancelling TP/SL orders: {e}")
+            return False
+
+    async def set_default_leverage(self, leverage: int) -> bool:
+        """Set default leverage for futures trading"""
+        try:
+            # Validate leverage
+            if leverage < 1 or leverage > 125:
+                logger.error(f"Invalid leverage: {leverage}. Must be between 1 and 125.")
+                return False
+                
+            # Update default leverage
+            self.default_leverage = leverage
+            logger.info(f"Default leverage set to {leverage}x")
+            
+            # Update config if available
+            if self.config and 'trading' in self.config:
+                self.config['trading']['default_leverage'] = leverage
+                
+            return True
+        except Exception as e:
+            logger.error(f"Error setting default leverage: {e}")
+            return False
+            
+    async def set_default_margin_mode(self, margin_mode: str) -> bool:
+        """Set default margin mode for futures trading"""
+        try:
+            # Validate margin mode
+            if margin_mode.lower() not in ['isolated', 'cross']:
+                logger.error(f"Invalid margin mode: {margin_mode}. Must be 'isolated' or 'cross'.")
+                return False
+                
+            # Update default margin mode
+            self.default_margin_mode = margin_mode.lower()
+            logger.info(f"Default margin mode set to {margin_mode}")
+            
+            # Update config if available
+            if self.config and 'trading' in self.config:
+                self.config['trading']['default_margin_mode'] = margin_mode.lower()
+                
+            return True
+        except Exception as e:
+            logger.error(f"Error setting default margin mode: {e}")
+            return False
+            
+    async def set_order_amount(self, amount: float) -> bool:
+        """Set order amount for trading"""
+        try:
+            # Validate amount
+            if amount < 10:
+                logger.error(f"Invalid order amount: {amount}. Must be at least 10 USDT.")
+                return False
+                
+            # Update order amount
+            self.order_amount = amount
+            logger.info(f"Order amount set to ${amount:,.2f}")
+            
+            # Update config if available
+            if self.config and 'trading' in self.config:
+                self.config['trading']['order_amount'] = amount
+                
+            return True
+        except Exception as e:
+            logger.error(f"Error setting order amount: {e}")
+            return False
+
+    async def set_leverage(self, symbol: str, leverage: int) -> bool:
+        """Set leverage for a specific symbol"""
+        try:
+            if not self.is_futures_enabled:
+                logger.error("Futures trading is not enabled")
+                return False
+                
+            # Validate leverage
+            if leverage < 1 or leverage > 125:
+                logger.error(f"Invalid leverage: {leverage}. Must be between 1 and 125.")
+                return False
+                
+            # Set leverage for the symbol
+            params = {
+                'symbol': symbol,
+                'leverage': leverage
+            }
+            
+            response = await self._make_request('POST', '/fapi/v1/leverage', params, is_futures=True, signed=True)
+            
+            if response and 'leverage' in response:
+                logger.info(f"Set leverage for {symbol} to {response['leverage']}x")
+                return True
+            else:
+                logger.error(f"Failed to set leverage for {symbol}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error setting leverage: {e}")
+            return False
+            
+    async def set_margin_type(self, symbol: str, margin_type: str) -> bool:
+        """Set margin type for a specific symbol (ISOLATED or CROSS)"""
+        try:
+            if not self.is_futures_enabled:
+                logger.error("Futures trading is not enabled")
+                return False
+                
+            # Validate margin type
+            margin_type = margin_type.upper()
+            if margin_type not in ['ISOLATED', 'CROSS']:
+                logger.error(f"Invalid margin type: {margin_type}. Must be 'ISOLATED' or 'CROSS'.")
+                return False
+                
+            # Set margin type for the symbol
+            params = {
+                'symbol': symbol,
+                'marginType': margin_type
+            }
+            
+            try:
+                response = await self._make_request('POST', '/fapi/v1/marginType', params, is_futures=True, signed=True)
+                
+                if response and isinstance(response, dict) and response.get('msg') == 'success':
+                    logger.info(f"Set margin type for {symbol} to {margin_type}")
+                    return True
+                else:
+                    logger.warning(f"Margin type for {symbol} is already {margin_type}")
+                    return True  # Consider it a success if already set
+            except Exception as e:
+                # Check if error is because margin type is already set
+                error_msg = str(e).lower()
+                if "already" in error_msg:
+                    logger.info(f"Margin type for {symbol} is already {margin_type}")
+                    return True
+                raise
+                
+        except Exception as e:
+            logger.error(f"Error setting margin type: {e}")
+            return False
+            
+    async def _make_request(self, method: str, endpoint: str, params: dict = None, 
+                         is_futures: bool = False, signed: bool = False) -> Any:
+            """Make a request to the Binance API with rate limiting"""
+            try:
+                # Implement rate limiting
+                current_time = time.time()
+                time_since_last = current_time - self.last_request_time
+                
+                if time_since_last < 1 and self.request_count >= self.max_requests_per_minute:
+                    wait_time = 1 - time_since_last
+                    logger.debug(f"Rate limiting: waiting {wait_time:.2f}s")
+                    await asyncio.sleep(wait_time)
+                    
+                self.last_request_time = time.time()
+                self.request_count = (self.request_count + 1) % self.max_requests_per_minute
+                
+                # Determine which client to use
+                client = self.futures_client if is_futures else self.client
+                
+                if not client:
+                    logger.error(f"{'Futures' if is_futures else 'Spot'} client not initialized")
+                    return None
+                    
+                # Make the request
+                if method.upper() == 'GET':
+                    if is_futures:
+                        if signed:
+                            response = client.get(endpoint, params=params)
+                        else:
+                            response = client.get_public(endpoint, params=params)
+                    else:
+                        response = await client.request(endpoint, params=params, method='GET', signed=signed)
+                elif method.upper() == 'POST':
+                    if is_futures:
+                        if signed:
+                            response = client.post(endpoint, params=params)
+                        else:
+                            response = client.post_public(endpoint, params=params)
+                    else:
+                        response = await client.request(endpoint, params=params, method='POST', signed=signed)
+                else:
+                    logger.error(f"Unsupported method: {method}")
+                    return None
+                    
+                return response
+                
+            except Exception as e:
+                logger.error(f"API request error ({method} {endpoint}): {e}")
+                raise

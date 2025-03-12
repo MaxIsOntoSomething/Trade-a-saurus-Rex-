@@ -1,5 +1,5 @@
 import asyncio
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, BotCommand, ParseMode
 from telegram.ext import (
     Application, CommandHandler, ContextTypes, 
     ConversationHandler, CallbackQueryHandler, MessageHandler,
@@ -13,6 +13,9 @@ from ..types.models import Order, OrderStatus, TimeFrame, OrderType, TradeDirect
 from ..trading.binance_client import BinanceClient
 from ..database.mongo_client import MongoClient
 import io  # Add for handling bytes from chart
+from ..trading.tpsl_manager import TPSLManager
+import json
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -57,29 +60,36 @@ class TelegramBot:
     def __init__(self, token: str, allowed_users: List[int], 
                  binance_client: BinanceClient, mongo_client: MongoClient,
                  config: dict):  # Add config parameter
+        """Initialize the Telegram bot with token and allowed users"""
         self.token = token
         self.allowed_users = allowed_users
         self.binance_client = binance_client
         self.mongo_client = mongo_client
         self.config = config
-        self.app = None
+        self.bot = Bot(token=token)
+        self.dp = Dispatcher(self.bot)
+        self.markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+        self.markup.add(types.KeyboardButton('/menu'))
         self.is_paused = False
-        self.running = False
-        self._polling_task = None
-        self._update_id = 0
-        self.temp_trade_data = {}
+        self.chart_generator = ChartGenerator()
+        self.user_states = {}  # Store user conversation states
+        self.current_mode = "spot"  # Default to spot mode
         
-        # Set base currency and reserve balance in binance client immediately
-        if 'trading' in self.config:
-            self.binance_client.base_currency = self.config['trading'].get('base_currency', 'USDT')
-            self.binance_client.reserve_balance = float(self.config['trading'].get('reserve_balance', 0))
-            
-        self.keyboard = [
-            [KeyboardButton("/balance"), KeyboardButton("/stats"), KeyboardButton("/profits")],
-            [KeyboardButton("/power"), KeyboardButton("/add"), KeyboardButton("/thresholds")],  # Changed /trading to /power
-            [KeyboardButton("/history"), KeyboardButton("/viz"), KeyboardButton("/menu")]
-        ]
-        self.markup = ReplyKeyboardMarkup(self.keyboard, resize_keyboard=True)
+        # Initialize user data storage
+        self.user_data = {}
+        
+        # Create buttons for main menu
+        self.markup.add(
+            types.KeyboardButton('/balance'),
+            types.KeyboardButton('/stats'),
+            types.KeyboardButton('/toggle')
+        )
+        self.markup.add(
+            types.KeyboardButton('/trade'),
+            types.KeyboardButton('/futures'),
+            types.KeyboardButton('/viz')
+        )
+        
         self.startup_message = f"""
 {DINO_ASCII}
 
@@ -94,94 +104,151 @@ Status: Ready to ROAR! 🦖
         self.sent_roars = set()  # Add this to track sent roar notifications
 
     async def initialize(self):
-        """Initialize the Telegram bot"""
-        self.app = Application.builder().token(self.token).build()
-        
-        # Add new command handlers
-        add_trade_handler = ConversationHandler(
-            entry_points=[CommandHandler("add", self.add_trade_start)],
-            states={
-                SYMBOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_trade_symbol)],
-                ORDER_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_trade_order_type)],
-                LEVERAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_trade_leverage)],
-                DIRECTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_trade_direction)],
-                AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_trade_amount)],
-                PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_trade_final)]
-            },
-            fallbacks=[CommandHandler("cancel", self.add_trade_cancel)],
-        )
-        
-        self.app.add_handler(add_trade_handler)
-        self.app.add_handler(CommandHandler("thresholds", self.show_thresholds))
-        self.app.add_handler(CommandHandler("menu", self.show_menu))
-        self.app.add_handler(CommandHandler("resetthresholds", self.reset_all_thresholds))  # Add new command
-        
-        # Register command handlers
-        self.app.add_handler(CommandHandler("start", self.start_command))
-        self.app.add_handler(CommandHandler("power", self.toggle_trading))  # Change command name
-        self.app.add_handler(CommandHandler("balance", self.get_balance))
-        self.app.add_handler(CommandHandler("stats", self.get_stats))
-        self.app.add_handler(CommandHandler("history", self.get_order_history))
-        self.app.add_handler(CommandHandler("profits", self.show_profits))
-        
-        # Add visualization command
-        self.app.add_handler(CommandHandler("viz", self.show_viz_menu))
-        self.app.add_handler(CallbackQueryHandler(self.handle_viz_selection, pattern="^(daily_volume|profit_distribution|order_types|hourly_activity|balance_chart|roi_comparison|sp500_vs_btc|portfolio_composition)$"))
-        
-        await self.app.initialize()
-        await self.app.start()
-        await self.send_restored_thresholds_message()
+        """Initialize the bot and register handlers"""
+        try:
+            # Register command handlers
+            self.dp.register_message_handler(self.cmd_start, commands=["start"])
+            self.dp.register_message_handler(self.cmd_help, commands=["help"])
+            self.dp.register_message_handler(self.cmd_status, commands=["status"])
+            self.dp.register_message_handler(self.cmd_balance, commands=["balance"])
+            self.dp.register_message_handler(self.cmd_orders, commands=["orders"])
+            self.dp.register_message_handler(self.cmd_positions, commands=["positions"])
+            self.dp.register_message_handler(self.cmd_futures, commands=["futures"])
+            self.dp.register_message_handler(self.cmd_chart, commands=["chart"])
+            self.dp.register_message_handler(self.cmd_stats, commands=["stats"])
+            self.dp.register_message_handler(self.cmd_thresholds, commands=["thresholds"])
+            self.dp.register_message_handler(self.cmd_reset, commands=["reset"])
+            self.dp.register_message_handler(self.cmd_tpsl, commands=["tpsl"])
+            self.dp.register_message_handler(self.cmd_updatetpsl, commands=["updatetpsl"])
+            self.dp.register_message_handler(self.cmd_toggletpsl, commands=["toggletpsl"])
+            
+            # Register futures commands
+            self.dp.register_message_handler(self.cmd_leverage, commands=["leverage"])
+            self.dp.register_message_handler(self.cmd_margin_mode, commands=["marginmode"])
+            self.dp.register_message_handler(self.cmd_order_amount, commands=["orderamount"])
+            
+            # Register mode switching command
+            self.dp.register_message_handler(self.cmd_switch_mode, commands=["mode"])
+            
+            # Register callback query handlers
+            self.dp.register_callback_query_handler(self.callback_handler)
+            
+            # Register message handler for all other messages
+            self.dp.register_message_handler(self.handle_message)
+            
+            # Initialize trading mode based on config
+            await self._initialize_trading_mode()
+            
+            logger.info("Telegram bot initialized")
+            return True
+        except Exception as e:
+            logger.error(f"Error initializing Telegram bot: {e}")
+            return False
+
+    async def _initialize_trading_mode(self):
+        """Initialize the trading mode based on config"""
+        # Check if futures is enabled in the binance client
+        if hasattr(self.binance_client, 'is_futures_enabled') and self.binance_client.is_futures_enabled:
+            # Default to spot mode, but allow futures mode
+            self.current_mode = "spot"
+            logger.info("Bot initialized with Spot mode as default, Futures mode is available")
+        else:
+            # Only spot mode is available
+            self.current_mode = "spot"
+            logger.info("Bot initialized with Spot mode only, Futures mode is not available")
+    
+    def get_current_mode(self) -> str:
+        """Get the current trading mode (spot or futures)"""
+        return self.current_mode
+    
+    async def cmd_switch_mode(self, message: types.Message):
+        """Handle /mode command - switch between spot and futures modes"""
+        try:
+            chat_id = message.chat.id
+            user_id = message.from_user.id
+            
+            # Check if user is authorized
+            if not self._is_authorized(user_id):
+                await self.send_message(chat_id, "⛔ Unauthorized access")
+                return
+                
+            # Check if futures trading is enabled
+            if not hasattr(self.binance_client, 'is_futures_enabled') or not self.binance_client.is_futures_enabled:
+                await self.send_message(chat_id, "Futures trading is not enabled. Only Spot mode is available.")
+                return
+                
+            # Create keyboard with mode options
+            keyboard = [
+                [InlineKeyboardButton("SPOT", callback_data="mode_spot")],
+                [InlineKeyboardButton("FUTURES", callback_data="mode_futures")]
+            ]
+                
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await self.send_message(
+                chat_id,
+                f"🔄 *Switch Trading Mode*\n\nCurrent mode: *{self.current_mode.upper()}*\n\nSelect trading mode:",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=reply_markup
+            )
+            
+        except Exception as e:
+            logger.error(f"Error handling mode switch command: {e}")
+            await self.send_message(message.chat.id, f"Error: {str(e)}")
 
     async def start(self):
-        """Start the bot and begin polling"""
-        self.running = True
-        
-        # Send startup message to all authorized users
-        for user_id in self.allowed_users:
-            try:
-                # First send welcome message
-                await self.app.bot.send_message(
-                    chat_id=user_id, 
-                    text=self.startup_message,
-                    reply_markup=self.markup
-                )
-                
-                # Then check for restored thresholds
-                if self.binance_client and hasattr(self.binance_client, 'restored_threshold_info'):
-                    restored_info = self.binance_client.restored_threshold_info
-                    if restored_info:
-                        logger.info(f"Sending threshold restoration notification: {restored_info}")
-                        await self.send_threshold_restoration_notification(restored_info)
-                    else:
-                        logger.info("No restored thresholds to notify about")
-                
-            except Exception as e:
-                logger.error(f"Failed to send startup message to {user_id}: {e}")
-        
-        # Start polling in the background
-        while self.running:
-            try:
-                updates = await self.app.bot.get_updates(
-                    offset=self._update_id,
-                    timeout=30
-                )
-                
-                for update in updates:
-                    if update.update_id >= self._update_id:
-                        self._update_id = update.update_id + 1
-                        await self.app.process_update(update)
-                        
-            except Exception as e:
-                logger.error(f"Polling error: {e}")
-                await asyncio.sleep(1)
-                
-            await asyncio.sleep(0.1)
+        """Start the bot"""
+        try:
+            # Initialize bot
+            await self.initialize()
+            
+            # Create application
+            self.application = Application.builder().token(self.token).build()
+            
+            # Add handlers
+            self.add_handlers()
+            
+            # Start the bot
+            await self.application.initialize()
+            await self.application.start()
+            await self.application.updater.start_polling()
+            
+            # Set running flag
+            self.running = True
+            
+            # Start position monitoring task
+            self.position_monitor_task = asyncio.create_task(self.monitor_positions())
+            
+            logger.info("Bot started successfully")
+            
+        except Exception as e:
+            logger.error(f"Error starting bot: {e}")
+            raise
 
     async def stop(self):
-        """Stop the Telegram bot"""
-        self.running = False
-        if self.app:
-            await self.app.stop()
+        """Stop the bot"""
+        try:
+            # Set running flag to False to stop monitoring
+            self.running = False
+            
+            # Cancel position monitoring task if it exists
+            if hasattr(self, 'position_monitor_task'):
+                self.position_monitor_task.cancel()
+                try:
+                    await self.position_monitor_task
+                except asyncio.CancelledError:
+                    pass
+            
+            # Stop the application
+            if self.application:
+                await self.application.stop()
+                await self.application.shutdown()
+                
+            logger.info("Bot stopped successfully")
+            
+        except Exception as e:
+            logger.error(f"Error stopping bot: {e}")
+            raise
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle the /start command"""
@@ -312,73 +379,195 @@ Menu:
             await update.message.reply_text(f"❌ Error getting stats: {str(e)}")
 
     async def get_order_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Get recent order history"""
-        if not self._is_authorized(update.effective_user.id):
-            await update.message.reply_text("⛔ Unauthorized access")
+        """Get order history"""
+        try:
+            chat_id = update.effective_chat.id
+            user_id = update.effective_user.id
+            
+            # Check if user is authorized
+            if not self._is_authorized(user_id):
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="⛔ Unauthorized access"
+                )
             return
             
-        try:
-            # Get last 5 orders
-            cursor = self.mongo_client.orders.find().sort("created_at", -1).limit(5)
-            orders = []
-            async for doc in cursor:
-                orders.append(
-                    f"{doc['symbol']} - {doc['status']}\n"
-                    f"Price: {doc['price']} Amount: {doc['quantity']}\n"
-                    f"Created: {doc['created_at'].strftime('%Y-%m-%d %H:%M:%S')}"
-                )
+            # Get order history based on current mode
+            if self.current_mode == "futures":
+                # Get futures order history
+                orders = await self.mongo_client.get_futures_orders(days=7)
                 
-            message = "📜 Recent Orders:\n\n" + "\n\n".join(orders)
-            await update.message.reply_text(message)
+                if not orders:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text="No futures orders found in the last 7 days."
+                    )
+                    return
+                    
+                # Format futures order history
+                message = "📜 *Recent Futures Orders*\n\n"
+                
+                for order in orders:
+                    # Extract order details
+                    symbol = order.get('symbol', 'Unknown')
+                    direction = order.get('direction', 'LONG')
+                    leverage = order.get('leverage', 1)
+                    status = order.get('status', 'Unknown')
+                    price = float(order.get('price', 0))
+                    quantity = float(order.get('quantity', 0))
+                    created_at = order.get('created_at', datetime.now()).strftime('%Y-%m-%d %H:%M')
+                    
+                    # Calculate value
+                    value = price * quantity
+                    
+                    # Format status with emoji
+                    status_emoji = "✅" if status == "filled" else "❌" if status == "cancelled" else "⏳"
+                    
+                    # Format direction with emoji
+                    direction_emoji = "📈" if direction == "LONG" else "📉"
+                    
+                    # Add order to message
+                    message += f"{status_emoji} {direction_emoji} *{symbol}* ({leverage}x)\n"
+                    message += f"   Price: ${price:.2f} | Qty: {quantity:.8f}\n"
+                    message += f"   Value: ${value:.2f} | {created_at}\n\n"
+                
+            else:
+                # Get spot order history
+                orders = await self.mongo_client.get_buy_orders(days=7)
+                
+                if not orders:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text="No spot orders found in the last 7 days."
+                    )
+                    return
+                    
+                # Format spot order history
+                message = "📜 *Recent Spot Orders*\n\n"
+                
+                for order in orders:
+                    # Extract order details
+                    symbol = order.get('symbol', 'Unknown')
+                    status = order.get('status', 'Unknown')
+                    price = float(order.get('price', 0))
+                    quantity = float(order.get('quantity', 0))
+                    created_at = order.get('created_at', datetime.now()).strftime('%Y-%m-%d %H:%M')
+                    
+                    # Calculate value
+                    value = price * quantity
+                    
+                    # Format status with emoji
+                    status_emoji = "✅" if status == "filled" else "❌" if status == "cancelled" else "⏳"
+                    
+                    # Add order to message
+                    message += f"{status_emoji} *{symbol}*\n"
+                    message += f"   Price: ${price:.2f} | Qty: {quantity:.8f}\n"
+                    message += f"   Value: ${value:.2f} | {created_at}\n\n"
+            
+            # Send message
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=message,
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
         except Exception as e:
-            await update.message.reply_text(f"❌ Error getting history: {str(e)}")
+            logger.error(f"Error getting order history: {e}")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"Error getting order history: {str(e)}"
+            )
 
     async def send_order_notification(self, order: Order, status: Optional[OrderStatus] = None):
-        """Send order notification to all allowed users"""
-        if not self.app:
-            logger.error("Telegram bot not initialized")
+        """Send notification about order status change"""
+        if not self.allowed_users:
             return
 
-        # Skip filled notification if we already sent a roar for this order
-        if status == OrderStatus.FILLED and order.order_id in self.sent_roars:
-            logger.debug(f"Skipping filled notification for {order.order_id} - ROAR already sent")
-            return
-
+        # Use provided status or order status
         status = status or order.status
-        emoji = {
-            OrderStatus.PENDING: "🔵",
-            OrderStatus.FILLED: "✅",
-            OrderStatus.CANCELLED: "⚠️"
-        }
         
-        # Calculate total value in USDT
-        total_value = order.price * order.quantity
-        
-        # Fix the format specifier
-        message = (
-            f"{emoji[status]} Order Update\n"
-            f"Order ID: {order.order_id}\n"
-            f"Symbol: {order.symbol}\n"
-            f"Status: {status.value.upper()}\n"
-            f"Amount: {float(order.quantity):.8f} {order.symbol.replace('USDT', '')}\n"
-            f"Price: ${float(order.price):.2f}\n"
-            f"Total: ${float(total_value):.2f} USDT\n"  # Fixed format specifier
-            f"Threshold: {order.threshold if order.threshold else 'Manual'}\n"
-            f"Timeframe: {self._get_timeframe_value(order.timeframe)}"
-        )
-
-        if status == OrderStatus.FILLED:
-            message += f"\nFees: ${float(order.fees):.4f} {order.fee_asset}"
+        # Create message based on status
+        if status == OrderStatus.PENDING:
+            emoji = "🔄"
+            action = "placed"
+        elif status == OrderStatus.FILLED:
+            emoji = "✅"
+            action = "filled"
+        elif status == OrderStatus.CANCELLED:
+            emoji = "❌"
+            action = "cancelled"
+        else:
+            emoji = "❓"
+            action = "updated"
             
-        if status == OrderStatus.CANCELLED and order.cancelled_at:
-            duration = order.cancelled_at - order.created_at
-            message += f"\nDuration: {duration.total_seconds() / 3600:.2f} hours"
-
+        # Format order details
+        order_type = "SPOT" if order.order_type == OrderType.SPOT else "FUTURES"
+        leverage_text = f" ({order.leverage}x)" if order.leverage else ""
+        direction_text = f" {order.direction.value.upper()}" if order.direction else ""
+        
+        # Format price with appropriate precision
+        price_str = f"${float(order.price):.2f}"
+        
+        # Format quantity with appropriate precision
+        if float(order.quantity) < 0.001:
+            quantity_str = f"{float(order.quantity):.8f}"
+        elif float(order.quantity) < 0.1:
+            quantity_str = f"{float(order.quantity):.6f}"
+        else:
+            quantity_str = f"{float(order.quantity):.4f}"
+            
+        # Calculate total value
+        total_value = float(order.price * order.quantity)
+        
+        # Add TP/SL info if available
+        tp_sl_text = ""
+        if hasattr(order, 'tp_price') and hasattr(order, 'sl_price') and order.tp_price and order.sl_price:
+            tp_sl_text = (
+                f"\n\nTP: ${float(order.tp_price):.2f}\n"
+                f"SL: ${float(order.sl_price):.2f}"
+            )
+            
+        # Create message
+        message = (
+            f"{emoji} Order {action.upper()}\n\n"
+            f"Symbol: {order.symbol}\n"
+            f"Type: {order_type}{leverage_text}{direction_text}\n"
+            f"Price: {price_str}\n"
+            f"Quantity: {quantity_str}\n"
+            f"Total: ${total_value:.2f}"
+            f"{tp_sl_text}"
+        )
+        
+        # Add threshold info if available
+        if order.threshold is not None and order.timeframe is not None:
+            message += f"\n\nTriggered by {order.threshold}% {order.timeframe.value} threshold"
+            
+        # Add reference price if available
+        if order.reference_price is not None:
+            price_change = ((float(order.price) - order.reference_price) / order.reference_price) * 100
+            message += f"\nReference: ${order.reference_price:.2f} ({price_change:+.2f}%)"
+            
+        # Add timestamp
+        if status == OrderStatus.PENDING:
+            timestamp = order.created_at
+        elif status == OrderStatus.FILLED:
+            timestamp = order.filled_at or datetime.now()
+        elif status == OrderStatus.CANCELLED:
+            timestamp = order.cancelled_at or datetime.now()
+        else:
+            timestamp = datetime.now()
+            
+        message += f"\n\nTime: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}"
+        
+        # Send to all allowed users
         for user_id in self.allowed_users:
             try:
-                await self.app.bot.send_message(chat_id=user_id, text=message)
+                await self.application.bot.send_message(
+                    chat_id=user_id,
+                    text=message
+                )
             except Exception as e:
-                logger.error(f"Failed to send notification to {user_id}: {e}")
+                logger.error(f"Failed to send order notification to {user_id}: {e}")
 
     async def send_balance_update(self, symbol: str, change: Decimal):
         """Send balance change notification"""
@@ -390,65 +579,68 @@ Menu:
         
         for user_id in self.allowed_users:
             try:
-                await self.app.bot.send_message(chat_id=user_id, text=message)
+                await self.application.bot.send_message(chat_id=user_id, text=message)
             except Exception as e:
                 logger.error(f"Failed to send balance update to {user_id}: {e}")
 
-    async def send_trade_chart(self, order: Order):
-        """Send trade chart to users"""
+    async def send_trade_chart(self, chat_id: int, order: Order, candles: List[Dict], 
+                             reference_price: Optional[Decimal] = None,
+                             funding_rate: Optional[float] = None) -> bool:
+        """Send a chart for a trade with entry point and reference price"""
         try:
-            # Get reference price and convert to Decimal
-            ref_price = self.binance_client.reference_prices.get(
-                order.symbol, {}
-            ).get(order.timeframe)
-            
-            if ref_price is not None:
-                ref_price = Decimal(str(ref_price))
-            
-            chart_data = await self.binance_client.generate_trade_chart(order)
-            if not chart_data:
-                logger.error("Failed to generate chart data")
-                # Send text-only notification as fallback
-                for user_id in self.allowed_users:
+            # Generate chart based on order type
+            if order.order_type == OrderType.FUTURES:
+                # Get position info if available
+                position_info = None
+                if self.binance_client:
                     try:
-                        await self.app.bot.send_message(
-                            chat_id=user_id,
-                            text=self.binance_client.chart_generator.format_info_text(
-                                order,
-                                ref_price
-                            )
-                        )
+                        position = await self.binance_client.get_position_info(order.symbol)
+                        if position:
+                            position_info = {
+                                'entry_price': position.get('entry_price', float(order.price)),
+                                'pnl': position.get('unrealized_pnl', 0),
+                                'pnl_percentage': position.get('roe', 0),
+                                'margin_ratio': position.get('margin_ratio', 0)
+                            }
                     except Exception as e:
-                        logger.error(f"Failed to send fallback message to {user_id}: {e}")
-                return
+                        logger.error(f"Error getting position info: {e}")
                 
-            # Attempt to send chart with caption
-            for user_id in self.allowed_users:
-                try:
-                    await self.app.bot.send_photo(
-                        chat_id=user_id,
-                        photo=chart_data,
-                        caption=self.binance_client.chart_generator.format_info_text(
-                            order,
-                            ref_price
-                        )
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to send chart to {user_id}: {e}")
-                    # Try sending text-only notification as fallback
+                # Get funding rate if not provided
+                if funding_rate is None and self.binance_client:
                     try:
-                        await self.app.bot.send_message(
-                            chat_id=user_id,
-                            text=self.binance_client.chart_generator.format_info_text(
-                                order,
-                                ref_price
-                            )
-                        )
-                    except Exception as e2:
-                        logger.error(f"Failed to send fallback message to {user_id}: {e2}")
+                        funding_info = await self.binance_client.get_funding_rate(order.symbol)
+                        if funding_info:
+                            funding_rate = funding_info.get('funding_rate', 0)
+                except Exception as e:
+                        logger.error(f"Error getting funding rate: {e}")
+                
+                # Generate futures-specific chart
+                chart_bytes = await self.chart_generator.generate_futures_chart(
+                    candles, order, funding_rate, position_info
+                )
+            else:
+                # Generate regular chart for spot orders
+                chart_bytes = await self.chart_generator.generate_trade_chart(
+                    candles, order, reference_price
+                )
+            
+            if not chart_bytes:
+                await self.send_message(chat_id, "Failed to generate chart")
+                return False
+                
+            # Send chart as photo
+            await self.bot.send_photo(
+                chat_id=chat_id,
+                photo=io.BytesIO(chart_bytes),
+                caption=f"Trade chart for {order.symbol}"
+            )
+            
+            return True
                     
         except Exception as e:
-            logger.error(f"Failed to generate trade chart: {e}")
+            logger.error(f"Error sending trade chart: {e}")
+            await self.send_message(chat_id, f"Error sending chart: {str(e)}")
+            return False
 
     async def send_roar(self, order: Order):
         """Send a dinosaur roar notification with trade summary in chart"""
@@ -492,7 +684,7 @@ Menu:
                 try:
                     if chart_data:
                         # Send with chart if available
-                        await self.app.bot.send_photo(
+                        await self.application.bot.send_photo(
                             chat_id=user_id,
                             photo=chart_data,
                             caption=caption
@@ -501,7 +693,7 @@ Menu:
                     else:
                         # Send text-only message if chart generation failed
                         text_message = caption + "\n\n⚠️ (Chart generation failed - not enough historical data)"
-                        await self.app.bot.send_message(
+                        await self.application.bot.send_message(
                             chat_id=user_id,
                             text=text_message
                         )
@@ -511,7 +703,7 @@ Menu:
                     # Last resort fallback - try to send minimal message
                     try:
                         minimal_msg = f"🦖 Trade Complete! {order.symbol} at ${float(order.price):.2f}"
-                        await self.app.bot.send_message(
+                        await self.application.bot.send_message(
                             chat_id=user_id,
                             text=minimal_msg
                         )
@@ -527,7 +719,7 @@ Menu:
             # Final fallback - try to send a minimal notification
             for user_id in self.allowed_users:
                 try:
-                    await self.app.bot.send_message(
+                    await self.application.bot.send_message(
                         chat_id=user_id,
                         text=f"🦖 ROAR! {order.symbol} trade completed. Check /profits for details."
                     )
@@ -535,32 +727,75 @@ Menu:
                     logger.error(f"Even fallback roar failed for {user_id}: {e2}")
 
     async def show_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show all available commands with descriptions"""
-        if not self._is_authorized(update.effective_user.id):
-            await update.message.reply_text("⛔ Unauthorized access")
+        """Show the main menu"""
+        if not await self.is_user_authorized(update, context):
             return
             
-        menu_text = """
-🦖 Trade-a-saurus Rex Commands:
+        try:
+            # Get current mode
+            mode_text = "FUTURES" if self.current_mode == "futures" else "SPOT"
+            
+            # Create menu message
+            message = f"🤖 *TRADE-A-SAURUS REX* 🦖\n\n"
+            message += f"*Current Mode:* {mode_text}\n"
+            
+            # Add mode-specific information
+            if self.current_mode == "futures":
+                # Add futures-specific information
+                leverage = self.config.get("futures", {}).get("leverage", 1)
+                margin_mode = self.config.get("futures", {}).get("margin_mode", "isolated").upper()
+                order_amount = self.config.get("futures", {}).get("order_amount", 0)
+                
+                message += f"*Leverage:* {leverage}x\n"
+                message += f"*Margin Mode:* {margin_mode}\n"
+                message += f"*Order Amount:* {order_amount} USDT\n"
+            else:
+                # Add spot-specific information
+                order_amount = self.config.get("spot", {}).get("order_amount", 0)
+                message += f"*Order Amount:* {order_amount} USDT\n"
+            
+            # Add TP/SL information
+            tp_sl_status = "ENABLED" if self.tp_sl_enabled else "DISABLED"
+            message += f"*TP/SL:* {tp_sl_status}\n"
+            
+            if self.tp_sl_enabled:
+                message += f"*TP %:* {self.default_tp_percentage}%\n"
+                message += f"*SL %:* {self.default_sl_percentage}%\n"
+            
+            # Add commands
+            message += "\n*Commands:*\n"
+            message += "/trade - Start a new trade\n"
+            message += "/cancel - Cancel active orders\n"
+            message += "/orders - View order history\n"
+            
+            if self.current_mode == "futures":
+                message += "/positions - View open positions\n"
+                
+            message += "/balance - Check account balance\n"
+            message += "/stats - View performance statistics\n"
+            message += "/chart - Get price chart\n"
+            message += "/mode - Toggle between Spot/Futures\n"
+            message += "/tpsl - TP/SL settings\n"
+            
+            if self.current_mode == "futures":
+                message += "/leverage - Set leverage\n"
+                message += "/marginmode - Set margin mode\n"
+                
+            message += "/orderamount - Set default order amount\n"
+            message += "/help - Show help\n"
 
-Trading Controls:
-/start - Start the bot and show welcome message
-/power - Toggle trading on/off  # Updated command name here
-
-Trading Information:
-/balance - Check current balance
-/stats - View trading statistics
-/history - View recent order history
-/thresholds - Show threshold status and resets
-/viz - Show data visualizations 📊
-
-Trading Actions:
-/add - Add a manual trade (interactive)
-
-Menu:
-/menu - Show this command list
-"""
-        await update.message.reply_text(menu_text)
+            # Send menu
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=message,
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception as e:
+            logger.error(f"Error showing menu: {e}")
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"Error showing menu: {e}"
+            )
 
     async def show_thresholds(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show detailed threshold information"""
@@ -655,22 +890,82 @@ Menu:
             await update.message.reply_text(f"❌ Error getting thresholds: {str(e)}")
 
     async def add_trade_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Start the manual trade addition process"""
-        if not self._is_authorized(update.effective_user.id):
-            await update.message.reply_text("⛔ Unauthorized access")
+        """Start the process of adding a manual trade"""
+        try:
+            chat_id = update.effective_chat.id
+            user_id = update.effective_user.id
+            
+            # Check if user is authorized
+            if not self._is_authorized(user_id):
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="⛔ Unauthorized access"
+                )
             return ConversationHandler.END
             
-        self.temp_trade_data[update.effective_user.id] = {}
-        
-        pairs = self.config['trading']['pairs']
-        keyboard = [[KeyboardButton(pair)] for pair in pairs]
-        markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True)
-        
-        await update.message.reply_text(
-            "What trading pair did you trade?",
-            reply_markup=markup
-        )
-        return SYMBOL
+            # Initialize user data for this conversation
+            context.user_data['trade'] = {}
+            
+            # Set order type based on current mode
+            if self.current_mode == "futures":
+                context.user_data['trade']['order_type'] = "futures"
+                
+                # Create keyboard with order type options
+                keyboard = [
+                    [InlineKeyboardButton("LONG", callback_data="direction_long")],
+                    [InlineKeyboardButton("SHORT", callback_data="direction_short")]
+                ]
+                
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="🔄 *New Futures Trade*\n\nSelect position direction:",
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=reply_markup
+                )
+                
+                return "direction"
+            else:
+                # Default to spot trading
+                context.user_data['trade']['order_type'] = "spot"
+                
+                # For spot trading, we don't need to ask for direction
+                # Proceed directly to symbol selection
+                symbols = self.config['trading']['pairs']
+                
+                keyboard = []
+                row = []
+                
+                for i, symbol in enumerate(symbols):
+                    row.append(InlineKeyboardButton(symbol, callback_data=f"symbol_{symbol}"))
+                    
+                    # Create rows of 3 buttons each
+                    if (i + 1) % 3 == 0 or i == len(symbols) - 1:
+                        keyboard.append(row)
+                        row = []
+                
+                # Add cancel button
+                keyboard.append([InlineKeyboardButton("Cancel", callback_data="cancel")])
+                
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="🔄 *New Spot Trade*\n\nSelect trading pair:",
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=reply_markup
+                )
+                
+                return "symbol"
+                
+        except Exception as e:
+            logger.error(f"Error starting trade conversation: {e}")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"Error: {str(e)}"
+            )
+            return ConversationHandler.END
 
     async def add_trade_order_type(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle order type input (SPOT/FUTURES)"""
@@ -1186,7 +1481,7 @@ Menu:
             balance_data = await self.mongo_client.get_balance_history(days)
             
             if not balance_data or len(balance_data) < 2:
-                await self.app.bot.send_message(
+                await self.application.bot.send_message(
                     chat_id=chat_id,
                     text="Not enough balance history data to generate chart.",
                     reply_markup=self.markup
@@ -1205,7 +1500,7 @@ Menu:
             )
             
             if not chart_bytes:
-                await self.app.bot.send_message(
+                await self.application.bot.send_message(
                     chat_id=chat_id,
                     text="Failed to generate balance chart.",
                     reply_markup=self.markup
@@ -1213,7 +1508,7 @@ Menu:
                 return
                 
             # Send chart to user
-            await self.app.bot.send_photo(
+            await self.application.bot.send_photo(
                 chat_id=chat_id,
                 photo=chart_bytes,
                 caption="📊 Account Balance History (30 days)\n"
@@ -1572,6 +1867,7 @@ Menu:
         try:
             # Reset daily thresholds
             await self.binance_client.reset_timeframe_thresholds('daily')
+            
             
             # Reset weekly thresholds
             await self.binance_client.reset_timeframe_thresholds('weekly')
@@ -2050,3 +2346,707 @@ Menu:
         except Exception as e:
             logger.error(f"Error creating portfolio composition chart: {e}", exc_info=True)
             return None
+
+    async def toggle_tpsl(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Toggle TP/SL on/off"""
+        if not self._is_authorized(update.effective_user.id):
+            await update.message.reply_text("⛔ Unauthorized access")
+            return
+            
+        # Toggle TP/SL
+        self.binance_client.tp_sl_enabled = not self.binance_client.tp_sl_enabled
+        
+        # Initialize or clear TP/SL manager
+        if self.binance_client.tp_sl_enabled:
+            if not self.binance_client.tp_sl_manager:
+                self.binance_client.tp_sl_manager = TPSLManager(self.binance_client, self.mongo_client)
+            message = (
+                "✅ TP/SL is now *ENABLED*\n\n"
+                f"Take Profit: {self.binance_client.default_tp_percentage}%\n"
+                f"Stop Loss: {self.binance_client.default_sl_percentage}%\n\n"
+                "TP/SL orders will be placed automatically for new filled orders."
+            )
+        else:
+            message = "❌ TP/SL is now *DISABLED*\n\nNo TP/SL orders will be placed for new orders."
+        
+        await update.message.reply_text(message, parse_mode='Markdown')
+
+    async def show_tpsl_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show TP/SL management menu"""
+        if not self._is_authorized(update.effective_user.id):
+            await update.message.reply_text("You are not authorized to use this bot.")
+            return
+            
+        # Check if TP/SL is enabled
+        tp_sl_enabled = self.binance_client.tp_sl_enabled
+        tp_percentage = self.binance_client.default_tp_percentage
+        sl_percentage = self.binance_client.default_sl_percentage
+        
+        if not tp_sl_enabled:
+            await update.message.reply_text(
+                "⚠️ TP/SL is currently *DISABLED*\n\n"
+                "Use /toggletpsl to enable TP/SL first.",
+                parse_mode='Markdown',
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Enable TP/SL", callback_data="tpsl_enable")]
+                ])
+            )
+            return
+            
+        keyboard = [
+            [InlineKeyboardButton("Update TP/SL Levels", callback_data="tpsl_update")],
+            [InlineKeyboardButton("View TP/SL Settings", callback_data="tpsl_view")],
+            [InlineKeyboardButton("Cancel TP/SL Orders", callback_data="tpsl_cancel")],
+            [InlineKeyboardButton("Configure Default TP/SL", callback_data="tpsl_config")]
+        ]
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            f"📊 *TP/SL Management*\n\n"
+            f"Current Default Settings:\n"
+            f"Take Profit: {tp_percentage}%\n"
+            f"Stop Loss: {sl_percentage}%\n\n"
+            f"Manage Take Profit and Stop Loss orders for your positions.",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+    async def handle_tpsl_enable(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle enabling TP/SL from callback"""
+        query = update.callback_query
+        await query.answer()
+        
+        # Enable TP/SL
+        self.binance_client.tp_sl_enabled = True
+        
+        # Initialize TP/SL manager if needed
+        if not self.binance_client.tp_sl_manager:
+            self.binance_client.tp_sl_manager = TPSLManager(self.binance_client, self.mongo_client)
+        
+        # Show TP/SL menu
+        await self.show_tpsl_menu(update, context)
+
+    async def handle_tpsl_config(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle configuring default TP/SL percentages"""
+        query = update.callback_query
+        await query.answer()
+        
+        await query.edit_message_text(
+            "*Configure Default TP/SL Percentages*\n\n"
+            f"Current Settings:\n"
+            f"Take Profit: {self.binance_client.default_tp_percentage}%\n"
+            f"Stop Loss: {self.binance_client.default_sl_percentage}%\n\n"
+            "Enter new Take Profit percentage (e.g., 5 for 5%):",
+            parse_mode='Markdown'
+        )
+        
+        # Set next state
+        return "tpsl_config_tp"
+    
+    async def handle_tpsl_config_tp(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle input of new default TP percentage"""
+        try:
+            # Parse TP percentage
+            tp_percentage = float(update.message.text.strip())
+            
+            # Validate percentage
+            if tp_percentage <= 0:
+                await update.message.reply_text(
+                    "TP percentage must be greater than 0. Please try again:"
+                )
+                return "tpsl_config_tp"
+                
+            # Store in context
+            context.user_data["tpsl_config_tp"] = tp_percentage
+            
+            # Ask for SL percentage
+            await update.message.reply_text(
+                f"Take Profit set to {tp_percentage}%.\n\n"
+                "Enter new Stop Loss percentage (e.g., 3 for 3%):"
+            )
+            
+            # Set next state
+            return "tpsl_config_sl"
+            
+        except ValueError:
+            await update.message.reply_text(
+                "Invalid input. Please enter a number for TP percentage:"
+            )
+            return "tpsl_config_tp"
+    
+    async def handle_tpsl_config_sl(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle input of new default SL percentage"""
+        try:
+            # Parse SL percentage
+            sl_percentage = float(update.message.text.strip())
+            
+            # Validate percentage
+            if sl_percentage <= 0:
+                await update.message.reply_text(
+                    "SL percentage must be greater than 0. Please try again:"
+                )
+                return "tpsl_config_sl"
+                
+            # Get TP percentage from context
+            tp_percentage = context.user_data.get("tpsl_config_tp")
+            
+            # Update default percentages
+            self.binance_client.default_tp_percentage = tp_percentage
+            self.binance_client.default_sl_percentage = sl_percentage
+            
+            # Update config if available
+            if self.config and 'trading' in self.config:
+                self.config['trading']['tp_percentage'] = tp_percentage
+                self.config['trading']['sl_percentage'] = sl_percentage
+            
+            # Confirm update
+            await update.message.reply_text(
+                "✅ Default TP/SL percentages updated:\n\n"
+                f"Take Profit: {tp_percentage}%\n"
+                f"Stop Loss: {sl_percentage}%\n\n"
+                "These settings will be applied to all new orders.",
+                reply_markup=self.markup
+            )
+            
+            # Clear context data
+            context.user_data.clear()
+            
+            return ConversationHandler.END
+            
+        except ValueError:
+            await update.message.reply_text(
+                "Invalid input. Please enter a number for SL percentage:"
+            )
+            return "tpsl_config_sl"
+
+    def get_tpsl_conversation(self) -> ConversationHandler:
+        """Create conversation handler for TP/SL management"""
+        return ConversationHandler(
+            entry_points=[
+                CommandHandler("tpsl", self.show_tpsl_menu),
+                CommandHandler("updatetpsl", self.handle_tpsl_config),
+                CallbackQueryHandler(self.handle_tpsl_selection, pattern=r"^tpsl_select_"),
+                CallbackQueryHandler(self.handle_tpsl_enable, pattern=r"^tpsl_enable$"),
+                CallbackQueryHandler(self.handle_tpsl_config, pattern=r"^tpsl_config$")
+            ],
+            states={
+                "tpsl_tp_percentage": [MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_tpsl_tp_percentage)],
+                "tpsl_sl_percentage": [MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_tpsl_sl_percentage)],
+                "tpsl_confirm": [CallbackQueryHandler(self.handle_tpsl_confirm, pattern=r"^tpsl_")],
+                "tpsl_config_tp": [MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_tpsl_config_tp)],
+                "tpsl_config_sl": [MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_tpsl_config_sl)]
+            },
+            fallbacks=[
+                CommandHandler("cancel", self.add_trade_cancel),
+                CallbackQueryHandler(self.handle_tpsl_menu, pattern=r"^tpsl_menu$"),
+                CallbackQueryHandler(self.handle_tpsl_view, pattern=r"^tpsl_view$"),
+                CallbackQueryHandler(self.handle_tpsl_cancel_select, pattern=r"^tpsl_cancel$"),
+                CallbackQueryHandler(self.handle_tpsl_cancel_confirm, pattern=r"^tpsl_cancel_")
+            ],
+            name="tpsl_conversation",
+            persistent=False
+        )
+
+    async def toggle_lower_entries(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Toggle Lower Entry Price Protection on/off"""
+        try:
+            # Check if user is authorized
+            if not self._is_authorized(update.effective_user.id):
+                await update.message.reply_text("You are not authorized to use this bot.")
+                return
+                
+            # Toggle the setting
+            current_state = self.binance_client.only_lower_entries
+            new_state = not current_state
+            self.binance_client.only_lower_entries = new_state
+            
+            # Update config if available
+            if self.config and 'trading' in self.config:
+                self.config['trading']['only_lower_entries'] = new_state
+            
+            # Send confirmation message
+            if new_state:
+                await update.message.reply_text(
+                    "✅ Lower Entry Price Protection is now ENABLED.\n\n"
+                    "New futures positions will only be opened if the entry price is lower than the previous average price.",
+                    reply_markup=self.markup
+                )
+            else:
+                await update.message.reply_text(
+                    "⚠️ Lower Entry Price Protection is now DISABLED.\n\n"
+                    "New futures positions will be opened regardless of the entry price compared to previous average.",
+                    reply_markup=self.markup
+                )
+                
+            logger.info(f"Lower Entry Price Protection toggled to: {new_state}")
+            
+        except Exception as e:
+            logger.error(f"Error toggling Lower Entry Price Protection: {e}")
+            await update.message.reply_text(
+                "❌ Error toggling Lower Entry Price Protection. Please try again.",
+                reply_markup=self.markup
+            )
+
+    async def cmd_help(self, message: types.Message):
+        """Handle /help command"""
+        try:
+            # Get current mode
+            current_mode = self.current_mode.upper()
+            
+            # Common commands
+            common_commands = (
+                "🦖 *Trade-a-saurus Rex Help* 🦖\n\n"
+                f"Current Mode: *{current_mode}*\n\n"
+                "*Basic Commands:*\n"
+                "/start - Start the bot\n"
+                "/menu - Show main menu\n"
+                "/mode - Switch between Spot/Futures modes\n"
+                "/toggle - Toggle trading on/off\n"
+                "/balance - Get current balance\n"
+                "/stats - Get performance stats\n"
+                "/history - Get order history\n"
+            )
+            
+            # Mode-specific commands
+            spot_commands = (
+                "*Spot Trading Commands:*\n"
+                "/thresholds - Show price thresholds\n"
+                "/reset - Reset all thresholds\n"
+            )
+            
+            futures_commands = (
+                "*Futures Trading Commands:*\n"
+                "/futures - Show open futures positions\n"
+                "/positions - Show position details\n"
+                "/leverage - Set default leverage (max 5x)\n"
+                "/marginmode - Set default margin mode (isolated/cross)\n"
+            )
+            
+            # Common settings commands
+            settings_commands = (
+                "*Trading Settings:*\n"
+                "/orderamount - Set USDT amount per order (min $10)\n"
+                "/tpsl - Manage Take Profit/Stop Loss settings\n"
+                "/toggletpsl - Toggle TP/SL on/off\n"
+                "/togglelower - Toggle Lower Entry Price Protection\n\n"
+            )
+            
+            # Visualization commands
+            viz_commands = (
+                "*Visualization Commands:*\n"
+                "/viz - Show visualizations\n"
+                "/profits - Show profit analysis\n"
+            )
+            
+            # Combine commands based on current mode
+            if self.current_mode == "spot":
+                help_text = common_commands + spot_commands + settings_commands + viz_commands
+            else:  # futures mode
+                help_text = common_commands + futures_commands + settings_commands + viz_commands
+            
+            await message.reply_text(
+                help_text,
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+        except Exception as e:
+            logger.error(f"Error sending help: {e}")
+            await message.reply_text("Error sending help. Please try again.")
+
+    async def cmd_stats(self, message: types.Message):
+        """Handle /stats command - show performance statistics"""
+        try:
+            chat_id = message.chat.id
+            user_id = message.from_user.id
+            
+            # Check if user is authorized
+            if not self._is_authorized(user_id):
+                await self.send_message(chat_id, "⛔ Unauthorized access")
+                return
+                
+            # Send typing action
+            await self.bot.send_chat_action(chat_id=chat_id, action="typing")
+            
+            # Get performance stats based on current mode
+            if self.current_mode == "spot":
+                stats = await self.mongo_client.get_performance_stats()
+            else:  # futures mode
+                stats = await self.mongo_client.get_futures_stats()
+            
+            if not stats:
+                await self.send_message(chat_id, "No performance statistics available yet.")
+                return
+                
+            # Format stats message based on mode
+            if self.current_mode == "spot":
+                # Format spot stats
+                stats_text = self._format_spot_stats(stats)
+            else:
+                # Format futures stats
+                stats_text = self._format_futures_stats(stats)
+                
+            # Send stats message
+            await self.send_message(chat_id, stats_text, parse_mode=ParseMode.MARKDOWN)
+            
+        except Exception as e:
+            logger.error(f"Error getting stats: {e}")
+            await self.send_message(message.chat.id, f"Error getting stats: {str(e)}")
+            
+    def _format_spot_stats(self, stats: dict) -> str:
+        """Format spot trading statistics"""
+        try:
+            # Extract stats
+            total_orders = stats.get('total_orders', 0)
+            filled_orders = stats.get('filled_orders', 0)
+            cancelled_orders = stats.get('cancelled_orders', 0)
+            total_volume = stats.get('total_volume', 0)
+            avg_order_size = stats.get('avg_order_size', 0)
+            total_fees = stats.get('total_fees', 0)
+            profit_loss = stats.get('profit_loss', 0)
+            win_rate = stats.get('win_rate', 0)
+            
+            # Format stats message
+            stats_text = (
+                "📊 *SPOT TRADING STATISTICS*\n\n"
+                f"Total Orders: {total_orders}\n"
+                f"Filled Orders: {filled_orders}\n"
+                f"Cancelled Orders: {cancelled_orders}\n"
+                f"Total Volume: ${float(total_volume):,.2f}\n"
+                f"Average Order Size: ${float(avg_order_size):,.2f}\n"
+                f"Total Fees: ${float(total_fees):,.2f}\n"
+                f"Profit/Loss: ${float(profit_loss):,.2f}\n"
+                f"Win Rate: {win_rate:.2f}%\n\n"
+            )
+            
+            # Add symbol stats if available
+            if 'symbols' in stats:
+                stats_text += "*Symbol Performance:*\n"
+                for symbol, symbol_stats in stats['symbols'].items():
+                    symbol_volume = symbol_stats.get('volume', 0)
+                    symbol_pnl = symbol_stats.get('pnl', 0)
+                    symbol_orders = symbol_stats.get('orders', 0)
+                    
+                    # Add emoji based on PnL
+                    emoji = "🟢" if symbol_pnl > 0 else "🔴" if symbol_pnl < 0 else "⚪"
+                    
+                    stats_text += f"{emoji} *{symbol}*: ${float(symbol_pnl):,.2f} ({symbol_orders} orders, ${float(symbol_volume):,.2f})\n"
+            
+            return stats_text
+            
+        except Exception as e:
+            logger.error(f"Error formatting spot stats: {e}")
+            return "Error formatting statistics."
+            
+    def _format_futures_stats(self, stats: dict) -> str:
+        """Format futures trading statistics"""
+        try:
+            # Extract stats
+            total_positions = stats.get('total_positions', 0)
+            open_positions = stats.get('open_positions', 0)
+            closed_positions = stats.get('closed_positions', 0)
+            long_positions = stats.get('long_positions', 0)
+            short_positions = stats.get('short_positions', 0)
+            total_volume = stats.get('total_volume', 0)
+            avg_leverage = stats.get('avg_leverage', 1)
+            total_fees = stats.get('total_fees', 0)
+            realized_pnl = stats.get('realized_pnl', 0)
+            unrealized_pnl = stats.get('unrealized_pnl', 0)
+            win_rate = stats.get('win_rate', 0)
+            
+            # Format stats message
+            stats_text = (
+                "📊 *FUTURES TRADING STATISTICS*\n\n"
+                f"Total Positions: {total_positions}\n"
+                f"Open Positions: {open_positions}\n"
+                f"Closed Positions: {closed_positions}\n"
+                f"Long Positions: {long_positions}\n"
+                f"Short Positions: {short_positions}\n"
+                f"Total Volume: ${float(total_volume):,.2f}\n"
+                f"Average Leverage: {avg_leverage:.2f}x\n"
+                f"Total Fees: ${float(total_fees):,.2f}\n"
+                f"Realized PnL: ${float(realized_pnl):,.2f}\n"
+                f"Unrealized PnL: ${float(unrealized_pnl):,.2f}\n"
+                f"Win Rate: {win_rate:.2f}%\n\n"
+            )
+            
+            # Add symbol stats if available
+            if 'symbols' in stats:
+                stats_text += "*Symbol Performance:*\n"
+                for symbol, symbol_stats in stats['symbols'].items():
+                    symbol_volume = symbol_stats.get('volume', 0)
+                    symbol_pnl = symbol_stats.get('pnl', 0)
+                    symbol_positions = symbol_stats.get('positions', 0)
+                    
+                    # Add emoji based on PnL
+                    emoji = "🟢" if symbol_pnl > 0 else "🔴" if symbol_pnl < 0 else "⚪"
+                    
+                    stats_text += f"{emoji} *{symbol}*: ${float(symbol_pnl):,.2f} ({symbol_positions} positions, ${float(symbol_volume):,.2f})\n"
+            
+            return stats_text
+            
+        except Exception as e:
+            logger.error(f"Error formatting futures stats: {e}")
+            return "Error formatting statistics."
+
+    async def set_leverage(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Set leverage for futures trading"""
+        if not await self.is_user_authorized(update, context):
+            return
+            
+        # Check if in futures mode
+        if self.current_mode != "futures":
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="This command is only available in futures mode."
+            )
+            return
+            
+        # Check if user provided a valid leverage
+        try:
+            leverage = int(context.args[0])
+            if 1 <= leverage <= 125:
+                self.binance_client.leverage = leverage
+                await update.message.reply_text(
+                    f"Leverage set to {leverage}x for futures trading."
+                )
+            else:
+                await update.message.reply_text(
+                    "Invalid leverage format. Please use a number between 1 and 125."
+                )
+        except (IndexError, ValueError):
+            await update.message.reply_text(
+                "Invalid leverage format. Please use /leverage <number>."
+            )
+
+    async def help(self, update: Update, context: CallbackContext) -> None:
+        """Show help message"""
+        if not await self.is_user_authorized(update, context):
+            return
+
+        try:
+            message = "🤖 *TRADE-A-SAURUS REX HELP* 🦖\n\n"
+            
+            # General commands
+            message += "*General Commands:*\n"
+            message += "/start - Start the bot\n"
+            message += "/menu - Show main menu\n"
+            message += "/help - Show this help message\n"
+            message += "/mode - Toggle between Spot/Futures mode\n\n"
+            
+            # Trading commands
+            message += "*Trading Commands:*\n"
+            message += "/trade - Start a new trade\n"
+            message += "/cancel - Cancel active orders\n"
+            message += "/orders - View order history\n"
+            message += "/balance - Check account balance\n"
+            message += "/stats - View performance statistics\n"
+            message += "/chart - Get price chart\n"
+            message += "/orderamount - Set default order amount\n\n"
+            
+            # TP/SL commands
+            message += "*TP/SL Commands:*\n"
+            message += "/tpsl - Show TP/SL menu\n"
+            message += "/updatetpsl - Update TP/SL settings\n"
+            message += "/toggletpsl - Toggle TP/SL on/off\n\n"
+            
+            # Futures-specific commands
+            message += "*Futures-Specific Commands:*\n"
+            message += "/positions - View open futures positions\n"
+            message += "/leverage - Set leverage (1-125)\n"
+            message += "/marginmode - Set margin mode (isolated/cross)\n\n"
+            
+            # Examples
+            message += "*Examples:*\n"
+            message += "/trade - Start a new trade\n"
+            message += "/leverage 10 - Set futures leverage to 10x\n"
+            message += "/marginmode isolated - Set margin mode to isolated\n"
+            message += "/orderamount 100 - Set default order amount to 100 USDT\n"
+            
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=message,
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception as e:
+            logger.error(f"Error showing help: {e}")
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"Error showing help: {e}"
+            )
+
+    async def is_user_authorized(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+        """Check if the user is authorized"""
+        return update.effective_user.id in self.allowed_users
+
+    async def handle_tpsl_tp_percentage(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle input of new TP percentage"""
+        try:
+            tp_percentage = float(update.message.text.strip())
+            if 0 < tp_percentage <= 100:
+                self.binance_client.default_tp_percentage = tp_percentage
+                await update.message.reply_text(
+                    f"New Take Profit percentage set to {tp_percentage}%"
+                )
+                return "tpsl_tp_percentage"
+
+    async def get_positions(self, update: Update, context: CallbackContext) -> None:
+        """Get open futures positions"""
+        if not await self.is_user_authorized(update, context):
+            return
+
+        try:
+            # Check if in futures mode
+            if self.current_mode != "futures":
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text="This command is only available in futures mode."
+                )
+                return
+                
+            # Get open positions
+            positions = await self.mongo_client.get_open_futures_positions()
+            
+            if not positions:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text="No open positions found."
+                )
+                return
+
+            # Format position information
+            message = "📊 *Open Futures Positions*\n\n"
+            for pos in positions:
+                symbol = pos['symbol']
+                direction = "LONG 📈" if pos['direction'] == "LONG" else "SHORT 📉"
+                leverage = pos['leverage']
+                entry_price = float(pos['entry_price'])
+                current_price = await self.binance_client.get_current_price(symbol)
+                quantity = float(pos['quantity'])
+                liq_price = float(pos.get('liquidation_price', 0))
+                
+                # Calculate PnL
+                if direction == "LONG 📈":
+                    pnl = (current_price - entry_price) * quantity * leverage
+                else:
+                    pnl = (entry_price - current_price) * quantity * leverage
+                
+                # Format TP/SL info if available
+                tp_info = f"TP: ${float(pos['tp_price']):.2f}" if pos.get('tp_price') else "No TP"
+                sl_info = f"SL: ${float(pos['sl_price']):.2f}" if pos.get('sl_price') else "No SL"
+
+                message += (
+                    f"*{symbol}* - {direction}\n"
+                    f"Leverage: {leverage}x\n"
+                    f"Entry: ${entry_price:.2f}\n"
+                    f"Current: ${current_price:.2f}\n"
+                    f"Size: {quantity:.4f}\n"
+                    f"Liq.Price: ${liq_price:.2f}\n"
+                    f"{tp_info} | {sl_info}\n"
+                    f"PnL: ${pnl:.2f} ({((current_price/entry_price - 1) * 100 * leverage):.2f}%)\n\n"
+                )
+
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=message,
+                parse_mode='Markdown'
+            )
+
+        except Exception as e:
+            logger.error(f"Error getting positions: {e}")
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="Error retrieving positions. Please try again."
+            )
+
+    async def monitor_positions(self):
+        """Monitor open positions for TP/SL hits and potential risks"""
+        logger.info("Starting position monitoring...")
+        
+        while self.running:
+            try:
+                # Get all open positions
+                positions = await self.mongo_client.get_open_futures_positions()
+                
+                for position in positions:
+                    symbol = position['symbol']
+                    current_price = await self.binance_client.get_current_price(symbol)
+                    
+                    # Get margin information
+                    margin_info = await self.binance_client.get_position_margin_info(symbol)
+                    if margin_info:
+                        required_margin = Decimal(str(margin_info['required_margin']))
+                        available_margin = Decimal(str(margin_info['available_margin']))
+                        margin_ratio = (available_margin / required_margin) * 100
+                        
+                        # Check margin levels
+                        if margin_ratio < 150:  # Warning at 150% margin ratio
+                    # Check TP hit
+                    if position.get('tp_price') and float(position['tp_price']):
+                        tp_price = float(position['tp_price'])
+                        if (position['direction'] == 'LONG' and current_price >= tp_price) or \
+                           (position['direction'] == 'SHORT' and current_price <= tp_price):
+                            # Calculate PnL
+                            entry_price = float(position['entry_price'])
+                            quantity = float(position['quantity'])
+                            leverage = position['leverage']
+                            
+                            if position['direction'] == 'LONG':
+                                pnl = (tp_price - entry_price) * quantity * leverage
+                            else:
+                                pnl = (entry_price - tp_price) * quantity * leverage
+                            
+                            # Record TP hit and PnL
+                            await self.mongo_client.record_futures_pnl(
+                                order_id=position['order_id'],
+                                pnl=pnl,
+                                close_price=tp_price,
+                                close_time=datetime.utcnow()
+                            )
+                            
+                            # Send notification
+                            await self.send_message(
+                                chat_id=position['user_id'],
+                                text=f"🎯 Take Profit Hit for {symbol}\n"
+                                     f"Entry: ${entry_price:.2f}\n"
+                                     f"TP: ${tp_price:.2f}\n"
+                                     f"PnL: ${pnl:.2f}"
+                            )
+                    
+                    # Check SL hit
+                    if position.get('sl_price') and float(position['sl_price']):
+                        sl_price = float(position['sl_price'])
+                        if (position['direction'] == 'LONG' and current_price <= sl_price) or \
+                           (position['direction'] == 'SHORT' and current_price >= sl_price):
+                            # Calculate PnL
+                            entry_price = float(position['entry_price'])
+                            quantity = float(position['quantity'])
+                            leverage = position['leverage']
+                            
+                            if position['direction'] == 'LONG':
+                                pnl = (sl_price - entry_price) * quantity * leverage
+                            else:
+                                pnl = (entry_price - sl_price) * quantity * leverage
+                            
+                            # Record SL hit and PnL
+                            await self.mongo_client.record_futures_pnl(
+                                order_id=position['order_id'],
+                                pnl=pnl,
+                                close_price=sl_price,
+                                close_time=datetime.utcnow()
+                            )
+                            
+                            # Send notification
+                            await self.send_message(
+                                chat_id=position['user_id'],
+                                text=f"🛑 Stop Loss Hit for {symbol}\n"
+                                     f"Entry: ${entry_price:.2f}\n"
+                                     f"SL: ${sl_price:.2f}\n"
+                                     f"PnL: ${pnl:.2f}"
+                            )
+                
+                await asyncio.sleep(5)  # Check every 5 seconds
+                
+            except Exception as e:
+                logger.error(f"Error in position monitoring: {e}")
+                await asyncio.sleep(30)  # Sleep longer on error

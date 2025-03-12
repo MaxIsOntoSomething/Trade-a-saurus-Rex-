@@ -29,44 +29,56 @@ A personal hobby project - An automated cryptocurrency trading bot for Binance t
 
 ## 🦖 What is Trade-a-saurus Rex?
 
-This bot watches for significant price drops in cryptocurrencies and automatically places buy orders when opportunities arise. Think of it as a digital dinosaur hunting for trading opportunities!
+### Spot Trading Features
+- 🎯 Automatic buy order placement based on price thresholds
+- 📉 Lower entry price protection
+- 💼 Portfolio management and tracking
+- 🔍 Order history and performance tracking
 
-## Key Features 🚀
+### Futures Trading Features (New!)
+- 📊 Dedicated Futures trading mode with separate commands
+- 🔧 Adjustable leverage (1x to 5x)
+- 💫 Support for both Isolated and Cross margin modes
+- 📈 Long and Short position support
+- 🎯 Take Profit and Stop Loss automation
+- ⚠️ Margin and liquidation warnings
+- 💰 PnL tracking and reporting
+- 🔄 Position monitoring and automatic closure
+- 🏦 Separate Futures wallet management
 
-- 🕒 Multi-timeframe monitoring (daily, weekly, monthly)
-- 📊 Real-time portfolio tracking with P/L calculations
-- 🎯 Dynamic threshold-based buying
-- 🔄 Auto-cancellation of unfilled orders
-- 🤖 Telegram integration for monitoring and control
-- 📈 Tax-adjusted profit calculations (28%)
-- 🎨 Chart position visualizations after Order Executions
-- 💰 USDT balance protection
-- 📊 Enhanced visualization tools with balance history charts
-- 🗄️ MongoDB persistence of thresholds and reference prices
-- 🔁 Threshold state restoration after restart
-- 🐳 Docker support (works best when running on Server)
+### Risk Management Features
+- ⚖️ Reserve balance protection
+- 🎯 Automated Take Profit and Stop Loss (TP/SL)
+- ⚠️ Margin level monitoring
+- 🚨 Liquidation price alerts
+- 💹 Real-time PnL tracking
+- 📊 Risk exposure monitoring
 
 ## Prerequisites
 
-- Python 3.7+
-- MongoDB
-- Binance account
-- Telegram bot token
+### Testing and Development
+- 🧪 Support for both Spot and Futures Testnet
+- 🔑 Separate API keys for Spot and Futures testing
+- 🔄 Easy switching between test and production environments
+- 📝 Comprehensive logging and error handling
 
-## Quick Start
+## Configuration
 
-1. **Setup**
-   ```bash
-   git clone https://github.com/yourusername/Trade-a-saurus-Rex.git
-   cd Trade-a-saurus-Rex
-   pip install -r requirements.txt
-   ```
+### Environment Variables
+Create a `.env` file based on `.env.example` with your configuration:
 
-2. **Configure**
-   - Copy `config/config_template.json` to `config/config.json`
-   - Add your API keys and settings
+```env
+# Binance Configuration
+BINANCE_SPOT_TESTNET_API_KEY=your_testnet_api_key_here
+BINANCE_SPOT_TESTNET_API_SECRET=your_testnet_api_secret_here
+BINANCE_FUTURES_TESTNET_API_KEY=your_futures_testnet_api_key_here
+BINANCE_FUTURES_TESTNET_API_SECRET=your_futures_testnet_api_secret_here
+BINANCE_MAINNET_API_KEY=your_mainnet_api_key_here
+BINANCE_MAINNET_API_SECRET=your_mainnet_api_secret_here
+BINANCE_USE_TESTNET=true
 
-## Telegram Commands
+# Other configurations...
+```
 
 - `/start` - Start the bot and show welcome message
 - `/power` - Toggle trading on/off
@@ -80,7 +92,26 @@ This bot watches for significant price drops in cryptocurrencies and automatical
 - `/viz` - Show data visualizations (volume, profit, balance charts)
 - `/menu` - Show all available commands
 
-## Recent Updates and Improvements
+```json
+{
+    "binance": {
+        "spot_testnet": {
+            "api_key": "your_testnet_api_key",
+            "api_secret": "your_testnet_api_secret"
+        },
+        "futures_testnet": {
+            "api_key": "your_futures_testnet_api_key",
+            "api_secret": "your_futures_testnet_api_secret"
+        },
+        "mainnet": {
+            "api_key": "your_mainnet_api_key",
+            "api_secret": "your_mainnet_api_secret"
+        },
+        "use_testnet": true
+    }
+    // Other configurations...
+}
+```
 
 - **Enhanced Data Persistence**: All thresholds and reference prices are now stored in MongoDB for reliable recovery after restarts
 - **Threshold Restoration**: Bot now properly restores triggered thresholds after a restart

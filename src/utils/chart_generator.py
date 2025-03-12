@@ -3,14 +3,16 @@ import pandas as pd
 import numpy as np  # Add the missing numpy import
 from datetime import datetime, timedelta  # Add timedelta import
 from decimal import Decimal
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple, Any
 import logging
-from ..types.models import TimeFrame, Order
+from ..types.models import TimeFrame, Order, OrderType, OrderDirection, MarginMode, PositionSide
 import io
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 from matplotlib.ticker import FuncFormatter
 import matplotlib.dates as mdates
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 logger = logging.getLogger(__name__)
 
@@ -116,112 +118,151 @@ class ChartGenerator:
                                  candles: List[Dict], 
                                  order: Order,
                                  reference_price: Optional[Decimal] = None) -> Optional[bytes]:
-        """Generate candlestick chart with trade markers"""
+        """Generate a chart for a trade with entry point and reference price"""
         try:
-            # Validate input data
             if not self.validate_candle_data(candles):
-                logger.error("Failed candle data validation")
+                logger.error("Invalid candle data for chart generation")
                 return None
 
+            # Prepare candle data
             df = self.prepare_candle_data(candles)
             
-            # Validate reference price if provided
-            ref_value = float(reference_price) if reference_price else None
-            if ref_value and not self.validate_reference_price(ref_value, candles):
-                logger.warning("Using first candle's open price as reference")
-                ref_value = float(df.iloc[0]['open'])
-
-            # Verify opening price
-            opening_price = float(df.iloc[0]['open'])
-            if abs(opening_price - float(reference_price if reference_price else 0)) > (opening_price * 0.1):
-                logger.warning(f"Large discrepancy between reference price and candle open price: "
-                             f"Open={opening_price}, Ref={reference_price}")
+            # Create figure with secondary y-axis
+            fig = make_subplots(rows=1, cols=1, shared_xaxes=True, 
+                               vertical_spacing=0.03, subplot_titles=('Price Chart',),
+                               specs=[[{"secondary_y": True}]])
             
-            # Create empty list for addplots
-            addplots = []
-
-            # Add entry point marker
-            entry_time = order.filled_at or order.created_at
-            if entry_time:
-                # Create entry marker with NaN values
-                entry_series = pd.Series(index=df.index, dtype=float)
-                entry_series.loc[:] = float('nan')
+            # Add candlestick chart
+            fig.add_trace(go.Candlestick(
+                x=df['timestamp'],
+                open=df['open'],
+                high=df['high'],
+                low=df['low'],
+                close=df['close'],
+                name="Price"
+            ))
+            
+            # Add volume bars
+            fig.add_trace(go.Bar(
+                x=df['timestamp'],
+                y=df['volume'],
+                name="Volume",
+                marker_color='rgba(0, 0, 255, 0.3)',
+                opacity=0.3
+            ), secondary_y=True)
+            
+            # Add entry point
+            entry_time = order.filled_at if order.filled_at else order.created_at
+            entry_price = float(order.price)
+            
+            fig.add_trace(go.Scatter(
+                x=[entry_time, entry_time],
+                y=[df['low'].min() * 0.99, df['high'].max() * 1.01],
+                mode='lines',
+                line=dict(color='green', width=2, dash='dash'),
+                name="Entry Point"
+            ))
+            
+            fig.add_trace(go.Scatter(
+                x=[df['timestamp'].min(), df['timestamp'].max()],
+                y=[entry_price, entry_price],
+                mode='lines',
+                line=dict(color='green', width=1, dash='dot'),
+                name="Entry Price"
+            ))
+            
+            # Add reference price if provided
+            if reference_price is not None and self.validate_reference_price(float(reference_price), candles):
+                ref_price = float(reference_price)
+                fig.add_trace(go.Scatter(
+                    x=[df['timestamp'].min(), df['timestamp'].max()],
+                    y=[ref_price, ref_price],
+                    mode='lines',
+                    line=dict(color='blue', width=1, dash='dot'),
+                    name="Reference Price"
+                ))
+            
+            # Add TP/SL lines if present in the order
+            if hasattr(order, 'tp_price') and order.tp_price:
+                tp_price = float(order.tp_price)
+                fig.add_trace(go.Scatter(
+                    x=[df['timestamp'].min(), df['timestamp'].max()],
+                    y=[tp_price, tp_price],
+                    mode='lines',
+                    line=dict(color='lime', width=1, dash='dot'),
+                    name="Take Profit"
+                ))
                 
-                # Find closest candle time
-                closest_time = min(df.index, key=lambda x: abs(x - entry_time))
-                entry_series.loc[closest_time] = float(order.price)
+            if hasattr(order, 'sl_price') and order.sl_price:
+                sl_price = float(order.sl_price)
+                fig.add_trace(go.Scatter(
+                    x=[df['timestamp'].min(), df['timestamp'].max()],
+                    y=[sl_price, sl_price],
+                    mode='lines',
+                    line=dict(color='red', width=1, dash='dot'),
+                    name="Stop Loss"
+                ))
                 
-                ap_entry = mpf.make_addplot(
-                    entry_series,
-                    type='scatter',
-                    marker='^',
-                    markersize=100,
-                    color='lime'
-                )
-                addplots.append(ap_entry)
-
-            # Add reference price line if provided and valid
-            if reference_price is not None:
-                ref_value = float(reference_price)
-                if not pd.isna(ref_value):
-                    ref_series = pd.Series([ref_value] * len(df), index=df.index)
-                    ap_ref = mpf.make_addplot(
-                        ref_series,
-                        type='line',
-                        color='blue',
-                        linestyle='--',
-                        width=1
-                    )
-                    addplots.append(ap_ref)
-
-            # Add opening price line
-            open_series = pd.Series([opening_price] * len(df), index=df.index)
-            ap_open = mpf.make_addplot(
-                open_series,
-                type='line',
-                color='gray',
-                linestyle=':',
-                width=1,
-                alpha=0.5
-            )
-            addplots.append(ap_open)
-
-            # Create plot
-            buf = io.BytesIO()
+            # Add liquidation price for futures orders
+            if order.order_type == OrderType.FUTURES and order.leverage and order.leverage > 1:
+                # Calculate liquidation price based on direction and leverage
+                # This is a simplified calculation - in real trading, the exact liquidation price
+                # depends on maintenance margin requirements which vary by exchange
+                maintenance_margin = 0.005  # 0.5% maintenance margin (typical for Binance)
+                
+                if order.direction == OrderDirection.LONG:
+                    # For long positions: entry_price * (1 - (1 / leverage) + maintenance_margin)
+                    liquidation_price = entry_price * (1 - (1 / order.leverage) + maintenance_margin)
+                else:
+                    # For short positions: entry_price * (1 + (1 / leverage) - maintenance_margin)
+                    liquidation_price = entry_price * (1 + (1 / order.leverage) - maintenance_margin)
+                
+                fig.add_trace(go.Scatter(
+                    x=[df['timestamp'].min(), df['timestamp'].max()],
+                    y=[liquidation_price, liquidation_price],
+                    mode='lines',
+                    line=dict(color='red', width=2, dash='dash'),
+                    name="Liquidation Price"
+                ))
             
-            # Plot configuration with percentages
-            entry_change = ((float(order.price) - opening_price) / opening_price) * 100
-            current_change = ((float(df.iloc[-1]['close']) - opening_price) / opening_price) * 100
-            
-            title = (
-                f"{order.symbol} Trade Analysis ({order.timeframe.value})\n"
-                f"Open: ${opening_price:.2f} | Entry: ${float(order.price):.2f} ({entry_change:+.2f}%)\n"
-                f"Current: ${float(df.iloc[-1]['close']):.2f} ({current_change:+.2f}%)"
+            # Update layout
+            fig.update_layout(
+                title=f"{order.symbol} Trade Chart",
+                xaxis_title="Time",
+                yaxis_title="Price",
+                height=600,
+                template="plotly_dark",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                margin=dict(l=50, r=50, b=100, t=100, pad=4)
             )
-
-            # Generate plot with error handling
-            try:
-                mpf.plot(
-                    df,
-                    type='candle',
-                    style=self.style,
-                    title=title,
-                    ylabel='Price (USDT)',
-                    ylabel_lower='Volume',
-                    volume=True,
-                    figsize=(12, 8),
-                    addplot=addplots,
-                    savefig=dict(fname=buf, dpi=150, bbox_inches='tight')
-                )
-            except Exception as plot_error:
-                logger.error(f"Plot generation error: {plot_error}")
-                return None
-
-            buf.seek(0)
-            return buf.getvalue()
+            
+            # Set y-axes titles
+            fig.update_yaxes(title_text="Price", secondary_y=False)
+            fig.update_yaxes(title_text="Volume", secondary_y=True)
+            
+            # Add info text
+            info_text = self.format_info_text(order, reference_price)
+            
+            # Add annotation with trade info
+            fig.add_annotation(
+                xref="paper", yref="paper",
+                x=0.01, y=0.01,
+                text=info_text,
+                showarrow=False,
+                font=dict(family="Courier New, monospace", size=10, color="white"),
+                align="left",
+                bgcolor="rgba(0,0,0,0.5)",
+                bordercolor="white",
+                borderwidth=1,
+                borderpad=4
+            )
+            
+            # Convert to PNG image
+            img_bytes = fig.to_image(format="png", width=1000, height=600, scale=2)
+            return img_bytes
             
         except Exception as e:
-            logger.error(f"Error generating chart: {e}")
+            logger.error(f"Error generating trade chart: {e}", exc_info=True)
             return None
 
     async def generate_balance_chart(self, 
@@ -694,35 +735,75 @@ class ChartGenerator:
             return None
 
     def format_info_text(self, order: Order, reference_price: Optional[Decimal] = None) -> str:
-        """Format trade information text"""
+        """Format information text for chart annotation"""
         try:
-            info = [
-                f"Trade Details for {order.symbol}:",
-                f"Entry Price: ${float(order.price):.2f}"
-            ]
-            
-            # Safe decimal calculations
+            # Calculate price change from reference if available
+            price_change_text = ""
             if reference_price is not None:
-                order_price = Decimal(str(order.price))
-                change = ((order_price - reference_price) / reference_price) * Decimal('100')
-                info.append(f"Reference Price: ${float(reference_price):.2f} ({float(change):+.2f}%)")
+                price_change = ((order.price / reference_price) - 1) * 100
+                price_change_text = f"Price Change: {price_change:.2f}%\n"
                 
-            info.extend([
-                f"Amount: {float(order.quantity):.8f}",
-                f"Total Value: ${float(order.price * order.quantity)::.2f}",  # Fixed format string here
-                f"Type: {order.order_type.value.upper()}"
-            ])
+            # Format basic order information
+            info_text = (
+                f"Symbol: {order.symbol}\n"
+                f"Type: {order.order_type.value.upper()}\n"
+                f"Price: ${float(order.price):.2f}\n"
+                f"Quantity: {float(order.quantity):.8f}\n"
+                f"Value: ${float(order.price * order.quantity):.2f}\n"
+                f"{price_change_text}"
+            )
             
-            if order.leverage:
-                info.append(f"Leverage: {order.leverage}x")
-            if order.direction:
-                info.append(f"Direction: {order.direction.value.upper()}")
+            # Add threshold information if available
+            if order.threshold is not None and order.timeframe is not None:
+                info_text += f"Threshold: {order.threshold}% ({order.timeframe.value})\n"
                 
-            return "\n".join(info)
+            # Add fee information if available
+            if order.fee is not None:
+                info_text += f"Fee: {float(order.fee):.8f} {order.fee_currency}\n"
+                
+            # Add futures-specific information
+            if order.order_type == OrderType.FUTURES:
+                # Add direction
+                direction = "LONG" if order.direction == OrderDirection.LONG else "SHORT"
+                info_text += f"Direction: {direction}\n"
+                
+                # Add leverage if available
+                if order.leverage is not None:
+                    info_text += f"Leverage: {order.leverage}x\n"
+                
+                # Add margin mode if available
+                if order.margin_mode is not None:
+                    margin_mode = order.margin_mode.upper() if hasattr(order.margin_mode, 'upper') else order.margin_mode
+                    info_text += f"Margin Mode: {margin_mode}\n"
+                
+                # Calculate and add liquidation price if leverage is available
+                if order.leverage and order.leverage > 1:
+                    maintenance_margin = 0.005  # 0.5% maintenance margin (typical for Binance)
+                    
+                    if order.direction == OrderDirection.LONG:
+                        # For long positions: entry_price * (1 - (1 / leverage) + maintenance_margin)
+                        liquidation_price = float(order.price) * (1 - (1 / order.leverage) + maintenance_margin)
+                    else:
+                        # For short positions: entry_price * (1 + (1 / leverage) - maintenance_margin)
+                        liquidation_price = float(order.price) * (1 + (1 / order.leverage) - maintenance_margin)
+                    
+                    info_text += f"Liquidation Price: ${liquidation_price:.2f}\n"
+                
+                # Add position side if available
+                if order.position_side is not None:
+                    position_side = order.position_side if isinstance(order.position_side, str) else order.position_side.value
+                    info_text += f"Position Side: {position_side}\n"
+            
+            # Add timestamp
+            timestamp = order.filled_at if order.filled_at else order.created_at
+            if timestamp:
+                info_text += f"Time: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}"
+                
+            return info_text
             
         except Exception as e:
-            logger.error(f"Error formatting info text: {e}", exc_info=True)  # Added stack trace
-            return "Error generating trade information"
+            logger.error(f"Error formatting info text: {e}")
+            return "Error formatting trade information"
 
     async def generate_simple_chart(self, candles, order, reference_price=None):
         """Generate a simplified chart with minimal features when full chart generation fails"""
@@ -783,3 +864,241 @@ class ChartGenerator:
         except Exception as e:
             logger.error(f"Error in simplified chart generation: {e}", exc_info=True)
             return None
+
+    async def generate_futures_chart(self, 
+                                  candles: List[Dict], 
+                                  order: Order,
+                                  funding_rate: Optional[float] = None,
+                                  position_info: Optional[Dict] = None) -> Optional[bytes]:
+        """Generate a chart specifically for futures trades with additional information"""
+        try:
+            if not self.validate_candle_data(candles):
+                logger.error("Invalid candle data for chart generation")
+                return None
+                
+            if order.order_type != OrderType.FUTURES:
+                logger.warning("Non-futures order provided to generate_futures_chart")
+                return await self.generate_trade_chart(candles, order)
+                
+            # Prepare candle data
+            df = self.prepare_candle_data(candles)
+            
+            # Create figure with secondary y-axis
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
+                               vertical_spacing=0.03, 
+                               subplot_titles=('Price Chart', 'Volume'),
+                               specs=[[{"secondary_y": True}], [{"secondary_y": False}]],
+                               row_heights=[0.8, 0.2])
+            
+            # Add candlestick chart
+            fig.add_trace(go.Candlestick(
+                x=df['timestamp'],
+                open=df['open'],
+                high=df['high'],
+                low=df['low'],
+                close=df['close'],
+                name="Price"
+            ), row=1, col=1)
+            
+            # Add volume bars
+            fig.add_trace(go.Bar(
+                x=df['timestamp'],
+                y=df['volume'],
+                name="Volume",
+                marker_color='rgba(0, 0, 255, 0.3)',
+                opacity=0.3
+            ), row=2, col=1)
+            
+            # Add entry point
+            entry_time = order.filled_at if order.filled_at else order.created_at
+            entry_price = float(order.price)
+            
+            fig.add_trace(go.Scatter(
+                x=[entry_time, entry_time],
+                y=[df['low'].min() * 0.99, df['high'].max() * 1.01],
+                mode='lines',
+                line=dict(color='green' if order.direction == OrderDirection.LONG else 'red', width=2, dash='dash'),
+                name="Entry Point"
+            ), row=1, col=1)
+            
+            fig.add_trace(go.Scatter(
+                x=[df['timestamp'].min(), df['timestamp'].max()],
+                y=[entry_price, entry_price],
+                mode='lines',
+                line=dict(color='green' if order.direction == OrderDirection.LONG else 'red', width=1, dash='dot'),
+                name="Entry Price"
+            ), row=1, col=1)
+            
+            # Add TP/SL lines if present in the order
+            if hasattr(order, 'tp_price') and order.tp_price:
+                tp_price = float(order.tp_price)
+                fig.add_trace(go.Scatter(
+                    x=[df['timestamp'].min(), df['timestamp'].max()],
+                    y=[tp_price, tp_price],
+                    mode='lines',
+                    line=dict(color='lime', width=1, dash='dot'),
+                    name="Take Profit"
+                ), row=1, col=1)
+                
+            if hasattr(order, 'sl_price') and order.sl_price:
+                sl_price = float(order.sl_price)
+                fig.add_trace(go.Scatter(
+                    x=[df['timestamp'].min(), df['timestamp'].max()],
+                    y=[sl_price, sl_price],
+                    mode='lines',
+                    line=dict(color='red', width=1, dash='dot'),
+                    name="Stop Loss"
+                ), row=1, col=1)
+                
+            # Calculate and add liquidation price
+            if order.leverage and order.leverage > 1:
+                # Calculate liquidation price based on direction and leverage
+                maintenance_margin = 0.005  # 0.5% maintenance margin (typical for Binance)
+                
+                if order.direction == OrderDirection.LONG:
+                    # For long positions: entry_price * (1 - (1 / leverage) + maintenance_margin)
+                    liquidation_price = entry_price * (1 - (1 / order.leverage) + maintenance_margin)
+                else:
+                    # For short positions: entry_price * (1 + (1 / leverage) - maintenance_margin)
+                    liquidation_price = entry_price * (1 + (1 / order.leverage) - maintenance_margin)
+                
+                fig.add_trace(go.Scatter(
+                    x=[df['timestamp'].min(), df['timestamp'].max()],
+                    y=[liquidation_price, liquidation_price],
+                    mode='lines',
+                    line=dict(color='red', width=2, dash='dash'),
+                    name="Liquidation Price"
+                ), row=1, col=1)
+            
+            # Add funding rate indicator if provided
+            if funding_rate is not None:
+                # Add a secondary y-axis for funding rate
+                fig.add_trace(go.Scatter(
+                    x=[df['timestamp'].min(), df['timestamp'].max()],
+                    y=[funding_rate * 100, funding_rate * 100],  # Convert to percentage
+                    mode='lines',
+                    line=dict(color='yellow', width=1, dash='dot'),
+                    name=f"Funding Rate: {funding_rate * 100:.4f}%"
+                ), row=1, col=1, secondary_y=True)
+            
+            # Update layout
+            fig.update_layout(
+                title=f"{order.symbol} Futures Chart - {order.direction.value.upper()} {order.leverage}x",
+                xaxis_title="Time",
+                yaxis_title="Price",
+                height=800,
+                template="plotly_dark",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                margin=dict(l=50, r=50, b=100, t=100, pad=4)
+            )
+            
+            # Set y-axes titles
+            fig.update_yaxes(title_text="Price", secondary_y=False, row=1, col=1)
+            if funding_rate is not None:
+                fig.update_yaxes(title_text="Funding Rate (%)", secondary_y=True, row=1, col=1)
+            fig.update_yaxes(title_text="Volume", row=2, col=1)
+            
+            # Add info text
+            info_text = self.format_futures_info_text(order, position_info, funding_rate)
+            
+            # Add annotation with trade info
+            fig.add_annotation(
+                xref="paper", yref="paper",
+                x=0.01, y=0.01,
+                text=info_text,
+                showarrow=False,
+                font=dict(family="Courier New, monospace", size=10, color="white"),
+                align="left",
+                bgcolor="rgba(0,0,0,0.5)",
+                bordercolor="white",
+                borderwidth=1,
+                borderpad=4
+            )
+            
+            # Convert to PNG image
+            img_bytes = fig.to_image(format="png", width=1000, height=800, scale=2)
+            return img_bytes
+            
+        except Exception as e:
+            logger.error(f"Error generating futures chart: {e}", exc_info=True)
+            return None
+
+    def format_futures_info_text(self, order: Order, position_info: Optional[Dict] = None, 
+                              funding_rate: Optional[float] = None) -> str:
+        """Format information text for futures chart annotation"""
+        try:
+            # Direction
+            direction = "LONG" if order.direction == OrderDirection.LONG else "SHORT"
+            
+            # Format basic order information
+            info_text = (
+                f"Symbol: {order.symbol}\n"
+                f"Type: FUTURES {direction}\n"
+                f"Entry Price: ${float(order.price):.2f}\n"
+                f"Quantity: {float(order.quantity):.8f}\n"
+                f"Value: ${float(order.price * order.quantity):.2f}\n"
+                f"Leverage: {order.leverage}x\n"
+                f"Margin Mode: {order.margin_mode.upper() if hasattr(order.margin_mode, 'upper') else order.margin_mode}\n"
+            )
+            
+            # Add position side if available
+            if order.position_side is not None:
+                position_side = order.position_side if isinstance(order.position_side, str) else order.position_side.value
+                info_text += f"Position Side: {position_side}\n"
+            
+            # Calculate liquidation price
+            if order.leverage and order.leverage > 1:
+                maintenance_margin = 0.005  # 0.5% maintenance margin
+                
+                if order.direction == OrderDirection.LONG:
+                    liquidation_price = float(order.price) * (1 - (1 / order.leverage) + maintenance_margin)
+                else:
+                    liquidation_price = float(order.price) * (1 + (1 / order.leverage) - maintenance_margin)
+                
+                info_text += f"Liquidation Price: ${liquidation_price:.2f}\n"
+            
+            # Add TP/SL information if available
+            if hasattr(order, 'tp_price') and order.tp_price:
+                tp_price = float(order.tp_price)
+                tp_pct = ((tp_price / float(order.price)) - 1) * 100
+                tp_pct = tp_pct if order.direction == OrderDirection.LONG else -tp_pct
+                info_text += f"Take Profit: ${tp_price:.2f} ({tp_pct:.2f}%)\n"
+                
+            if hasattr(order, 'sl_price') and order.sl_price:
+                sl_price = float(order.sl_price)
+                sl_pct = ((sl_price / float(order.price)) - 1) * 100
+                sl_pct = sl_pct if order.direction == OrderDirection.LONG else -sl_pct
+                info_text += f"Stop Loss: ${sl_price:.2f} ({sl_pct:.2f}%)\n"
+            
+            # Add funding rate if available
+            if funding_rate is not None:
+                funding_direction = "Pay" if funding_rate > 0 else "Receive"
+                funding_impact = "Negative" if (funding_rate > 0 and order.direction == OrderDirection.LONG) or \
+                                            (funding_rate < 0 and order.direction == OrderDirection.SHORT) else "Positive"
+                info_text += f"Funding Rate: {funding_rate * 100:.4f}% ({funding_direction}, {funding_impact})\n"
+            
+            # Add position information if available
+            if position_info:
+                if 'pnl' in position_info:
+                    pnl = position_info['pnl']
+                    pnl_pct = position_info.get('pnl_percentage', 0)
+                    info_text += f"Current PnL: ${pnl:.2f} ({pnl_pct:.2f}%)\n"
+                
+                if 'margin_ratio' in position_info:
+                    margin_ratio = position_info['margin_ratio']
+                    info_text += f"Margin Ratio: {margin_ratio:.2f}%\n"
+                
+                if 'entry_price' in position_info:
+                    avg_entry = position_info['entry_price']
+                    info_text += f"Avg Entry Price: ${avg_entry:.2f}\n"
+            
+            # Add timestamp
+            timestamp = order.filled_at if order.filled_at else order.created_at
+            if timestamp:
+                info_text += f"Time: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}"
+                
+            return info_text
+            
+        except Exception as e:
+            logger.error(f"Error formatting futures info text: {e}")
+            return "Error formatting futures trade information"
