@@ -87,8 +87,8 @@ class BinanceClient:
             if float(current_balance) < self.reserve_balance:
                 logger.error(
                     f"Initial balance check failed:\n"
-                    f"Current Balance: ${float(current_balance):.2f}\n"
-                    f"Reserve Balance: ${self.reserve_balance:.2f}\n"
+                    f"Current Balance: ${float(current_balance):.2f} {self.base_currency}\n"
+                    f"Reserve Balance: ${self.reserve_balance:.2f} {self.base_currency}\n"
                     f"Trading will be paused until balance is above reserve."
                 )
                 if self.telegram_bot:
@@ -101,8 +101,8 @@ class BinanceClient:
 
             logger.info(
                 f"Initial balance check passed:\n"
-                f"Current Balance: ${float(current_balance):.2f}\n"
-                f"Reserve Balance: ${self.reserve_balance:.2f}"
+                f"Current Balance: ${float(current_balance):.2f} {self.base_currency}\n"
+                f"Reserve Balance: ${self.reserve_balance:.2f} {self.base_currency}"
             )
             return True
 
@@ -592,10 +592,10 @@ class BinanceClient:
                 logger.info(f"[RESERVE CHECK] No valid reserve balance set (value: {self.reserve_balance})")
                 return True
 
-            # Get current balance in base currency (USDT)
+            # Get current balance in base currency
             current_balance = await self.get_balance(self.base_currency)
-            logger.info(f"[RESERVE CHECK] Current balance: ${float(current_balance):,.2f}")
-            logger.info(f"[RESERVE CHECK] Reserve balance: ${float(self.reserve_balance):,.2f}")
+            logger.info(f"[RESERVE CHECK] Current balance: ${float(current_balance):,.2f} {self.base_currency}")
+            logger.info(f"[RESERVE CHECK] Reserve balance: ${float(self.reserve_balance):,.2f} {self.base_currency}")
             
             # Get sum of pending orders
             pending_orders_value = Decimal('0')
@@ -608,9 +608,9 @@ class BinanceClient:
             available_balance = float(current_balance - pending_orders_value)
             remaining_after_order = available_balance - order_amount
 
-            logger.info(f"[RESERVE CHECK] Available after pending: ${available_balance:,.2f}")
-            logger.info(f"[RESERVE CHECK] Remaining after order: ${remaining_after_order:,.2f}")
-            logger.info(f"[RESERVE CHECK] Required reserve: ${float(self.reserve_balance):,.2f}")
+            logger.info(f"[RESERVE CHECK] Available after pending: ${available_balance:.2f} {self.base_currency}")
+            logger.info(f"[RESERVE CHECK] Remaining after order: ${remaining_after_order:.2f} {self.base_currency}")
+            logger.info(f"[RESERVE CHECK] Required reserve: ${float(self.reserve_balance):,.2f} {self.base_currency}")
 
             # Check if remaining balance would be above reserve
             return remaining_after_order >= self.reserve_balance

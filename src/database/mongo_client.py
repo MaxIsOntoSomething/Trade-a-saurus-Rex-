@@ -482,7 +482,15 @@ class MongoClient:
             return []
 
     async def record_balance(self, timestamp: datetime, balance: Decimal, invested: Decimal = None, fees: Decimal = None):
-        """Record balance snapshot for historical tracking"""
+        """
+        Record balance snapshot for historical tracking
+        
+        Args:
+            timestamp: The datetime of the snapshot
+            balance: The current balance in base currency
+            invested: The total amount invested in base currency
+            fees: The total fees paid in base currency
+        """
         try:
             await self.balance_history.insert_one({
                 "timestamp": timestamp,

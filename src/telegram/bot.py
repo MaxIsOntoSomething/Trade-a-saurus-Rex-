@@ -1491,13 +1491,16 @@ Menu:
 
     async def send_reserve_alert(self, current_balance: Decimal, reserve_balance: float, pending_value: Decimal):
         """Send alert when reserve balance would be violated"""
+        # Get base currency from config
+        base_currency = self.config['trading'].get('base_currency', 'USDT')
+        
         available_balance = float(current_balance - pending_value)
         message = (
             "⚠️ Trading Paused - Reserve Balance Protection\n\n"
-            f"Current Balance: ${float(current_balance):.2f}\n"
-            f"Pending Orders: ${float(pending_value)::.2f}\n"
-            f"Available Balance: ${available_balance:.2f}\n"
-            f"Reserve Balance: ${reserve_balance:.2f}\n\n"
+            f"Current Balance: ${float(current_balance):.2f} {base_currency}\n"
+            f"Pending Orders: ${float(pending_value):.2f} {base_currency}\n"
+            f"Available Balance: ${available_balance:.2f} {base_currency}\n"
+            f"Reserve Balance: ${reserve_balance:.2f} {base_currency}\n\n"
             "Trading will resume automatically on next timeframe reset\n"
             "when balance is above reserve requirement."
         )
@@ -1514,15 +1517,18 @@ Menu:
 
     async def send_initial_balance_alert(self, current_balance: Decimal, reserve_balance: float):
         """Send alert when initial balance is below reserve"""
+        # Get base currency from config
+        base_currency = self.config['trading'].get('base_currency', 'USDT')
+        
         message = (
             "⚠️ WARNING - Insufficient Initial Balance\n\n"
-            f"Current Balance: ${float(current_balance):.2f}\n"  # Fixed double colon here
-            f"Required Reserve: ${reserve_balance:.2f}\n\n"
+            f"Current Balance: ${float(current_balance):.2f} {base_currency}\n"
+            f"Required Reserve: ${reserve_balance:.2f} {base_currency}\n\n"
             "Trading is paused until balance is above reserve requirement.\n"
             "You can:\n"
             "1. Add more funds\n"
             "2. Lower reserve balance in config\n"
-            "3. Use /power to check balance and resume"  # Changed from /trading to /power
+            "3. Use /power to check balance and resume"
         )
         
         for user_id in self.allowed_users:
