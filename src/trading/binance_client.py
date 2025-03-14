@@ -1009,15 +1009,20 @@ class BinanceClient:
                 # Standard fee calculation for spot trades
                 fee_amount = trade_value * fee_rate
             
-            # Default fee asset is USDT for most trades
-            fee_asset = "USDT"
+            # Get base currency for fee asset
+            base_currency = self.base_currency or "USDT"  # Default to USDT if base_currency not set
+            
+            # Default fee asset is the base currency for most trades
+            fee_asset = base_currency
             
             logger.info(f"Calculated fees for {symbol} ({order_type}): {float(fee_amount):.4f} {fee_asset} (rate: {float(fee_rate)*100:.4f}%)")
             
             return fee_amount, fee_asset
         except Exception as e:
             logger.error(f"Error calculating fees: {e}")
-            return Decimal('0'), "USDT"  # Default safe values
+            # Use base_currency for default fee asset if available
+            base_currency = self.base_currency or "USDT"
+            return Decimal('0'), base_currency
 
     async def get_historical_benchmark(self, symbol: str, days: int = 90) -> Dict:
         """Get historical performance data for a benchmark asset"""

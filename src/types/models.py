@@ -38,6 +38,6 @@ class Order:
     filled_at: Optional[datetime] = None
     cancelled_at: Optional[datetime] = None
     fees: Decimal = Decimal('0')
-    fee_asset: str = 'USDT'
-    threshold: Optional[float] = None  # Add optional threshold field
-    is_manual: bool = False  # Add this field
+    fee_asset: str = None  # Remove default USDT to make this dynamic
+    threshold: Optional[float] = None
+    is_manual: bool = False

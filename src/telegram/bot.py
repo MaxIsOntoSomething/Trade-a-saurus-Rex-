@@ -351,8 +351,14 @@ Menu:
             OrderStatus.CANCELLED: "⚠️"
         }
         
-        # Calculate total value in USDT
+        # Get base currency from config
+        base_currency = self.config['trading'].get('base_currency', 'USDT')
+        
+        # Calculate total value in base currency
         total_value = order.price * order.quantity
+        
+        # Extract base asset (remove base currency suffix)
+        base_asset = order.symbol.replace(base_currency, '')
         
         # Fix the format specifier
         message = (
@@ -360,9 +366,9 @@ Menu:
             f"Order ID: {order.order_id}\n"
             f"Symbol: {order.symbol}\n"
             f"Status: {status.value.upper()}\n"
-            f"Amount: {float(order.quantity):.8f} {order.symbol.replace('USDT', '')}\n"
+            f"Amount: {float(order.quantity):.8f} {base_asset}\n"
             f"Price: ${float(order.price):.2f}\n"
-            f"Total: ${float(total_value):.2f} USDT\n"  # Fixed format specifier
+            f"Total: ${float(total_value):.2f} {base_currency}\n"
             f"Threshold: {order.threshold if order.threshold else 'Manual'}\n"
             f"Timeframe: {self._get_timeframe_value(order.timeframe)}"
         )
@@ -382,10 +388,13 @@ Menu:
 
     async def send_balance_update(self, symbol: str, change: Decimal):
         """Send balance change notification"""
+        # Get base currency from config
+        base_currency = self.config['trading'].get('base_currency', 'USDT')
+        
         message = (
             f"💰 Balance Update\n"
             f"Symbol: {symbol}\n"
-            f"Change: {change:+.8f} USDT"
+            f"Change: {change:+.8f} {base_currency}"
         )
         
         for user_id in self.allowed_users:
@@ -455,6 +464,12 @@ Menu:
         # Add order ID to sent roars set
         self.sent_roars.add(order.order_id)
         
+        # Get base currency from config
+        base_currency = self.config['trading'].get('base_currency', 'USDT')
+        
+        # Extract base asset (remove base currency suffix)
+        base_asset = order.symbol.replace(base_currency, '')
+        
         # Send chart with full information
         try:
             ref_price = self.binance_client.reference_prices.get(
@@ -469,9 +484,9 @@ Menu:
                 f"🦖 ROARRR! Trade Complete! 💥\n\n"
                 f"Order ID: {order.order_id}\n"
                 f"Symbol: {order.symbol}\n"
-                f"Amount: {float(order.quantity):.8f} {order.symbol.replace('USDT', '')}\n"
+                f"Amount: {float(order.quantity):.8f} {base_asset}\n"
                 f"Price: ${float(order.price):.2f}\n"
-                f"Total: ${float(order.price * order.quantity):.2f} USDT\n"  # Fixed double colon "::" -> ":"
+                f"Total: ${float(order.price * order.quantity):.2f} {base_currency}\n"
                 f"Fees: ${float(order.fees):.4f} {order.fee_asset}\n"
                 f"Threshold: {order.threshold if order.threshold else 'Manual'}\n"
                 f"Timeframe: {self._get_timeframe_value(order.timeframe)}\n\n"
@@ -864,6 +879,9 @@ Menu:
                 await update.message.reply_text("No filled orders found.")
                 return
 
+            # Get the base currency from config
+            base_currency = self.config['trading'].get('base_currency', 'USDT')
+
             # Initialize portfolio totals
             portfolio_stats = {
                 "total_cost": Decimal('0'),
@@ -875,13 +893,13 @@ Menu:
             # Calculate profits for each position
             response = ["📊 Portfolio Analysis:\n"]
 
-            # First show USDT balance
+            # First show base currency balance
             try:
-                usdt_balance = await self.binance_client.get_balance('USDT')
-                response.append(f"💵 USDT Balance: ${usdt_balance:.2f}\n")
+                base_balance = await self.binance_client.get_balance(base_currency)
+                response.append(f"💵 {base_currency} Balance: ${base_balance:.2f}\n")
             except Exception as e:
-                logger.error(f"Failed to get USDT balance: {e}")
-                response.append("💵 USDT Balance: Unable to fetch\n")
+                logger.error(f"Failed to get {base_currency} balance: {e}")
+                response.append(f"💵 {base_currency} Balance: Unable to fetch\n")
 
             # Process each configured symbol
             for symbol in sorted(allowed_symbols):
@@ -902,10 +920,13 @@ Menu:
                 portfolio_stats["total_profit"] += profit_data["absolute_pl"]
                 portfolio_stats["total_tax"] += profit_data["tax_amount"]
                 
+                # Extract base asset name (remove the base currency suffix)
+                base_asset = symbol.replace(base_currency, '')
+                
                 # Generate position message
                 position_msg = [
                     f"\n🔸 {symbol}:",
-                    f"Quantity: {position['total_quantity']:.8f}",
+                    f"Quantity: {position['total_quantity']:.8f} {base_asset}",
                     f"Avg Entry: ${position['avg_entry_price']:.2f}",
                     f"Current: ${current_price:.2f}",
                     f"Value: ${profit_data['current_value']:.2f}",
@@ -937,7 +958,7 @@ Menu:
             if portfolio_stats["total_tax"] > 0:
                 net_profit = portfolio_stats["total_profit"] - portfolio_stats["total_tax"]
                 summary.extend([
-                    f'Total Tax: ${portfolio_stats["total_tax"]:.2f}',  # Changed double quotes to single quotes
+                    f'Total Tax: ${portfolio_stats["total_tax"]:.2f}',
                     f"Net P/L: ${net_profit:.2f}"
                 ])
 
@@ -1963,14 +1984,17 @@ Menu:
                     reply_markup=self.markup
                 )
                 return
+            
+            # Get the base currency from config
+            base_currency = self.config['trading'].get('base_currency', 'USDT')
                 
-            # Get USDT balance
-            usdt_balance = await self.binance_client.get_balance('USDT')
+            # Get base currency balance
+            base_balance = await self.binance_client.get_balance(base_currency)
             
             # Get current prices for all positions to calculate current values
             portfolio_data = []
-            total_value = float(usdt_balance)  # Start with USDT balance
-            asset_values = {'USDT': float(usdt_balance)}
+            total_value = float(base_balance)  # Start with base currency balance
+            asset_values = {base_currency: float(base_balance)}
             
             for symbol, position in positions.items():
                 if float(position['total_quantity']) <= 0:
@@ -1988,14 +2012,14 @@ Menu:
                     total_value += position_value
                     
                     # Store the value for this asset
-                    base_asset = symbol.replace('USDT', '')
+                    base_asset = symbol.replace(base_currency, '')
                     asset_values[base_asset] = position_value
                     
                 except Exception as e:
                     logger.error(f"Error getting price for {symbol}: {e}")
             
             # Generate the chart
-            chart_bytes = await self._create_portfolio_composition_chart(asset_values, total_value)
+            chart_bytes = await self._create_portfolio_composition_chart(asset_values, total_value, base_currency)
             
             if not chart_bytes:
                 await self.app.bot.send_message(
@@ -2029,7 +2053,7 @@ Menu:
                 reply_markup=self.markup
             )
             
-    async def _create_portfolio_composition_chart(self, asset_values: dict, total_value: float) -> Optional[bytes]:
+    async def _create_portfolio_composition_chart(self, asset_values: dict, total_value: float, base_currency: str = 'USDT') -> Optional[bytes]:
         """Create portfolio composition pie chart"""
         try:
             import matplotlib.pyplot as plt
@@ -2060,22 +2084,22 @@ Menu:
             values = [item[1] for item in sorted_items]
             percentages = [(value / total_value * 100) if total_value > 0 else 0 for value in values]
             
-            # Generate colors - ensure USDT is a specific color if present
+            # Generate colors - ensure base currency is a specific color if present
             colors = plt.cm.tab20.colors[:len(labels)]
-            if 'USDT' in labels:
-                usdt_index = labels.index('USDT')
-                # Use a specific color for USDT - light green
+            if base_currency in labels:
+                base_index = labels.index(base_currency)
+                # Use a specific color for base currency - light green
                 colors = list(colors)
-                colors[usdt_index] = (0.2, 0.8, 0.2, 1.0)  # RGBA for green
+                colors[base_index] = (0.2, 0.8, 0.2, 1.0)  # RGBA for green
             
             # Create figure
             plt.figure(figsize=(10, 8))
             
             # Create a slightly more visually appealing pie chart with shadow and explode effect
             explode = [0.05] * len(labels)  # Small explode effect for all pieces
-            if 'USDT' in labels:
-                usdt_index = labels.index('USDT')
-                explode[usdt_index] = 0.1  # Larger explode for USDT
+            if base_currency in labels:
+                base_index = labels.index(base_currency)
+                explode[base_index] = 0.1  # Larger explode for base currency
             
             # Create the pie chart with percentages displayed in legend
             patches, texts, autotexts = plt.pie(
@@ -2106,7 +2130,7 @@ Menu:
                 frameon=False
             )
             
-            plt.title("Portfolio Composition", fontsize=16, pad=20)
+            plt.title(f"Portfolio Composition ({base_currency})", fontsize=16, pad=20)
             plt.tight_layout()
             
             # Save to buffer
