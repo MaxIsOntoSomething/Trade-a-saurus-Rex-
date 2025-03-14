@@ -490,7 +490,7 @@ Menu:
             # Send the message - with chart if available, as text if not
             for user_id in self.allowed_users:
                 try:
-                    if chart_data:
+                    if (chart_data):
                         # Send with chart if available
                         await self.app.bot.send_photo(
                             chat_id=user_id,
@@ -545,7 +545,7 @@ Menu:
 
 Trading Controls:
 /start - Start the bot and show welcome message
-/power - Toggle trading on/off  # Updated command name here
+/power - Toggle trading on/off
 
 Trading Information:
 /balance - Check current balance
@@ -556,6 +556,7 @@ Trading Information:
 
 Trading Actions:
 /add - Add a manual trade (interactive)
+/resetthresholds - Reset all thresholds across timeframes
 
 Menu:
 /menu - Show this command list
@@ -819,7 +820,7 @@ Menu:
                 f"Amount: {float(order.quantity):.8f}\n"
                 f"Price: ${float(order.price):.2f}\n"
                 f"Auto-calculated Fees: ${float(order.fees):.4f} {order.fee_asset}\n"
-                f"Total Value: ${float(order.price * order.quantity):.2f}",
+                f"Total Value: ${float(order.price * order.quantity)::.2f}",
                 reply_markup=self.markup  # Restore original keyboard
             )
             
@@ -1067,7 +1068,7 @@ Menu:
                 f"{leverage_info}\n"
                 f"Amount: {float(order.quantity):.8f}\n"
                 f"Price: ${float(order.price):.2f}\n"
-                f"Auto-calculated Fees: ${float(order.fees):.4f} {order.fee_asset}\n"
+                f"Auto-calculated Fees: ${float(order.fees)::.4f} {order.fee_asset}\n"
                 f"Total Value: ${float(order.price * order.quantity):.2f}",
                 reply_markup=self.markup  # Restore original keyboard
             )
@@ -1375,44 +1376,72 @@ Menu:
 
     async def send_timeframe_reset_notification(self, reset_data: dict):
         """Send notification when a timeframe resets with price information"""
-        emoji_map = {
-            TimeFrame.DAILY: "📅",
-            TimeFrame.WEEKLY: "📆",
-            TimeFrame.MONTHLY: "📊"
-        }
-        
-        timeframe = reset_data["timeframe"]
-        message_parts = [
-            f"{emoji_map.get(timeframe, '🔄')} {timeframe.value.title()} Reset",
-            f"\nOpening Prices:"
-        ]
-        
-        # Add price information for each symbol
-        for price_data in reset_data["prices"]:
-            symbol = price_data["symbol"]
-            current = price_data["current_price"]
-            reference = price_data["reference_price"]
-            change = price_data["price_change"]
+        try:
+            if not self.app or not self.allowed_users:
+                logger.warning("Cannot send timeframe reset notification: Telegram app not initialized or no allowed users")
+                return
+                
+            emoji_map = {
+                TimeFrame.DAILY: "📅",
+                TimeFrame.WEEKLY: "📆",
+                TimeFrame.MONTHLY: "📊"
+            }
             
-            message_parts.append(
-                f"\n{symbol}:"
-                f"\nOpening: ${reference:,.2f}"
-                f"\nCurrent: ${current:,.2f}"
-                f"\nChange: {change:+.2f}%"
-            )
-        
-        message_parts.append(f"\n\nAll {timeframe.value} thresholds have been reset.")
-        
-        # Send to all authorized users
-        for user_id in self.allowed_users:
-            try:
-                await self.app.bot.send_message(
-                    chat_id=user_id,
-                    text="\n".join(message_parts),
-                    reply_markup=self.markup
+            timeframe = reset_data.get("timeframe")
+            if not timeframe:
+                logger.error("Missing timeframe in reset data")
+                return
+                
+            # Get emoji based on timeframe or use default
+            emoji = emoji_map.get(timeframe, "🔄") if hasattr(timeframe, "value") else "🔄"
+            
+            # Get timeframe value, handling both enum and string cases
+            timeframe_value = timeframe.value if hasattr(timeframe, "value") else str(timeframe)
+                
+            message_parts = [
+                f"{emoji} {timeframe_value.title()} Reset",
+                f"\nOpening Prices:"
+            ]
+            
+            # Add price information for each symbol
+            for price_data in reset_data.get("prices", []):
+                symbol = price_data.get("symbol", "Unknown")
+                current = price_data.get("current_price", 0)
+                reference = price_data.get("reference_price", 0)
+                change = price_data.get("price_change", 0)
+                
+                message_parts.append(
+                    f"\n{symbol}:"
+                    f"\nOpening: ${reference:,.2f}"
+                    f"\nCurrent: ${current:,.2f}"
+                    f"\nChange: {change:+.2f}%"
                 )
-            except Exception as e:
-                logger.error(f"Failed to send reset notification to {user_id}: {e}")
+            
+            message_parts.append(f"\n\nAll {timeframe_value} thresholds have been reset.")
+            
+            final_message = "\n".join(message_parts)
+            
+            # Log the full message for debugging
+            logger.info(f"Sending timeframe reset notification: {timeframe_value}")
+            logger.debug(f"Reset notification message: {final_message}")
+            
+            # Send to all authorized users
+            successful_sends = 0
+            for user_id in self.allowed_users:
+                try:
+                    await self.app.bot.send_message(
+                        chat_id=user_id,
+                        text=final_message,
+                        reply_markup=self.markup
+                    )
+                    successful_sends += 1
+                except Exception as e:
+                    logger.error(f"Failed to send reset notification to {user_id}: {e}")
+            
+            logger.info(f"Sent {timeframe_value} reset notification to {successful_sends}/{len(self.allowed_users)} users")
+            
+        except Exception as e:
+            logger.error(f"Error sending timeframe reset notification: {e}", exc_info=True)
 
     async def send_threshold_notification(self, symbol: str, timeframe: TimeFrame, 
                                        threshold: float, current_price: float,
@@ -1570,19 +1599,60 @@ Menu:
             return
         
         try:
-            # Reset daily thresholds
-            await self.binance_client.reset_timeframe_thresholds('daily')
-            
-            # Reset weekly thresholds
-            await self.binance_client.reset_timeframe_thresholds('weekly')
-            
-            # Reset monthly thresholds
-            await self.binance_client.reset_timeframe_thresholds('monthly')
-            
-            await update.message.reply_text(
-                "✅ All thresholds have been reset across all timeframes.",
+            # Send "processing" message
+            progress_message = await update.message.reply_text(
+                "🔄 Processing threshold reset for all timeframes...",
                 reply_markup=self.markup
             )
+            
+            # Log action
+            logger.info(f"User {update.effective_user.id} requested manual reset of all thresholds")
+            
+            # Reset thresholds for each timeframe
+            results = {}
+            timeframes = ['daily', 'weekly', 'monthly']
+            
+            for timeframe in timeframes:
+                try:
+                    # Reset timeframe thresholds
+                    result = await self.binance_client.reset_timeframe_thresholds(timeframe)
+                    results[timeframe] = result
+                    logger.info(f"Reset {timeframe} thresholds: {'Success' if result else 'Failed'}")
+                except Exception as e:
+                    logger.error(f"Error resetting {timeframe} thresholds: {e}")
+                    results[timeframe] = False
+            
+            # Check results and send appropriate message
+            if all(results.values()):
+                await progress_message.edit_text(
+                    "✅ All thresholds have been reset across all timeframes.",
+                    reply_markup=self.markup
+                )
+            else:
+                # Create detailed error message
+                failed_timeframes = [tf for tf, success in results.items() if not success]
+                success_timeframes = [tf for tf, success in results.items() if success]
+                
+                message = "⚠️ Threshold reset partially completed:\n"
+                
+                if success_timeframes:
+                    message += f"✅ Successfully reset: {', '.join(success_timeframes)}\n"
+                if failed_timeframes:
+                    message += f"❌ Failed to reset: {', '.join(failed_timeframes)}\n"
+                
+                message += "\nPlease check logs for more details."
+                
+                await progress_message.edit_text(message, reply_markup=self.markup)
+                
+            # Update the MongoDB database to ensure consistency
+            if self.mongo_client:
+                try:
+                    # Clear all triggered thresholds in database for complete consistency
+                    await self.mongo_client.reset_all_triggered_thresholds()
+                    logger.info("Successfully cleared all triggered thresholds in database")
+                except Exception as e:
+                    logger.error(f"Error clearing triggered thresholds in database: {e}")
+                    
         except Exception as e:
             logger.error(f"Failed to reset all thresholds: {e}")
             await update.message.reply_text(

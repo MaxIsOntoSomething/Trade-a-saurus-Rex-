@@ -236,21 +236,34 @@ class BinanceClient:
                 
                 self.reference_prices[symbol][timeframe] = ref_price or current_price
                 
-                # Clear triggered thresholds
-                if symbol in self.triggered_thresholds:
-                    self.triggered_thresholds[symbol][timeframe] = set()
-                    
-                    # Clear in database as well
-                    if self.telegram_bot and self.telegram_bot.mongo_client:
-                        await self.telegram_bot.mongo_client.save_triggered_threshold(
-                            symbol, timeframe.value, []
-                        )
+                # Standardize the triggered_thresholds structure
+                if symbol not in self.triggered_thresholds:
+                    self.triggered_thresholds[symbol] = {
+                        'daily': set(),
+                        'weekly': set(),
+                        'monthly': set()
+                    }
+                
+                # Clear triggered thresholds - ensure we use the timeframe.value consistently
+                self.triggered_thresholds[symbol][timeframe.value] = set()
+                
+                # Clear in database as well
+                if self.mongo_client:
+                    await self.mongo_client.save_triggered_threshold(
+                        symbol, timeframe.value, []
+                    )
                     
             self.last_reset[timeframe] = now
             
             # Send notification via telegram bot if available
             if self.telegram_bot:
-                await self.telegram_bot.send_timeframe_reset_notification(reset_data)
+                try:
+                    logger.info(f"Sending automatic timeframe reset notification for {timeframe.value}")
+                    await self.telegram_bot.send_timeframe_reset_notification(reset_data)
+                except Exception as e:
+                    logger.error(f"Failed to send automatic reset notification: {e}")
+            else:
+                logger.warning(f"No telegram bot available to send {timeframe.value} reset notification")
             
             return True
             
@@ -411,24 +424,36 @@ class BinanceClient:
     def mark_threshold_triggered(self, symbol: str, timeframe: TimeFrame, threshold: float):
         """Mark a threshold as triggered in memory and persist to database"""
         try:
-            # Initialize if needed
+            # Convert timeframe to value string if it's an enum
+            timeframe_value = timeframe.value if hasattr(timeframe, 'value') else timeframe
+            
+            # Initialize if needed - ensure we have a standardized structure
             if symbol not in self.triggered_thresholds:
-                self.triggered_thresholds[symbol] = {}
-            if timeframe not in self.triggered_thresholds[symbol]:
-                self.triggered_thresholds[symbol][timeframe] = []
+                self.triggered_thresholds[symbol] = {
+                    'daily': set(),
+                    'weekly': set(),
+                    'monthly': set()
+                }
+            
+            # Ensure the timeframe exists in the dictionary
+            if timeframe_value not in self.triggered_thresholds[symbol]:
+                self.triggered_thresholds[symbol][timeframe_value] = set()
                 
             # Add threshold if not already in list
-            if threshold not in self.triggered_thresholds[symbol][timeframe]:
-                self.triggered_thresholds[symbol][timeframe].append(threshold)
-                logger.info(f"Marking threshold {threshold}% as triggered for {symbol} {timeframe.value}")
+            if threshold not in self.triggered_thresholds[symbol][timeframe_value]:
+                self.triggered_thresholds[symbol][timeframe_value].add(threshold)
+                logger.info(f"Marking threshold {threshold}% as triggered for {symbol} {timeframe_value}")
                 
             # Persist to database in background
-            asyncio.create_task(self.mongo_client.save_triggered_threshold(
-                symbol, timeframe, threshold
-            ))
+            if self.mongo_client:
+                threshold_list = list(self.triggered_thresholds[symbol][timeframe_value])
+                asyncio.create_task(self.mongo_client.save_triggered_threshold(
+                    symbol, timeframe_value, threshold_list
+                ))
+                
         except Exception as e:
             logger.error(f"Error marking threshold triggered: {e}")
-            
+
     async def reset_timeframe_thresholds(self, timeframe_str: str):
         """Reset all thresholds for a specific timeframe"""
         try:
@@ -475,19 +500,27 @@ class BinanceClient:
                     "price_change": price_change
                 })
                 
-                # Check if symbol had triggered thresholds to reset
-                if symbol in self.triggered_thresholds and timeframe.value in self.triggered_thresholds[symbol]:
-                    # Only log if there were thresholds to clear
-                    if self.triggered_thresholds[symbol][timeframe.value]:
-                        reset_symbols.append(symbol)
-                        logger.info(f"Cleared thresholds for {symbol} {timeframe.value}: {list(self.triggered_thresholds[symbol][timeframe.value])}")
-                    
-                    # Clear triggered thresholds for this symbol and timeframe
-                    self.triggered_thresholds[symbol][timeframe.value] = set()
+                # Check if symbol had triggered thresholds to reset and standardize the dictionary structure
+                if symbol not in self.triggered_thresholds:
+                    self.triggered_thresholds[symbol] = {
+                        'daily': set(),
+                        'weekly': set(),
+                        'monthly': set()
+                    }
+                
+                # Only log if there were thresholds to clear
+                if timeframe.value in self.triggered_thresholds[symbol] and self.triggered_thresholds[symbol][timeframe.value]:
+                    reset_symbols.append(symbol)
+                    logger.info(f"Cleared thresholds for {symbol} {timeframe.value}: {list(self.triggered_thresholds[symbol][timeframe.value])}")
+                
+                # Clear triggered thresholds for this symbol and timeframe
+                # Ensure we're using a consistent structure
+                self.triggered_thresholds[symbol][timeframe.value] = set()
             
             # Persist changes to database
-            await self.mongo_client.save_reference_prices(self.reference_prices)
-            await self.mongo_client.clear_triggered_thresholds(timeframe)
+            if self.mongo_client:
+                await self.mongo_client.save_reference_prices(self.reference_prices)
+                await self.mongo_client.clear_triggered_thresholds(timeframe)
             
             # Send notification if telegram bot is available
             if reset_data["prices"] and hasattr(self, 'telegram_bot') and self.telegram_bot:
@@ -892,65 +925,6 @@ class BinanceClient:
         except Exception as e:
             logger.error(f"Failed to get historical prices for {symbol}: {e}")
             return []
-
-    def mark_threshold_triggered(self, pair: str, timeframe: str, threshold: float):
-        """Mark a threshold as triggered and persist to database"""
-        # Ensure symbol exists in dictionary
-        if pair not in self.triggered_thresholds:
-            self.triggered_thresholds[pair] = {
-                'daily': set(),
-                'weekly': set(),
-                'monthly': set()
-            }
-            
-        # Ensure timeframe exists in the symbol's dictionary
-        if timeframe not in self.triggered_thresholds[pair]:
-            self.triggered_thresholds[pair][timeframe] = set()
-        
-        # Skip if already triggered
-        if threshold in self.triggered_thresholds[pair][timeframe]:
-            logger.debug(f"Threshold {threshold}% already triggered for {pair} {timeframe}")
-            return False
-        
-        # Mark as triggered
-        self.triggered_thresholds[pair][timeframe].add(threshold)
-        
-        # Save to database - create task but wait for completion to ensure it's saved
-        try:
-            logger.info(f"Marking threshold {threshold}% as triggered for {pair} {timeframe}")
-            if self.mongo_client:
-                asyncio.create_task(
-                    self.mongo_client.save_triggered_threshold(
-                        pair, 
-                        timeframe, 
-                        list(self.triggered_thresholds[pair][timeframe])
-                    )
-                )
-            return True
-        except Exception as e:
-            logger.error(f"Failed to persist threshold {threshold}% for {pair} {timeframe}: {e}")
-            return False
-
-    async def reset_timeframe_thresholds(self, timeframe: str):
-        """Reset thresholds for a specific timeframe and persist to database"""
-        try:
-            # Reset in memory
-            for symbol in self.triggered_thresholds:
-                # Ensure timeframe exists in the symbol's dictionary
-                if timeframe not in self.triggered_thresholds[symbol]:
-                    self.triggered_thresholds[symbol][timeframe] = set()
-                else:
-                    self.triggered_thresholds[symbol][timeframe] = set()
-            
-            # Reset in database
-            if self.mongo_client:
-                await self.mongo_client.reset_timeframe_thresholds(timeframe)
-            
-            logger.info(f"Reset all thresholds for timeframe: {timeframe}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to reset thresholds for {timeframe}: {e}")
-            return False
 
     async def get_current_price(self, symbol: str) -> float:
         """Get the current price for a symbol"""

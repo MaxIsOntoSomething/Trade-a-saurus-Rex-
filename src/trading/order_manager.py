@@ -297,3 +297,48 @@ class OrderManager:
         except Exception as e:
             logger.error(f"Error calculating invested amount: {e}")
             return Decimal('0')
+
+    async def _check_timeframe_resets(self):
+        """Check if any timeframes need to be reset"""
+        try:
+            for timeframe in TimeFrame:
+                reset_occurred = await self.binance_client.check_timeframe_reset(timeframe)
+                if reset_occurred:
+                    logger.info(f"Timeframe {timeframe.value} was reset")
+                    # Additional reset-related tasks can be added here
+        except Exception as e:
+            logger.error(f"Error checking timeframe resets: {e}")
+
+    async def run_trading_cycle(self):
+        """Run one trading cycle"""
+        try:
+            # Skip if trading is paused
+            if (
+                hasattr(self.telegram_bot, "is_paused") and 
+                self.telegram_bot.is_paused
+            ):
+                logger.debug("Trading is paused, skipping cycle")
+                return
+
+            # Check timeframe resets first - ensure this runs before other trading operations
+            await self._check_timeframe_resets()
+            
+            # Process each trading pair
+            for symbol in self.config['trading']['pairs']:
+                if not self.running:
+                    break
+                    
+                # Process the symbol
+                await self.process_symbol(symbol)
+                
+            # Check pending orders
+            pending_count = await self.mongo_client.orders.count_documents(
+                {"status": OrderStatus.PENDING.value}
+            )
+            
+            if pending_count > 0:
+                logger.info(f"Found {pending_count} pending orders, checking status...")
+                await self.monitor_orders()
+                
+        except Exception as e:
+            logger.error(f"Error in trading cycle: {e}", exc_info=True)

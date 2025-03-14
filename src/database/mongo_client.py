@@ -876,4 +876,15 @@ class MongoClient:
             logger.error(f"Error getting portfolio composition: {e}", exc_info=True)
             return {}
 
+    # Add this method to the MongoClient class:
+
+    async def reset_all_triggered_thresholds(self):
+        """Reset all triggered thresholds in the database"""
+        try:
+            result = await self.triggered_thresholds.delete_many({})
+            return result.deleted_count
+        except Exception as e:
+            logger.error(f"Error resetting all triggered thresholds: {e}")
+            return 0
+
     # ...rest of existing code...
