@@ -7,7 +7,7 @@ import logging
 from typing import Dict, List, Optional, Tuple
 import aiohttp
 import json
-from ..types.models import Order, OrderStatus, TimeFrame, OrderType  # Add OrderType
+from ..types.models import Order, OrderStatus, TimeFrame, OrderType, TradeDirection, TakeProfit, StopLoss, TPSLStatus  # Add TP/SL imports
 from ..utils.rate_limiter import RateLimiter
 from ..types.constants import PRECISION, MIN_NOTIONAL, TIMEFRAME_INTERVALS, TRADING_FEES, ORDER_TYPE_FEES
 from ..utils.chart_generator import ChartGenerator
@@ -67,6 +67,30 @@ class BinanceClient:
                     'weekly': set(),
                     'monthly': set()
                 }
+        
+        # Add default TP/SL values
+        self.default_tp_percentage = 0
+        self.default_sl_percentage = 0
+        
+        if config and 'trading' in config:
+            # Parse TP/SL settings from config
+            tp_setting = config['trading'].get('take_profit', '0%')
+            sl_setting = config['trading'].get('stop_loss', '0%')
+            
+            # Extract percentage values (remove % sign and convert to float)
+            try:
+                self.default_tp_percentage = float(tp_setting.strip('%').strip())
+                logger.info(f"[INIT] Take Profit configured: {self.default_tp_percentage}%")
+            except (ValueError, AttributeError):
+                logger.warning(f"[INIT] Invalid Take Profit setting: {tp_setting}, using 0%")
+                self.default_tp_percentage = 0
+                
+            try:
+                self.default_sl_percentage = float(sl_setting.strip('%').strip())
+                logger.info(f"[INIT] Stop Loss configured: {self.default_sl_percentage}%")
+            except (ValueError, AttributeError):
+                logger.warning(f"[INIT] Invalid Stop Loss setting: {sl_setting}, using 0%")
+                self.default_sl_percentage = 0
         
     def set_telegram_bot(self, bot):
         """Set telegram bot for notifications"""
@@ -711,6 +735,10 @@ class BinanceClient:
                 threshold=threshold  # This is now handled by the Order class
             )
             
+            # If the order is considered filled (manual orders), create TP/SL
+            if order.status == OrderStatus.FILLED:
+                await self.create_tp_sl_orders(order)
+            
             return order
             
         except BinanceAPIException as e:
@@ -1148,5 +1176,126 @@ class BinanceClient:
         except Exception as e:
             logger.error(f"Error generating YTD comparison chart: {e}", exc_info=True)
             return None
+
+    async def create_tp_sl_orders(self, order: Order) -> tuple:
+        """Create take profit and stop loss orders for an existing order"""
+        tp_order_id = None
+        sl_order_id = None
+        
+        # Skip if no TP/SL is configured
+        if self.default_tp_percentage <= 0 and self.default_sl_percentage <= 0:
+            logger.info(f"No TP/SL configured, skipping for {order.symbol}")
+            return None, None
+            
+        if not order.filled_at:
+            logger.warning(f"Cannot create TP/SL for unfilled order {order.order_id}")
+            return None, None
+        
+        try:
+            # Calculate TP/SL prices based on entry price and direction
+            is_long = not order.direction or order.direction == TradeDirection.LONG
+            
+            # For spot orders or long futures, TP is above entry, SL is below
+            # For short futures, TP is below entry, SL is above
+            tp_multiplier = 1 + (self.default_tp_percentage / 100) if is_long else 1 - (self.default_tp_percentage / 100)
+            sl_multiplier = 1 - (self.default_sl_percentage / 100) if is_long else 1 + (self.default_sl_percentage / 100)
+            
+            # Calculate TP/SL prices
+            tp_price = order.price * Decimal(str(tp_multiplier))
+            sl_price = order.price * Decimal(str(sl_multiplier))
+            
+            # Round prices to appropriate precision
+            price_precision = self._get_price_precision(order.symbol)
+            tp_price = Decimal(str(round(tp_price, price_precision)))
+            sl_price = Decimal(str(round(sl_price, price_precision)))
+            
+            logger.info(f"Calculated TP/SL for {order.symbol}: Entry={float(order.price)}, TP={float(tp_price)} ({self.default_tp_percentage}%), SL={float(sl_price)} ({self.default_sl_percentage}%)")
+            
+            # Create TP object if applicable
+            if self.default_tp_percentage > 0:
+                order.take_profit = TakeProfit(
+                    price=tp_price,
+                    percentage=self.default_tp_percentage,
+                    status=TPSLStatus.PENDING
+                )
+                
+                # For futures orders, place actual TP order
+                if order.order_type == OrderType.FUTURES:
+                    # Implementation for actual TP order placement would go here
+                    logger.info(f"Placing TP order for {order.symbol} at {float(tp_price)}")
+                    # tp_order_id = "tp_" + order.order_id  # In a real implementation, this would be the actual order ID
+                    # order.take_profit.order_id = tp_order_id
+            
+            # Create SL object if applicable
+            if self.default_sl_percentage > 0:
+                order.stop_loss = StopLoss(
+                    price=sl_price,
+                    percentage=self.default_sl_percentage,
+                    status=TPSLStatus.PENDING
+                )
+                
+                # For futures orders, place actual SL order
+                if order.order_type == OrderType.FUTURES:
+                    # Implementation for actual SL order placement would go here
+                    logger.info(f"Placing SL order for {order.symbol} at {float(sl_price)}")
+                    # sl_order_id = "sl_" + order.order_id  # In a real implementation, this would be the actual order ID
+                    # order.stop_loss.order_id = sl_order_id
+            
+            return tp_order_id, sl_order_id
+            
+        except Exception as e:
+            logger.error(f"Error creating TP/SL orders for {order.symbol}: {e}")
+            return None, None
+
+    # Add method to check TP/SL triggers
+    async def check_tp_sl_triggers(self, order: Order) -> Dict[str, bool]:
+        """Check if take profit or stop loss levels have been triggered"""
+        result = {'tp_triggered': False, 'sl_triggered': False}
+        
+        if not order or order.status != OrderStatus.FILLED:
+            return result
+            
+        # Skip if already triggered
+        if (order.take_profit and order.take_profit.status == TPSLStatus.TRIGGERED) and \
+           (order.stop_loss and order.stop_loss.status == TPSLStatus.TRIGGERED):
+            return result
+            
+        try:
+            # Get current price
+            current_price = await self.get_current_price(order.symbol)
+            if not current_price:
+                logger.warning(f"Failed to get current price for {order.symbol}")
+                return result
+                
+            current_price_dec = Decimal(str(current_price))
+            
+            # Determine trade direction
+            is_long = not order.direction or order.direction == TradeDirection.LONG
+            
+            # Check take profit
+            if order.take_profit and order.take_profit.status == TPSLStatus.PENDING:
+                tp_triggered = (current_price_dec >= order.take_profit.price) if is_long else (current_price_dec <= order.take_profit.price)
+                
+                if tp_triggered:
+                    logger.info(f"🎯 TP triggered for {order.symbol}: Target={float(order.take_profit.price)}, Current={current_price}")
+                    order.take_profit.status = TPSLStatus.TRIGGERED
+                    order.take_profit.triggered_at = datetime.utcnow()
+                    result['tp_triggered'] = True
+            
+            # Check stop loss
+            if order.stop_loss and order.stop_loss.status == TPSLStatus.PENDING:
+                sl_triggered = (current_price_dec <= order.stop_loss.price) if is_long else (current_price_dec >= order.stop_loss.price)
+                
+                if sl_triggered:
+                    logger.info(f"⛔ SL triggered for {order.symbol}: Target={float(order.stop_loss.price)}, Current={current_price}")
+                    order.stop_loss.status = TPSLStatus.TRIGGERED
+                    order.stop_loss.triggered_at = datetime.utcnow()
+                    result['sl_triggered'] = True
+                    
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error checking TP/SL for {order.symbol}: {e}")
+            return result
 
     # ...rest of existing code...

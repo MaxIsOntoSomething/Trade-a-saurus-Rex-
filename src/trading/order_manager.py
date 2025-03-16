@@ -6,7 +6,7 @@ import platform
 from datetime import datetime, timedelta
 from typing import Dict, List
 from decimal import Decimal  # Add the missing Decimal import
-from ..types.models import Order, OrderStatus, TimeFrame
+from ..types.models import Order, OrderStatus, TimeFrame, TPSLStatus
 from ..trading.binance_client import BinanceClient
 from ..database.mongo_client import MongoClient
 from ..telegram.bot import TelegramBot
@@ -32,16 +32,28 @@ class OrderManager:
         logger.info("Starting order monitoring...")
         # Don't await the task, just create and return it
         self.monitor_task = asyncio.create_task(self.monitor_thresholds())
-        return self.monitor_task  # Return the task instead of awaiting it
+        
+        # Add TP/SL monitoring task
+        self.tp_sl_task = asyncio.create_task(self.monitor_tp_sl())
+        
+        return self.monitor_task  # Return the main monitoring task
         
     async def stop(self):
         """Stop the order manager"""
         logger.info("Stopping order monitoring...")
         self.running = False
+        
         if self.monitor_task:
             self.monitor_task.cancel()
             try:
                 await self.monitor_task
+            except asyncio.CancelledError:
+                pass
+                
+        if hasattr(self, 'tp_sl_task') and self.tp_sl_task:
+            self.tp_sl_task.cancel()
+            try:
+                await self.tp_sl_task
             except asyncio.CancelledError:
                 pass
             
@@ -253,6 +265,12 @@ class OrderManager:
                             await self.telegram_bot.send_balance_update(
                                 order.symbol, balance_change
                             )
+                        
+                        # Create TP/SL orders if configured
+                        await self.binance_client.create_tp_sl_orders(order)
+                        # Update order in database with TP/SL information
+                        await self.mongo_client.insert_order(order)
+                        
                         # Send only ROAR notification for filled orders
                         await self.telegram_bot.send_roar(order)
                         
@@ -348,3 +366,58 @@ class OrderManager:
                 
         except Exception as e:
             logger.error(f"Error in trading cycle: {e}", exc_info=True)
+            
+    async def monitor_tp_sl(self):
+        """Monitor take profit and stop loss levels for all active orders"""
+        logger.info("Starting TP/SL monitoring")
+        check_interval = 20  # Check every 20 seconds
+        
+        while self.running:
+            try:
+                # Skip if trading is paused
+                if self.telegram_bot.is_paused:
+                    await asyncio.sleep(check_interval)
+                    continue
+                
+                # Get all orders with active (pending) TP/SL
+                orders = await self.mongo_client.get_orders_with_active_tp_sl()
+                
+                if orders:
+                    logger.info(f"Checking TP/SL for {len(orders)} orders")
+                    
+                    for order in orders:
+                        # Skip if connection issues
+                        if not await self.check_connection_health():
+                            logger.error("Connection health check failed, waiting...")
+                            await asyncio.sleep(30)
+                            break
+                            
+                        # Check TP/SL triggers
+                        triggers = await self.binance_client.check_tp_sl_triggers(order)
+                        
+                        # If anything triggered, update in database and notify
+                        if triggers['tp_triggered'] or triggers['sl_triggered']:
+                            # Update database with new status
+                            await self.mongo_client.update_tp_sl_status(
+                                order_id=order.order_id,
+                                tp_status=order.take_profit.status if triggers['tp_triggered'] else None,
+                                sl_status=order.stop_loss.status if triggers['sl_triggered'] else None,
+                                tp_triggered_at=order.take_profit.triggered_at if triggers['tp_triggered'] else None,
+                                sl_triggered_at=order.stop_loss.triggered_at if triggers['sl_triggered'] else None
+                            )
+                            
+                            # Send notification
+                            if self.telegram_bot:
+                                if triggers['tp_triggered']:
+                                    await self.telegram_bot.send_tp_notification(order)
+                                if triggers['sl_triggered']:
+                                    await self.telegram_bot.send_sl_notification(order)
+                                    
+                        # Add small delay between orders
+                        await asyncio.sleep(0.5)
+                
+            except Exception as e:
+                logger.error(f"Error in TP/SL monitoring: {e}", exc_info=True)
+            
+            # Sleep until next check
+            await asyncio.sleep(check_interval)

@@ -488,6 +488,17 @@ Menu:
                 f"Price: ${float(order.price):.2f}\n"
                 f"Total: ${float(order.price * order.quantity):.2f} {base_currency}\n"
                 f"Fees: ${float(order.fees):.4f} {order.fee_asset}\n"
+            )
+            
+            # Add Take Profit information if configured
+            if order.take_profit:
+                caption += f"Take Profit: ${float(order.take_profit.price):.2f} (+{order.take_profit.percentage:.2f}%)\n"
+                
+            # Add Stop Loss information if configured
+            if order.stop_loss:
+                caption += f"Stop Loss: ${float(order.stop_loss.price):.2f} (-{order.stop_loss.percentage:.2f}%)\n"
+                
+            caption += (
                 f"Threshold: {order.threshold if order.threshold else 'Manual'}\n"
                 f"Timeframe: {self._get_timeframe_value(order.timeframe)}\n\n"
                 f"Check /profits to see your updated portfolio."
@@ -505,34 +516,30 @@ Menu:
             # Send the message - with chart if available, as text if not
             for user_id in self.allowed_users:
                 try:
-                    if (chart_data):
-                        # Send with chart if available
+                    if chart_data:
                         await self.app.bot.send_photo(
                             chat_id=user_id,
                             photo=chart_data,
                             caption=caption
                         )
-                        logger.info(f"Sent ROAR with chart to user {user_id}")
                     else:
-                        # Send text-only message if chart generation failed
-                        text_message = caption + "\n\n⚠️ (Chart generation failed - not enough historical data)"
+                        # Append warning if chart generation failed
+                        full_message = caption + "\n\n⚠️ (Chart generation failed - not enough historical data)"
                         await self.app.bot.send_message(
                             chat_id=user_id,
-                            text=text_message
+                            text=full_message
                         )
-                        logger.info(f"Sent text-only ROAR to user {user_id} due to chart failure")
                 except Exception as e:
-                    logger.error(f"Failed to send ROAR to {user_id}: {e}")
-                    # Last resort fallback - try to send minimal message
+                    logger.error(f"Error sending ROAR to {user_id}: {e}")
                     try:
-                        minimal_msg = f"🦖 Trade Complete! {order.symbol} at ${float(order.price):.2f}"
+                        # Send plain text as fallback
                         await self.app.bot.send_message(
                             chat_id=user_id,
-                            text=minimal_msg
+                            text=caption + "\n\n⚠️ (Chart generation failed)"
                         )
-                    except Exception:
-                        pass  # If even this fails, we've logged the error above
-                    
+                    except Exception as e2:
+                        logger.error(f"Even fallback message failed: {e2}")
+            
             # Cleanup old roar notifications periodically
             if len(self.sent_roars) > 1000:
                 self.sent_roars.clear()
@@ -542,12 +549,16 @@ Menu:
             # Final fallback - try to send a minimal notification
             for user_id in self.allowed_users:
                 try:
-                    await self.app.bot.send_message(
-                        chat_id=user_id,
-                        text=f"🦖 ROAR! {order.symbol} trade completed. Check /profits for details."
+                    simple_message = (
+                        f"🦖 ROARRR! Trade Complete! 💥\n\n"
+                        f"Symbol: {order.symbol}\n"
+                        f"Price: ${float(order.price):.2f}\n"
+                        f"Amount: {float(order.quantity):.8f}\n"
+                        f"Total: ${float(order.price * order.quantity):.2f}"
                     )
+                    await self.app.bot.send_message(chat_id=user_id, text=simple_message)
                 except Exception as e2:
-                    logger.error(f"Even fallback roar failed for {user_id}: {e2}")
+                    logger.error(f"Completely failed to send notification: {e2}")
 
     async def show_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show all available commands with descriptions"""
@@ -2178,3 +2189,139 @@ Menu:
         except Exception as e:
             logger.error(f"Error creating portfolio composition chart: {e}", exc_info=True)
             return None
+
+    async def send_tp_notification(self, order: Order):
+        """Send notification when Take Profit level is triggered"""
+        if not order.take_profit or not order.take_profit.triggered_at:
+            return
+            
+        # Get base currency from config
+        base_currency = self.config['trading'].get('base_currency', 'USDT')
+        
+        # Extract base asset (remove base currency suffix)
+        base_asset = order.symbol.replace(base_currency, '')
+        
+        # Calculate profit
+        entry_price = float(order.price)
+        tp_price = float(order.take_profit.price)
+        quantity = float(order.quantity)
+        profit_amount = (tp_price - entry_price) * quantity
+        profit_percentage = order.take_profit.percentage
+        
+        message = (
+            f"✅ Take Profit Triggered!\n\n"
+            f"Symbol: {order.symbol}\n"
+            f"Entry Price: ${entry_price:.2f}\n"
+            f"TP Price: ${tp_price:.2f}\n"
+            f"Quantity: {quantity:.8f} {base_asset}\n"
+            f"Profit: ${profit_amount:.2f} (+{profit_percentage:.2f}%)\n"
+            f"Triggered at: {order.take_profit.triggered_at.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        
+        for user_id in self.allowed_users:
+            try:
+                await self.app.bot.send_message(
+                    chat_id=user_id,
+                    text=message,
+                    reply_markup=self.markup
+                )
+            except Exception as e:
+                logger.error(f"Failed to send TP notification to {user_id}: {e}")
+
+    async def send_sl_notification(self, order: Order):
+        """Send notification when Stop Loss level is triggered"""
+        if not order.stop_loss or not order.stop_loss.triggered_at:
+            return
+            
+        # Get base currency from config
+        base_currency = self.config['trading'].get('base_currency', 'USDT')
+        
+        # Extract base asset (remove base currency suffix)
+        base_asset = order.symbol.replace(base_currency, '')
+        
+        # Calculate loss
+        entry_price = float(order.price)
+        sl_price = float(order.stop_loss.price)
+        quantity = float(order.quantity)
+        loss_amount = (sl_price - entry_price) * quantity
+        loss_percentage = -order.stop_loss.percentage  # Make negative for display purposes
+        
+        message = (
+            f"⛔ Stop Loss Triggered!\n\n"
+            f"Symbol: {order.symbol}\n"
+            f"Entry Price: ${entry_price:.2f}\n"
+            f"SL Price: ${sl_price:.2f}\n"
+            f"Quantity: {quantity:.8f} {base_asset}\n"
+            f"Loss: ${loss_amount:.2f} ({loss_percentage:.2f}%)\n"
+            f"Triggered at: {order.stop_loss.triggered_at.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        
+        for user_id in self.allowed_users:
+            try:
+                await self.app.bot.send_message(
+                    chat_id=user_id,
+                    text=message,
+                    reply_markup=self.markup
+                )
+            except Exception as e:
+                logger.error(f"Failed to send SL notification to {user_id}: {e}")
+
+    async def send_restored_thresholds_message(self):
+        """Send message about restored thresholds if any"""
+        try:
+            if not self.binance_client or not hasattr(self.binance_client, 'restored_threshold_info'):
+                logger.info("No restored thresholds to notify about")
+                return
+
+            restored_info = self.binance_client.restored_threshold_info
+            
+            # Skip if no thresholds were restored
+            if not restored_info:
+                logger.info("No restored thresholds to notify about (empty)")
+                return
+            
+            # Format the restored thresholds message
+            message = "🔄 *Restored Triggered Thresholds*\n\n"
+            
+            # Handle dictionary format with proper structure
+            has_thresholds = False
+            
+            for symbol, timeframes in restored_info.items():
+                if not timeframes:  # Skip symbols with no timeframes
+                    continue
+                    
+                symbol_message = f"*{symbol}*:\n"
+                symbol_has_thresholds = False
+                
+                for timeframe, thresholds in timeframes.items():
+                    if thresholds:  # Only include if there are thresholds
+                        sorted_thresholds = sorted(thresholds)
+                        threshold_str = ", ".join(f"{t}%" for t in sorted_thresholds)
+                        symbol_message += f"  • {timeframe.value}: {threshold_str}\n"
+                        symbol_has_thresholds = True
+                
+                if symbol_has_thresholds:
+                    message += symbol_message + "\n"
+                    has_thresholds = True
+            
+            # If no thresholds were found in any symbol, return early
+            if not has_thresholds:
+                logger.info("No triggered thresholds to report")
+                return
+                
+            message += "These thresholds will not trigger again until their next reset period."
+            
+            # Send the message to all allowed users
+            for user_id in self.allowed_users:
+                try:
+                    await self.app.bot.send_message(
+                        chat_id=user_id, 
+                        text=message, 
+                        parse_mode="Markdown"
+                    )
+                    logger.info(f"Sent threshold restoration message to user {user_id}")
+                except Exception as e:
+                    logger.error(f"Failed to send threshold restoration message to {user_id}: {e}")
+                    
+        except Exception as e:
+            logger.error(f"Failed to send startup threshold message: {e}")

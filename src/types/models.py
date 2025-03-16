@@ -22,6 +22,28 @@ class TradeDirection(Enum):
     LONG = "long"
     SHORT = "short"
 
+class TPSLStatus(Enum):
+    PENDING = "pending"
+    TRIGGERED = "triggered"
+    CANCELLED = "cancelled"
+    EXPIRED = "expired"
+
+@dataclass
+class TakeProfit:
+    price: Decimal
+    percentage: float
+    status: TPSLStatus = TPSLStatus.PENDING
+    triggered_at: Optional[datetime] = None
+    order_id: Optional[str] = None
+
+@dataclass
+class StopLoss:
+    price: Decimal
+    percentage: float
+    status: TPSLStatus = TPSLStatus.PENDING
+    triggered_at: Optional[datetime] = None
+    order_id: Optional[str] = None
+
 @dataclass
 class Order:
     symbol: str
@@ -41,3 +63,5 @@ class Order:
     fee_asset: str = None  # Remove default USDT to make this dynamic
     threshold: Optional[float] = None
     is_manual: bool = False
+    take_profit: Optional[TakeProfit] = None
+    stop_loss: Optional[StopLoss] = None

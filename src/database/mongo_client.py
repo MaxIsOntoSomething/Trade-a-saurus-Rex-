@@ -1,11 +1,11 @@
 import motor.motor_asyncio
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
-from ..types.models import Order, OrderStatus, TimeFrame, OrderType, TradeDirection  # Add imports
+from ..types.models import Order, OrderStatus, TimeFrame, OrderType, TradeDirection, TPSLStatus, TakeProfit, StopLoss  # Add TPSLStatus and related classes
 from ..types.constants import TAX_RATE, PRICE_PRECISION
-from decimal import Decimal, ROUND_DOWN, InvalidOperation  # Replace DecimalException with InvalidOperation
+from decimal import Decimal, ROUND_DOWN, InvalidOperation
 import logging
-import numpy as np  # Add missing numpy import
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -87,12 +87,35 @@ class MongoClient:
             return None
 
         try:
+            # Serialize take profit data if present
+            tp_data = None
+            if order.take_profit:
+                tp_data = {
+                    "price": str(order.take_profit.price),
+                    "percentage": order.take_profit.percentage,
+                    "status": order.take_profit.status.value,
+                    "triggered_at": order.take_profit.triggered_at,
+                    "order_id": order.take_profit.order_id
+                }
+
+            # Serialize stop loss data if present
+            sl_data = None
+            if order.stop_loss:
+                sl_data = {
+                    "price": str(order.stop_loss.price),
+                    "percentage": order.stop_loss.percentage,
+                    "status": order.stop_loss.status.value,
+                    "triggered_at": order.stop_loss.triggered_at,
+                    "order_id": order.stop_loss.order_id
+                }
+
             order_dict = {
                 "symbol": order.symbol,
                 "status": order.status.value,
+                "order_type": order.order_type.value,
                 "price": str(order.price),
                 "quantity": str(order.quantity),
-                "threshold": float(order.threshold),
+                "threshold": float(order.threshold) if order.threshold else None,
                 "timeframe": order.timeframe.value,
                 "order_id": order.order_id,
                 "created_at": order.created_at,
@@ -102,6 +125,8 @@ class MongoClient:
                 "is_manual": bool(order.is_manual),
                 "filled_at": order.filled_at,
                 "cancelled_at": order.cancelled_at,
+                "take_profit": tp_data,
+                "stop_loss": sl_data,
                 "metadata": {  # Add metadata for better tracking
                     "inserted_at": datetime.utcnow(),
                     "last_checked": datetime.utcnow(),
@@ -363,6 +388,34 @@ class MongoClient:
                 order.leverage = int(doc["leverage"])
             if doc.get("direction"):
                 order.direction = TradeDirection(doc["direction"])
+
+            # Add take profit data if present
+            tp_data = doc.get("take_profit")
+            if tp_data:
+                try:
+                    order.take_profit = TakeProfit(
+                        price=Decimal(tp_data["price"]),
+                        percentage=float(tp_data["percentage"]),
+                        status=TPSLStatus(tp_data["status"]),
+                        triggered_at=tp_data.get("triggered_at"),
+                        order_id=tp_data.get("order_id")
+                    )
+                except (KeyError, ValueError, TypeError) as e:
+                    logger.error(f"Error parsing take profit data for {doc.get('order_id')}: {e}")
+
+            # Add stop loss data if present
+            sl_data = doc.get("stop_loss")
+            if sl_data:
+                try:
+                    order.stop_loss = StopLoss(
+                        price=Decimal(sl_data["price"]),
+                        percentage=float(sl_data["percentage"]),
+                        status=TPSLStatus(sl_data["status"]),
+                        triggered_at=sl_data.get("triggered_at"),
+                        order_id=sl_data.get("order_id")
+                    )
+                except (KeyError, ValueError, TypeError) as e:
+                    logger.error(f"Error parsing stop loss data for {doc.get('order_id')}: {e}")
 
             return order
             
@@ -894,5 +947,64 @@ class MongoClient:
         except Exception as e:
             logger.error(f"Error resetting all triggered thresholds: {e}")
             return 0
+
+    async def update_tp_sl_status(self, order_id: str, tp_status: Optional[TPSLStatus] = None, 
+                                sl_status: Optional[TPSLStatus] = None,
+                                tp_triggered_at: Optional[datetime] = None,
+                                sl_triggered_at: Optional[datetime] = None) -> bool:
+        """Update TP/SL status for an order"""
+        try:
+            update_dict = {"updated_at": datetime.utcnow()}
+            
+            if tp_status:
+                update_dict["take_profit.status"] = tp_status.value
+            if tp_triggered_at:
+                update_dict["take_profit.triggered_at"] = tp_triggered_at
+                
+            if sl_status:
+                update_dict["stop_loss.status"] = sl_status.value
+            if sl_triggered_at:
+                update_dict["stop_loss.triggered_at"] = sl_triggered_at
+            
+            result = await self.orders.update_one(
+                {"order_id": order_id},
+                {"$set": update_dict}
+            )
+            
+            return result.modified_count > 0
+            
+        except Exception as e:
+            logger.error(f"Error updating TP/SL status for order {order_id}: {e}")
+            return False
+
+    async def get_orders_with_active_tp_sl(self) -> List[Order]:
+        """Get all orders with active (pending) TP/SL settings"""
+        try:
+            # Find orders that are filled and have either pending TP or SL
+            query = {
+                "status": OrderStatus.FILLED.value,
+                "$or": [
+                    {"take_profit.status": TPSLStatus.PENDING.value},
+                    {"stop_loss.status": TPSLStatus.PENDING.value}
+                ]
+            }
+            
+            cursor = self.orders.find(query)
+            orders = []
+            
+            async for doc in cursor:
+                try:
+                    order = self._document_to_order(doc)
+                    if order:
+                        orders.append(order)
+                except Exception as e:
+                    logger.error(f"Error processing order with TP/SL: {e}")
+            
+            logger.info(f"Found {len(orders)} orders with active TP/SL")
+            return orders
+            
+        except Exception as e:
+            logger.error(f"Error fetching orders with active TP/SL: {e}")
+            return []
 
     # ...rest of existing code...
