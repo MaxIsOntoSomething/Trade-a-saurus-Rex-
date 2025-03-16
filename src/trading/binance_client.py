@@ -368,57 +368,53 @@ class BinanceClient:
             raise
             
     async def check_thresholds(self, symbol: str, timeframe: TimeFrame) -> List[float]:
-        """Check if any thresholds are triggered for the given symbol and timeframe"""
+        """Check price thresholds for a symbol and timeframe"""
         try:
-            # Skip if trading is paused
-            if hasattr(self, 'telegram_bot') and self.telegram_bot.is_paused:
-                return []
-
-            # Get current price and reference price
-            current_price = await self.get_current_price(symbol)
+            # Get reference price (or calculate if not available)
             reference_price = await self.get_reference_price(symbol, timeframe)
-            
             if not reference_price:
-                logger.warning(f"No reference price for {symbol} on {timeframe.value}")
+                logger.warning(f"No reference price for {symbol} {timeframe.value}")
                 return []
                 
-            # Calculate raw price change percentage (no absolute value)
+            # Get current price
+            current_price = await self.get_current_price(symbol)
+            if not current_price:
+                logger.warning(f"Failed to get current price for {symbol}")
+                return []
+                
+            # Calculate price change as a percentage
             price_change = ((current_price - reference_price) / reference_price) * 100
             
-            # Debug log for price change - show direction
-            logger.debug(f"{symbol} {timeframe.value} price change: {price_change:.2f}%")
+            # Get thresholds for this timeframe
+            thresholds = self.config['trading']['thresholds'][timeframe.value]
             
-            # Get thresholds for the timeframe from config
-            timeframe_thresholds = self.config['trading']['thresholds'][timeframe.value]
+            # Check if we've triggered any thresholds
+            triggered = []
             
-            # Get already triggered thresholds for this symbol and timeframe
-            triggered = set()
-            if symbol in self.triggered_thresholds and timeframe.value in self.triggered_thresholds[symbol]:
-                triggered = self.triggered_thresholds[symbol][timeframe.value]
-            
-            # Check which thresholds are triggered but not yet processed
-            # Only trigger on price decreases (negative price_change)
-            newly_triggered = []
-            for threshold in timeframe_thresholds:
-                # Only trigger when price_change is negative (price decrease) and exceeds threshold
-                if price_change < 0 and abs(price_change) >= threshold and threshold not in triggered:
-                    logger.info(f"Threshold triggered for {symbol}: {threshold}% on {timeframe.value} (Price decrease of {price_change:.2f}%)")
-                    newly_triggered.append(threshold)
+            for threshold in thresholds:
+                # Skip if this threshold has already been triggered
+                if (
+                    symbol in self.triggered_thresholds and
+                    timeframe.value in self.triggered_thresholds[symbol] and
+                    threshold in self.triggered_thresholds[symbol][timeframe.value]
+                ):
+                    continue
                     
-                    # Mark threshold as triggered
-                    self.mark_threshold_triggered(symbol, timeframe, threshold)
+                # Check if price dropped by the threshold percentage or more
+                if price_change <= -threshold:
+                    triggered.append(threshold)
                     
-                    # Send notification if telegram bot is available
+                    # If we have a Telegram bot, send notification
                     if hasattr(self, 'telegram_bot') and self.telegram_bot:
                         await self.telegram_bot.send_threshold_notification(
                             symbol, timeframe, threshold, 
                             current_price, reference_price, price_change
                         )
-                    
-            return newly_triggered
+            
+            return triggered
             
         except Exception as e:
-            logger.error(f"Error checking thresholds for {symbol} on {timeframe.value}: {e}")
+            logger.error(f"Error checking thresholds: {e}")
             return []
 
     def mark_threshold_triggered(self, symbol: str, timeframe: TimeFrame, threshold: float):

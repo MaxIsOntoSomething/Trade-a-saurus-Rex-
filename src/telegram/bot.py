@@ -1468,16 +1468,44 @@ Menu:
                                        threshold: float, current_price: float,
                                        reference_price: float, price_change: float):
         """Send notification when a threshold is triggered"""
-        message = (
-            f"🎯 Threshold Triggered - Price Drop!\n\n"
-            f"Symbol: {symbol}\n"
-            f"Timeframe: {timeframe.value}\n"
-            f"Threshold: {threshold}%\n"
-            f"Reference Price: ${reference_price:,.2f}\n"
-            f"Current Price: ${current_price:,.2f}\n"
-            f"Change: {price_change:+.2f}%\n"
-            f"Action: Buying opportunity detected"
-        )
+        # Check if we have enough balance for an order before sending notification
+        has_enough_balance = False
+        try:
+            # Get order amount from config
+            order_amount = self.config['trading'].get('order_amount', 0)
+            
+            # Check if we have sufficient balance
+            if hasattr(self.binance_client, 'check_reserve_balance'):
+                has_enough_balance = await self.binance_client.check_reserve_balance(order_amount)
+        except Exception as e:
+            logger.error(f"Error checking balance before threshold notification: {e}")
+            # If there's an error checking balance, default to sending the notification
+            has_enough_balance = True
+        
+        # Only send notification if we have enough balance or there was an error checking
+        if has_enough_balance:
+            message = (
+                f"🎯 Threshold Triggered - Price Drop!\n\n"
+                f"Symbol: {symbol}\n"
+                f"Timeframe: {timeframe.value}\n"
+                f"Threshold: {threshold}%\n"
+                f"Reference Price: ${reference_price:,.2f}\n"
+                f"Current Price: ${current_price:,.2f}\n"
+                f"Change: {price_change:+.2f}%\n"
+                f"Action: Buying opportunity detected"
+            )
+        else:
+            # Send a different message when balance is insufficient
+            message = (
+                f"💸 Price Drop Alert (No Action)\n\n"
+                f"Symbol: {symbol}\n"
+                f"Timeframe: {timeframe.value}\n"
+                f"Threshold: {threshold}%\n"
+                f"Reference Price: ${reference_price:,.2f}\n"
+                f"Current Price: ${current_price:,.2f}\n"
+                f"Change: {price_change:+.2f}%\n"
+                f"Action: Insufficient balance - no order placed"
+            )
         
         for user_id in self.allowed_users:
             try:

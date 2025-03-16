@@ -73,6 +73,13 @@ class OrderManager:
             current_price = await self.binance_client.get_current_price(symbol)
             logger.info(f"Current {symbol} price: ${current_price:,.2f}")
             
+            # Check if we have enough balance for at least one order
+            order_amount = self.config['trading']['order_amount']
+            has_enough_balance = await self.binance_client.check_reserve_balance(order_amount)
+            
+            if not has_enough_balance:
+                logger.warning(f"Insufficient balance for orders. Current balance below required amount.")
+                
             # Check thresholds for each timeframe
             for timeframe in TimeFrame:
                 logger.info(f"Checking {timeframe.value} timeframe...")
@@ -84,14 +91,13 @@ class OrderManager:
                 for threshold in triggered_thresholds:
                     logger.info(f"🎯 Trigger: {symbol} {threshold}% on {timeframe.value}")
                     
+                    # Skip order placement if balance is insufficient
+                    if not has_enough_balance:
+                        logger.warning(f"Skipping order for {symbol} at threshold {threshold}% due to insufficient balance")
+                        continue
+                    
                     # Attempt to place an order for this threshold
                     try:
-                        # Check if we have enough balance - pass the order amount
-                        order_amount = self.config['trading']['order_amount']
-                        if not await self.binance_client.check_reserve_balance(order_amount):
-                            logger.warning(f"Insufficient balance to place order for {symbol} at {threshold}%")
-                            continue
-                            
                         # Place buy order
                         order = await self.binance_client.place_limit_buy_order(
                             symbol=symbol,
