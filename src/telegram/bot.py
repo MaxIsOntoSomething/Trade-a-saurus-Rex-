@@ -77,7 +77,8 @@ class TelegramBot:
         self.keyboard = [
             [KeyboardButton("/balance"), KeyboardButton("/stats"), KeyboardButton("/profits")],
             [KeyboardButton("/power"), KeyboardButton("/add"), KeyboardButton("/thresholds")],  # Changed /trading to /power
-            [KeyboardButton("/history"), KeyboardButton("/viz"), KeyboardButton("/menu")]
+            [KeyboardButton("/tp_sl"), KeyboardButton("/history"), KeyboardButton("/viz")],
+            [KeyboardButton("/menu")]
         ]
         self.markup = ReplyKeyboardMarkup(self.keyboard, resize_keyboard=True)
         self.startup_message = f"""
@@ -115,6 +116,11 @@ Status: Ready to ROAR! 🦖
         self.app.add_handler(CommandHandler("thresholds", self.show_thresholds))
         self.app.add_handler(CommandHandler("menu", self.show_menu))
         self.app.add_handler(CommandHandler("resetthresholds", self.reset_all_thresholds))  # Add new command
+        
+        # Add TP/SL command handlers
+        self.app.add_handler(CommandHandler("tp_sl", self.show_tp_sl))
+        self.app.add_handler(CommandHandler("set_tp", self.set_take_profit))
+        self.app.add_handler(CommandHandler("set_sl", self.set_stop_loss))
         
         # Register command handlers
         self.app.add_handler(CommandHandler("start", self.start_command))
@@ -583,6 +589,11 @@ Trading Information:
 Trading Actions:
 /add - Add a manual trade (interactive)
 /resetthresholds - Reset all thresholds across timeframes
+
+Take Profit & Stop Loss:
+/tp_sl - View current TP/SL settings
+/set_tp - Set take profit percentage (example: /set_tp 5)
+/set_sl - Set stop loss percentage (example: /set_sl 3)
 
 Menu:
 /menu - Show this command list
@@ -2265,6 +2276,199 @@ Menu:
                 )
             except Exception as e:
                 logger.error(f"Failed to send SL notification to {user_id}: {e}")
+
+    async def send_restored_thresholds_message(self):
+        """Send message about restored thresholds if any"""
+        try:
+            if not self.binance_client or not hasattr(self.binance_client, 'restored_threshold_info'):
+                logger.info("No restored thresholds to notify about")
+                return
+
+            restored_info = self.binance_client.restored_threshold_info
+            
+            # Skip if no thresholds were restored
+            if not restored_info:
+                logger.info("No restored thresholds to notify about (empty)")
+                return
+            
+            # Format the restored thresholds message
+            message = "🔄 *Restored Triggered Thresholds*\n\n"
+            
+            # Handle dictionary format with proper structure
+            has_thresholds = False
+            
+            for symbol, timeframes in restored_info.items():
+                if not timeframes:  # Skip symbols with no timeframes
+                    continue
+                    
+                symbol_message = f"*{symbol}*:\n"
+                symbol_has_thresholds = False
+                
+                for timeframe, thresholds in timeframes.items():
+                    if thresholds:  # Only include if there are thresholds
+                        sorted_thresholds = sorted(thresholds)
+                        threshold_str = ", ".join(f"{t}%" for t in sorted_thresholds)
+                        symbol_message += f"  • {timeframe.value}: {threshold_str}\n"
+                        symbol_has_thresholds = True
+                
+                if symbol_has_thresholds:
+                    message += symbol_message + "\n"
+                    has_thresholds = True
+            
+            # If no thresholds were found in any symbol, return early
+            if not has_thresholds:
+                logger.info("No triggered thresholds to report")
+                return
+                
+            message += "These thresholds will not trigger again until their next reset period."
+            
+            # Send the message to all allowed users
+            for user_id in self.allowed_users:
+                try:
+                    await self.app.bot.send_message(
+                        chat_id=user_id, 
+                        text=message, 
+                        parse_mode="Markdown"
+                    )
+                    logger.info(f"Sent threshold restoration message to user {user_id}")
+                except Exception as e:
+                    logger.error(f"Failed to send threshold restoration message to {user_id}: {e}")
+                    
+        except Exception as e:
+            logger.error(f"Failed to send startup threshold message: {e}")
+
+    async def show_tp_sl(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show current TP/SL settings"""
+        if not self._is_authorized(update.effective_user.id):
+            await update.message.reply_text("⛔ Unauthorized access")
+            return
+            
+        try:
+            # Get current TP/SL settings from binance client
+            tp_percentage = self.binance_client.default_tp_percentage
+            sl_percentage = self.binance_client.default_sl_percentage
+            
+            # Get all orders with active TP/SL
+            orders_with_tp_sl = await self.mongo_client.get_orders_with_active_tp_sl()
+            
+            message = f"""
+📊 Take Profit & Stop Loss Settings:
+
+Current Default Settings:
+📈 Take Profit: {tp_percentage}%
+📉 Stop Loss: {sl_percentage}%
+
+To change settings:
+/set_tp <percentage> - Example: /set_tp 5
+/set_sl <percentage> - Example: /set_sl 3
+
+"""
+            # Add information about active TP/SL orders if any exist
+            if orders_with_tp_sl:
+                message += f"\nActive TP/SL Orders ({len(orders_with_tp_sl)}):\n"
+                for order in orders_with_tp_sl[:5]:  # Show only first 5 to avoid message too long
+                    entry_price = float(order.price)
+                    tp_price = float(order.take_profit.price) if order.take_profit else 0
+                    sl_price = float(order.stop_loss.price) if order.stop_loss else 0
+                    
+                    message += f"\n{order.symbol}: Entry=${entry_price:.2f}"
+                    if order.take_profit:
+                        message += f" | TP=${tp_price:.2f} (+{order.take_profit.percentage}%)"
+                    if order.stop_loss:
+                        message += f" | SL=${sl_price:.2f} (-{order.stop_loss.percentage}%)"
+                
+                if len(orders_with_tp_sl) > 5:
+                    message += f"\n\n...and {len(orders_with_tp_sl) - 5} more orders"
+            
+            await update.message.reply_text(message)
+            
+        except Exception as e:
+            logger.error(f"Error showing TP/SL settings: {e}", exc_info=True)
+            await update.message.reply_text(f"❌ Error getting TP/SL settings: {str(e)}")
+
+    async def set_take_profit(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Set take profit percentage"""
+        if not self._is_authorized(update.effective_user.id):
+            await update.message.reply_text("⛔ Unauthorized access")
+            return
+            
+        try:
+            # Check if argument is provided
+            if not context.args or len(context.args) < 1:
+                await update.message.reply_text(
+                    "❌ Please provide a percentage value.\nExample: /set_tp 5"
+                )
+                return
+            
+            # Get percentage from args and validate
+            try:
+                tp_percentage = float(context.args[0])
+                if tp_percentage < 0:
+                    await update.message.reply_text("❌ Take profit percentage must be positive")
+                    return
+            except ValueError:
+                await update.message.reply_text("❌ Invalid percentage format. Must be a number.")
+                return
+            
+            # Update binance client
+            old_tp = self.binance_client.default_tp_percentage
+            self.binance_client.default_tp_percentage = tp_percentage
+            
+            # Update config if available
+            if 'trading' in self.config:
+                self.config['trading']['take_profit'] = f"{tp_percentage}%"
+            
+            # Send confirmation
+            await update.message.reply_text(
+                f"✅ Take profit updated from {old_tp}% to {tp_percentage}%\n"
+                f"This will apply to new trades only."
+            )
+            
+        except Exception as e:
+            logger.error(f"Error setting take profit: {e}", exc_info=True)
+            await update.message.reply_text(f"❌ Error setting take profit: {str(e)}")
+
+    async def set_stop_loss(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Set stop loss percentage"""
+        if not self._is_authorized(update.effective_user.id):
+            await update.message.reply_text("⛔ Unauthorized access")
+            return
+            
+        try:
+            # Check if argument is provided
+            if not context.args or len(context.args) < 1:
+                await update.message.reply_text(
+                    "❌ Please provide a percentage value.\nExample: /set_sl 3"
+                )
+                return
+            
+            # Get percentage from args and validate
+            try:
+                sl_percentage = float(context.args[0])
+                if sl_percentage < 0:
+                    await update.message.reply_text("❌ Stop loss percentage must be positive")
+                    return
+            except ValueError:
+                await update.message.reply_text("❌ Invalid percentage format. Must be a number.")
+                return
+            
+            # Update binance client
+            old_sl = self.binance_client.default_sl_percentage
+            self.binance_client.default_sl_percentage = sl_percentage
+            
+            # Update config if available
+            if 'trading' in self.config:
+                self.config['trading']['stop_loss'] = f"{sl_percentage}%"
+            
+            # Send confirmation
+            await update.message.reply_text(
+                f"✅ Stop loss updated from {old_sl}% to {sl_percentage}%\n"
+                f"This will apply to new trades only."
+            )
+            
+        except Exception as e:
+            logger.error(f"Error setting stop loss: {e}", exc_info=True)
+            await update.message.reply_text(f"❌ Error setting stop loss: {str(e)}")
 
     async def send_restored_thresholds_message(self):
         """Send message about restored thresholds if any"""

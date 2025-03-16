@@ -1007,4 +1007,53 @@ class MongoClient:
             logger.error(f"Error fetching orders with active TP/SL: {e}")
             return []
 
+    async def get_position_for_symbol(self, symbol: str) -> Optional[Dict]:
+        """Get position details for a specific symbol"""
+        try:
+            pipeline = [
+                {"$match": {"symbol": symbol, "status": "filled"}},
+                {"$group": {
+                    "_id": "$symbol",
+                    "total_quantity": {"$sum": {"$toDecimal": "$quantity"}},
+                    "total_cost": {
+                        "$sum": {
+                            "$multiply": [
+                                {"$toDecimal": "$quantity"},
+                                {"$toDecimal": "$price"}
+                            ]
+                        }
+                    },
+                    "order_count": {"$sum": 1}
+                }},
+                {"$project": {
+                    "symbol": "$_id",
+                    "total_quantity": {"$toString": "$total_quantity"},
+                    "total_cost": {"$toString": "$total_cost"},
+                    "avg_entry_price": {
+                        "$toString": {
+                            "$cond": [
+                                {"$eq": ["$total_quantity", 0]},
+                                0,
+                                {"$divide": ["$total_cost", "$total_quantity"]}
+                            ]
+                        }
+                    },
+                    "order_count": 1
+                }}
+            ]
+            
+            async for doc in self.orders.aggregate(pipeline):
+                return {
+                    "symbol": doc["_id"],
+                    "total_quantity": Decimal(doc["total_quantity"]),
+                    "total_cost": Decimal(doc["total_cost"]),
+                    "avg_entry_price": Decimal(doc["avg_entry_price"]),
+                    "order_count": doc["order_count"]
+                }
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error getting position for {symbol}: {e}")
+            return None
+
     # ...rest of existing code...

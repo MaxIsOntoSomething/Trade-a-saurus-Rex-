@@ -29,8 +29,9 @@
             "monthly": [10, 20, 30]
         },
         "reserve_balance": 500,
-        "take_profit": "20%",
-        "stop_loss": "10%"
+        "only_lower_entries": true,
+        "take_profit": "5%",
+        "stop_loss": "3%"
     }
 }
 

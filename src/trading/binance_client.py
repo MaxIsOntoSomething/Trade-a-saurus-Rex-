@@ -655,6 +655,21 @@ class BinanceClient:
             ticker = await self.client.get_symbol_ticker(symbol=symbol)
             price = Decimal(ticker['price'])
             
+            # Check if this would raise the average entry price when only_lower_entries is enabled
+            if not is_manual and self.config and 'trading' in self.config and self.config['trading'].get('only_lower_entries', False):
+                # Get existing position average entry price from MongoDB
+                current_avg_price = None
+                if self.mongo_client:
+                    position = await self.mongo_client.get_position_for_symbol(symbol)
+                    if position and 'avg_entry_price' in position:
+                        current_avg_price = Decimal(position['avg_entry_price'])
+                
+                # If we already have a position and current price is higher than avg entry
+                if current_avg_price is not None and price > current_avg_price:
+                    logger.warning(f"Skipping order: Current price ${float(price):.2f} is higher than average entry price ${float(current_avg_price):.2f}")
+                    logger.warning(f"The 'only_lower_entries' protection is enabled")
+                    raise ValueError(f"Current price ${float(price):.2f} would increase average entry of ${float(current_avg_price):.2f}")
+            
             # Original requested amount (for logging if adjustment needed)
             original_amount = amount
             
