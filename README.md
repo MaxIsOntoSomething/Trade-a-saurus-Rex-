@@ -90,6 +90,8 @@ This bot watches for significant price drops in cryptocurrencies and automatical
 - **Optimized MongoDB Queries**: More efficient and robust database operations
 - **Reserve Balance Protection**: Enhanced reserve balance protection to prevent over-trading
 - **Command Improvements**: Added `/resetthresholds` command for manual reset
+- **Lower Entries Protection**: Added protection to prevent increasing average entry price with commands to control it
+- **TP/SL Management**: Added Take Profit and Stop Loss settings with Telegram commands
 
 ## Portfolio Analysis
 
@@ -124,10 +126,7 @@ MIT License
 ## ✅ TODO  
 
 ### 🚀 Work in Progress  
-- 🎯 Introduce percentage-based Take Profit (TP) and Stop Loss (SL) system.  
-- 📉 Add "Only Lower Entries" setting to prevent increasing average entry price.  
-- 📊 Include TP and Sl in Chart Generation.
-- Add commands to toggle lower entry price protection
+- 📊 Include TP and SL in Chart Generation.
 
 ### ✅ Finished  
 - ✅ **Telegram - Open Orders Command**  
@@ -140,6 +139,10 @@ MIT License
 - ✅ **Threshold Persistence**  
 - ✅ **Balance History Charts**  
 - ✅ **Format String Fixes**  
+- ✅ **Percentage-based Take Profit and Stop Loss**  
+- ✅ **"Only Lower Entries" Setting** (prevent increasing average entry price)
+- ✅ **Add commands to toggle lower entry price protection**
+
 ### 📌 Planned  
 - 📌 **Weekly & Monthly Summary (Optional)**  
 - 📌 **More Detailed Explanation of Bot**
