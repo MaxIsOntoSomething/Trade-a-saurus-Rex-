@@ -865,7 +865,7 @@ Menu:
                 f"Amount: {float(order.quantity):.8f}\n"
                 f"Price: ${float(order.price):.2f}\n"
                 f"Auto-calculated Fees: ${float(order.fees):.4f} {order.fee_asset}\n"
-                f"Total Value: ${float(order.price * order.quantity)::.2f}",
+                f"Total Value: ${float(order.price * order.quantity):.2f}",
                 reply_markup=self.markup  # Restore original keyboard
             )
             
@@ -1119,7 +1119,7 @@ Menu:
                 f"{leverage_info}\n"
                 f"Amount: {float(order.quantity):.8f}\n"
                 f"Price: ${float(order.price):.2f}\n"
-                f"Auto-calculated Fees: ${float(order.fees)::.4f} {order.fee_asset}\n"
+                f"Auto-calculated Fees: ${float(order.fees):.4f} {order.fee_asset}\n"
                 f"Total Value: ${float(order.price * order.quantity):.2f}",
                 reply_markup=self.markup  # Restore original keyboard
             )

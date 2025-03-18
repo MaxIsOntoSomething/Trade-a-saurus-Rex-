@@ -709,7 +709,7 @@ class ChartGenerator:
                 
             info.extend([
                 f"Amount: {float(order.quantity):.8f}",
-                f"Total Value: ${float(order.price * order.quantity)::.2f}",  # Fixed format string here
+                f"Total Value: ${float(order.price * order.quantity):.2f}",  # Fixed format string
                 f"Type: {order.order_type.value.upper()}"
             ])
             
