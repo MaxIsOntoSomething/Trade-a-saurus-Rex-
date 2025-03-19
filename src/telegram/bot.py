@@ -235,16 +235,19 @@ Menu:
             await update.message.reply_text("⛔ Unauthorized access")
             return
             
+        # Get base currency from config
+        base_currency = self.config['trading'].get('base_currency', 'USDT')
+        
         # Check reserve balance before resuming
         if not self.is_paused:
-            current_balance = await self.binance_client.get_balance('USDT')
+            current_balance = await self.binance_client.get_balance(base_currency)
             reserve_balance = self.binance_client.reserve_balance or 0  # Default to 0 if None
             
             if float(current_balance) < reserve_balance:
                 await update.message.reply_text(
                     "❌ Cannot resume trading: Balance below reserve requirement\n"
-                    f"Current: ${float(current_balance):.2f}\n"
-                    f"Required: ${reserve_balance:.2f}"
+                    f"Current: ${float(current_balance):.2f} {base_currency}\n"
+                    f"Required: ${reserve_balance:.2f} {base_currency}"
                 )
                 return
                 
@@ -729,11 +732,14 @@ Menu:
             user_data = self.temp_trade_data[update.effective_user.id]
             user_data['order_type'] = OrderType(order_type.lower())
             
+            # Get base currency from config
+            base_currency = self.config['trading'].get('base_currency', 'USDT')
+            
             if order_type == "FUTURES":
                 await update.message.reply_text("Enter leverage (e.g., 5, 10, 20):")
                 return LEVERAGE
             else:
-                await update.message.reply_text("Enter amount in USDT (e.g., 100.50):")
+                await update.message.reply_text(f"Enter amount in {base_currency} (e.g., 100.50):")
                 return AMOUNT
                 
         except Exception as e:
@@ -775,7 +781,10 @@ Menu:
         user_data = self.temp_trade_data[update.effective_user.id]
         user_data['direction'] = TradeDirection(direction.lower())
         
-        await update.message.reply_text("Enter amount in USDT (e.g., 100.50):")
+        # Get base currency from config
+        base_currency = self.config['trading'].get('base_currency', 'USDT')
+        
+        await update.message.reply_text(f"Enter amount in {base_currency} (e.g., 100.50):")
         return AMOUNT
 
     async def add_trade_amount(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -788,7 +797,10 @@ Menu:
             user_data = self.temp_trade_data[update.effective_user.id]
             user_data['amount'] = Decimal(str(amount))
             
-            await update.message.reply_text("Enter entry price (e.g., 42000.50):")
+            # Get base currency from config for clarity in the message
+            base_currency = self.config['trading'].get('base_currency', 'USDT')
+            
+            await update.message.reply_text(f"Enter entry price (e.g., 42000.50) in {base_currency}:")
             return PRICE
             
         except ValueError as e:
@@ -1120,7 +1132,7 @@ Menu:
                 f"Amount: {float(order.quantity):.8f}\n"
                 f"Price: ${float(order.price):.2f}\n"
                 f"Auto-calculated Fees: ${float(order.fees):.4f} {order.fee_asset}\n"
-                f"Total Value: ${float(order.price * order.quantity):.2f}",
+                f"Total Value: ${float(order.price * order.quantity)::.2f}",
                 reply_markup=self.markup  # Restore original keyboard
             )
             
@@ -1264,15 +1276,19 @@ Menu:
                 )
                 return
                 
+            # Get base currency from config
+            base_currency = self.config['trading'].get('base_currency', 'USDT')
+            
             # Send chart to user
             await self.app.bot.send_photo(
                 chat_id=chat_id,
                 photo=chart_bytes,
-                caption="📊 Account Balance History (30 days)\n"
-                        "💹 Green arrows indicate buy orders\n"
-                        "🟢 Green line: Total Balance\n"
-                        "🔵 Blue line: Invested Amount\n"
-                        "🟣 Purple line: Profit (Balance - Invested)",
+                caption=f"📊 Account Balance History (30 days)\n"
+                        f"💹 Green arrows indicate buy orders\n"
+                        f"🟢 Green line: Total Balance\n"
+                        f"🔵 Blue line: Invested Amount\n"
+                        f"🟣 Purple line: Profit (Balance - Invested)\n"
+                        f"All values in {base_currency}",
                 reply_markup=self.markup
             )
             
