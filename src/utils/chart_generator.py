@@ -185,6 +185,34 @@ class ChartGenerator:
                 alpha=0.5
             )
             addplots.append(ap_open)
+            
+            # Add Take Profit line if order has TP configured
+            if order.take_profit and hasattr(order.take_profit, 'price') and order.take_profit.price:
+                tp_price = float(order.take_profit.price)
+                tp_series = pd.Series([tp_price] * len(df), index=df.index)
+                ap_tp = mpf.make_addplot(
+                    tp_series,
+                    type='line',
+                    color='green',  # Green for take profit
+                    linestyle='--',
+                    width=1.5,
+                    secondary_y=False
+                )
+                addplots.append(ap_tp)
+            
+            # Add Stop Loss line if order has SL configured
+            if order.stop_loss and hasattr(order.stop_loss, 'price') and order.stop_loss.price:
+                sl_price = float(order.stop_loss.price)
+                sl_series = pd.Series([sl_price] * len(df), index=df.index)
+                ap_sl = mpf.make_addplot(
+                    sl_series,
+                    type='line',
+                    color='red',  # Red for stop loss
+                    linestyle='--',
+                    width=1.5,
+                    secondary_y=False
+                )
+                addplots.append(ap_sl)
 
             # Create plot
             buf = io.BytesIO()
@@ -193,11 +221,27 @@ class ChartGenerator:
             entry_change = ((float(order.price) - opening_price) / opening_price) * 100
             current_change = ((float(df.iloc[-1]['close']) - opening_price) / opening_price) * 100
             
+            # Add TP/SL info to title if available
             title = (
                 f"{order.symbol} Trade Analysis ({order.timeframe.value})\n"
                 f"Open: ${opening_price:.2f} | Entry: ${float(order.price):.2f} ({entry_change:+.2f}%)\n"
                 f"Current: ${float(df.iloc[-1]['close']):.2f} ({current_change:+.2f}%)"
             )
+            
+            # Additional TP/SL line for title if configured
+            tp_sl_line = ""
+            if order.take_profit and hasattr(order.take_profit, 'price') and order.take_profit.price:
+                tp_price = float(order.take_profit.price)
+                tp_percentage = float(order.take_profit.percentage) if hasattr(order.take_profit, 'percentage') else ((tp_price / float(order.price) - 1) * 100)
+                tp_sl_line += f"TP: ${tp_price:.2f} (+{tp_percentage:.2f}%) "
+                
+            if order.stop_loss and hasattr(order.stop_loss, 'price') and order.stop_loss.price:
+                sl_price = float(order.stop_loss.price)
+                sl_percentage = float(order.stop_loss.percentage) if hasattr(order.stop_loss, 'percentage') else ((1 - sl_price / float(order.price)) * 100)
+                tp_sl_line += f"SL: ${sl_price:.2f} (-{sl_percentage:.2f}%)"
+                
+            if tp_sl_line:
+                title += f"\n{tp_sl_line}"
 
             # Generate plot with error handling
             try:
@@ -713,6 +757,17 @@ class ChartGenerator:
                 f"Type: {order.order_type.value.upper()}"
             ])
             
+            # Add TP/SL information if configured
+            if order.take_profit and hasattr(order.take_profit, 'price') and order.take_profit.price:
+                tp_price = float(order.take_profit.price)
+                tp_percentage = order.take_profit.percentage if hasattr(order.take_profit, 'percentage') else ((tp_price / float(order.price) - 1) * 100)
+                info.append(f"Take Profit: ${tp_price:.2f} (+{tp_percentage:.2f}%)")
+                
+            if order.stop_loss and hasattr(order.stop_loss, 'price') and order.stop_loss.price:
+                sl_price = float(order.stop_loss.price)
+                sl_percentage = order.stop_loss.percentage if hasattr(order.stop_loss, 'percentage') else ((1 - sl_price / float(order.price)) * 100)
+                info.append(f"Stop Loss: ${sl_price:.2f} (-{sl_percentage:.2f}%)")
+            
             if order.leverage:
                 info.append(f"Leverage: {order.leverage}x")
             if order.direction:
@@ -745,11 +800,25 @@ class ChartGenerator:
             ax.plot(dates, closes, 'b-', linewidth=2)
             
             # Add order price as horizontal line
-            ax.axhline(y=float(order.price), color='r', linestyle='--', alpha=0.8, label=f"Order Price: ${float(order.price):,.2f}")
+            ax.axhline(y=float(order.price), color='r', linestyle='--', alpha=0.8, label=f"Entry: ${float(order.price):,.2f}")
             
             # Add reference price if available
             if reference_price is not None:
                 ax.axhline(y=float(reference_price), color='g', linestyle='--', alpha=0.8, label=f"Reference: ${float(reference_price):,.2f}")
+            
+            # Add Take Profit line if configured
+            if order.take_profit and hasattr(order.take_profit, 'price') and order.take_profit.price:
+                tp_price = float(order.take_profit.price)
+                tp_percentage = float(order.take_profit.percentage) if hasattr(order.take_profit, 'percentage') else ((tp_price / float(order.price) - 1) * 100)
+                ax.axhline(y=tp_price, color='green', linestyle='--', alpha=0.8, 
+                          label=f"TP: ${tp_price:,.2f} (+{tp_percentage:.2f}%)")
+            
+            # Add Stop Loss line if configured
+            if order.stop_loss and hasattr(order.stop_loss, 'price') and order.stop_loss.price:
+                sl_price = float(order.stop_loss.price)
+                sl_percentage = float(order.stop_loss.percentage) if hasattr(order.stop_loss, 'percentage') else ((1 - sl_price / float(order.price)) * 100)
+                ax.axhline(y=sl_price, color='red', linestyle='--', alpha=0.8, 
+                          label=f"SL: ${sl_price:,.2f} (-{sl_percentage:.2f}%)")
             
             # Format x-axis to show clean dates
             ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
