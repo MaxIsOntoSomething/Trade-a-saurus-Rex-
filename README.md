@@ -125,10 +125,10 @@ MIT License
 
 ## ✅ TODO  
 
-### 🚀 Work in Progress  
-- 📊 Include TP and SL in Chart Generation.
+
 
 ### ✅ Finished  
+- ✅ **Include TP and SL in Chart Generation.**
 - ✅ **Telegram - Open Orders Command**  
 - ✅ **Reserve Balance**  
 - ✅ **Chart Generation**  
@@ -143,9 +143,6 @@ MIT License
 - ✅ **"Only Lower Entries" Setting** (prevent increasing average entry price)
 - ✅ **Add commands to toggle lower entry price protection**
 
-### 📌 Planned  
-- 📌 **Weekly & Monthly Summary (Optional)**  
-- 📌 **More Detailed Explanation of Bot**
 
  Readme**
 
