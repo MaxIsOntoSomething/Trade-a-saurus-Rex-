@@ -92,6 +92,12 @@ class BinanceClient:
                 logger.warning(f"[INIT] Invalid Stop Loss setting: {sl_setting}, using 0%")
                 self.default_sl_percentage = 0
         
+        # Add tracking of invalid symbols
+        self.invalid_symbols = set()
+        
+        # Initialize thresholds dictionary with nested structure to track triggered thresholds
+        self.triggered_thresholds = {}
+        
     def set_telegram_bot(self, bot):
         """Set telegram bot for notifications"""
         self.telegram_bot = bot
@@ -175,6 +181,13 @@ class BinanceClient:
             
         # Add initial balance check
         await self.check_initial_balance()
+
+        # Load previously identified invalid symbols from database
+        if self.mongo_client:
+            invalid_symbols = await self.mongo_client.get_invalid_symbols()
+            self.invalid_symbols = set(invalid_symbols)
+            if invalid_symbols:
+                logger.info(f"Loaded {len(invalid_symbols)} known invalid symbols: {', '.join(invalid_symbols)}")
 
     async def restore_threshold_state(self):
         """Restore triggered thresholds from database on startup"""
@@ -359,30 +372,43 @@ class BinanceClient:
     async def update_reference_prices(self, symbols: List[str]):
         """Update reference prices for all timeframes"""
         try:
-            for symbol in symbols:
+            # Filter out known invalid symbols
+            valid_symbols = [symbol for symbol in symbols if symbol not in self.invalid_symbols]
+            
+            for symbol in valid_symbols:
                 if (symbol not in self.reference_prices):
                     self.reference_prices[symbol] = {}
                     self.triggered_thresholds[symbol] = {tf: [] for tf in TimeFrame}
 
-                # Get current price first
-                await self.rate_limiter.acquire()
-                ticker = await self.client.get_symbol_ticker(symbol=symbol)
-                current_price = float(ticker['price'])
+                # Get current price first with better error handling
+                try:
+                    await self.rate_limiter.acquire()
+                    ticker = await self.client.get_symbol_ticker(symbol=symbol)
+                    current_price = float(ticker['price'])
 
-                # Print symbol header and current price together
-                logger.info(f"\n=== Checking {symbol} ===")
-                logger.info(f"Current price for {symbol}: ${current_price:,.2f}")
-
-                # Process each timeframe
-                for timeframe in TimeFrame:
-                    logger.info(f"  ▶ Getting {timeframe.value} reference price")
-                    ref_price = await self.get_reference_price(symbol, timeframe)
-                    
-                    if ref_price is not None:
-                        self.reference_prices[symbol][timeframe] = ref_price
+                    # Print symbol header and current price together
+                    logger.info(f"\n=== Checking {symbol} ===")
+                    logger.info(f"Current price for {symbol}: ${current_price:,.2f}")
+                
+                    # Process each timeframe
+                    for timeframe in TimeFrame:
+                        logger.info(f"  ▶ Getting {timeframe.value} reference price")
+                        ref_price = await self.get_reference_price(symbol, timeframe)
+                        
+                        if ref_price is not None:
+                            self.reference_prices[symbol][timeframe] = ref_price
+                        else:
+                            logger.warning(f"    Using current price as {timeframe.value} reference")
+                            self.reference_prices[symbol][timeframe] = current_price
+                except BinanceAPIException as e:
+                    if e.code == -1121:  # Invalid symbol
+                        logger.error(f"Invalid symbol: {symbol}. Adding to invalid symbols list.")
+                        self.invalid_symbols.add(symbol)
+                        if self.mongo_client:
+                            await self.mongo_client.save_invalid_symbol(symbol, str(e))
+                        continue
                     else:
-                        logger.warning(f"    Using current price as {timeframe.value} reference")
-                        self.reference_prices[symbol][timeframe] = current_price
+                        raise
 
                 # Add small delay between symbols
                 await asyncio.sleep(0.1)
@@ -1316,5 +1342,85 @@ class BinanceClient:
         except Exception as e:
             logger.error(f"Error checking TP/SL for {order.symbol}: {e}")
             return result
+
+    async def check_connection(self) -> dict:
+        """Check connection to Binance and return status data for health checks"""
+        try:
+            # Test connection
+            await self.client.ping()
+            
+            # Get server time to verify working connection
+            time_resp = await self.client.get_server_time()
+            server_time = datetime.fromtimestamp(time_resp['serverTime']/1000)
+            
+            # Get account info
+            account = await self.client.get_account()
+            balances = {
+                asset['asset']: float(asset['free']) 
+                for asset in account['balances'] 
+                if float(asset['free']) > 0
+            }
+            
+            # Default to USDT if base_currency is not specified
+            base_cur = self.base_currency or 'USDT'
+            base_balance = balances.get(base_cur, 0)
+            
+            return {
+                "status": "connected",
+                "server_time": server_time.isoformat(),
+                "base_currency": base_cur,
+                "base_balance": base_balance,
+                "reserve_balance": self.reserve_balance,
+                "balances": balances,
+                "is_paused": self.telegram_bot.is_paused if self.telegram_bot else True,
+                "invalid_symbols": list(self.invalid_symbols)
+            }
+        except Exception as e:
+            logger.error(f"Connection check failed: {e}")
+            return {
+                "status": "error",
+                "error": str(e)
+            }
+
+    async def check_symbol_validity(self, symbol: str) -> bool:
+        """Check if a symbol is valid on Binance"""
+        # Return early if already known to be invalid
+        if symbol in self.invalid_symbols:
+            logger.debug(f"Symbol {symbol} previously identified as invalid, skipping check")
+            return False
+            
+        try:
+            # Try to get symbol ticker, which will fail if symbol is invalid
+            await self.rate_limiter.acquire()
+            await self.client.get_symbol_ticker(symbol=symbol)
+            return True
+        except BinanceAPIException as e:
+            if e.code == -1121:  # Invalid symbol error code
+                logger.warning(f"Invalid symbol detected: {symbol}")
+                self.invalid_symbols.add(symbol)
+                
+                # Save to database if possible
+                if self.mongo_client:
+                    await self.mongo_client.save_invalid_symbol(symbol, str(e))
+                return False
+            else:
+                # For other errors, treat as a temporary issue
+                logger.error(f"Error checking symbol {symbol}: {e}")
+                return True  # Consider valid for now, in case of temporary API issues
+        except Exception as e:
+            logger.error(f"Unexpected error checking symbol {symbol}: {e}")
+            return True  # Consider valid for now
+            
+    async def filter_valid_symbols(self, symbols: List[str]) -> List[str]:
+        """Filter out invalid symbols from a list"""
+        valid_symbols = []
+        for symbol in symbols:
+            if await self.check_symbol_validity(symbol):
+                valid_symbols.append(symbol)
+                
+        filtered_count = len(symbols) - len(valid_symbols)
+        if filtered_count > 0:
+            logger.info(f"Filtered out {filtered_count} invalid symbols, {len(valid_symbols)} symbols remaining")
+        return valid_symbols
 
     # ...rest of existing code...

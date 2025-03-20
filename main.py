@@ -153,12 +153,38 @@ async def check_initial_connection(binance_client: BinanceClient, config: dict) 
         logger.info("=" * 50)
         logger.info("✅ Successfully connected to Binance")
         
-        # Get prices for all configured pairs
-        for symbol in config['trading']['pairs']:
-            ticker = await binance_client.client.get_symbol_ticker(symbol=symbol)
-            price = float(ticker['price'])
-            logger.info(f"🔸 Current {symbol} Price: ${price:,.2f}")
+        # Check validity of all configured pairs
+        valid_pairs = []
+        invalid_pairs = []
         
+        for symbol in config['trading']['pairs']:
+            try:
+                ticker = await binance_client.client.get_symbol_ticker(symbol=symbol)
+                price = float(ticker['price'])
+                logger.info(f"🔸 Current {symbol} Price: ${price:,.2f}")
+                valid_pairs.append(symbol)
+            except Exception as e:
+                error_message = str(e)
+                if "APIError(code=-1121): Invalid symbol" in error_message:
+                    logger.warning(f"❌ Invalid symbol: {symbol} - Removing from trading pairs.")
+                    invalid_pairs.append(symbol)
+                    # Track invalid symbol
+                    binance_client.invalid_symbols.add(symbol)
+                    if binance_client.mongo_client:
+                        await binance_client.mongo_client.save_invalid_symbol(symbol, error_message)
+                else:
+                    logger.error(f"❌ Error checking {symbol}: {e}")
+        
+        # Update config with only valid pairs
+        if invalid_pairs:
+            logger.warning(f"Removed {len(invalid_pairs)} invalid pairs: {', '.join(invalid_pairs)}")
+            config['trading']['pairs'] = valid_pairs
+            
+        if not valid_pairs:
+            logger.error("❌ No valid trading pairs found. Check your configuration.")
+            return False
+            
+        logger.info(f"✅ Found {len(valid_pairs)} valid trading pairs: {', '.join(valid_pairs)}")
         logger.info("=" * 50)
         return True
     except Exception as e:
@@ -170,12 +196,27 @@ async def check_initial_connection(binance_client: BinanceClient, config: dict) 
 async def initialize_services(config):
     """Initialize all services with updated Binance API structure"""
     try:
-        # Initialize MongoDB client
+        logger.info("Initializing services...")
+        
+        # Create MongoDB client
         mongo_client = MongoClient(
             uri=config['mongodb']['uri'],
             database=config['mongodb']['database']
         )
-        await mongo_client.init_indexes()  # Initialize database indexes
+        await mongo_client.init_indexes()
+        
+        # Ensure we use a consistent base currency throughout
+        base_currency = config['trading'].get('base_currency', 'USDT')
+        
+        # Log important configuration information
+        logger.info(f"Base Currency: {base_currency}")
+        logger.info(f"Reserve Balance: ${config['trading'].get('reserve_balance', 0):,.2f}")
+        logger.info(f"Trading Pairs: {', '.join(config['trading']['pairs'])}")
+        
+        # Check for USDC vs USDT consistency
+        for pair in config['trading']['pairs']:
+            if not pair.endswith(base_currency):
+                logger.warning(f"Pair {pair} doesn't use {base_currency} as base currency. This might cause issues.")
         
         # Determine which API keys to use based on use_testnet setting
         use_testnet = config['binance']['use_testnet']

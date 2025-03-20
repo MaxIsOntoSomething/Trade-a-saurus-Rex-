@@ -18,6 +18,7 @@ class MongoClient:
         self.threshold_state = self.db.threshold_state  # Add collection for threshold state
         self.thresholds = self.db.thresholds  # Add this line for thresholds collection
         self.reference_prices = self.db.reference_prices  # Add this line for reference prices collection
+        self.invalid_symbols = self.db.invalid_symbols  # Add collection for invalid symbols
 
     async def init_indexes(self):
         await self.orders.create_index("order_id", unique=True)
@@ -36,6 +37,9 @@ class MongoClient:
         
         # Add index for reference prices
         await self.reference_prices.create_index([("symbol", 1), ("timeframe", 1)], unique=True)
+        
+        # Add index for invalid symbols
+        await self.invalid_symbols.create_index("symbol", unique=True)
         
         logger.info("Database indexes initialized")
 
@@ -89,7 +93,7 @@ class MongoClient:
         try:
             # Check if order with this ID already exists
             existing_order = await self.orders.find_one({"order_id": order.order_id})
-            if existing_order:
+            if (existing_order):
                 logger.info(f"Order {order.order_id} already exists, updating instead of inserting")
                 
                 # Serialize take profit data if present
@@ -1103,5 +1107,45 @@ class MongoClient:
         except Exception as e:
             logger.error(f"Error getting position for {symbol}: {e}")
             return None
+
+    async def save_invalid_symbol(self, symbol: str, error_message: str = None):
+        """Save an invalid symbol to the database"""
+        try:
+            await self.invalid_symbols.update_one(
+                {"symbol": symbol},
+                {"$set": {
+                    "symbol": symbol,
+                    "error_message": error_message,
+                    "last_checked": datetime.utcnow(),
+                    "check_count": 1
+                }},
+                upsert=True
+            )
+            logger.info(f"Marked {symbol} as invalid in database")
+            return True
+        except Exception as e:
+            logger.error(f"Error saving invalid symbol {symbol}: {e}")
+            return False
+            
+    async def get_invalid_symbols(self) -> list:
+        """Get all invalid symbols from the database"""
+        try:
+            cursor = self.invalid_symbols.find({})
+            symbols = []
+            async for doc in cursor:
+                symbols.append(doc["symbol"])
+            return symbols
+        except Exception as e:
+            logger.error(f"Error getting invalid symbols: {e}")
+            return []
+            
+    async def check_symbol_validity(self, symbol: str) -> bool:
+        """Check if a symbol is marked as invalid in database"""
+        try:
+            doc = await self.invalid_symbols.find_one({"symbol": symbol})
+            return doc is None  # Return True if symbol is not in invalid collection
+        except Exception as e:
+            logger.error(f"Error checking symbol validity for {symbol}: {e}")
+            return True  # Default to assuming symbol is valid on error
 
     # ...rest of existing code...

@@ -24,6 +24,9 @@ class OrderManager:
         self.monitor_task = None
         self.check_interval = 60  # 60 seconds between checks
         logger.setLevel(logging.DEBUG)  # Add this line
+        
+        # Check if running in Docker environment
+        self.running_in_docker = os.environ.get('RUNNING_IN_DOCKER', 'false').lower() == 'true'
         self.clear_command = 'cls' if platform.system() == 'Windows' else 'clear'
         
     async def start(self):
@@ -74,8 +77,11 @@ class OrderManager:
     async def process_symbol(self, symbol: str):
         """Process a single symbol for threshold checking"""
         try:
-            logger.info(f"\n=== Processing {symbol} ===")
-            
+            # Skip invalid symbols
+            if symbol in self.binance_client.invalid_symbols:
+                logger.debug(f"Skipping known invalid symbol: {symbol}")
+                return
+                
             # Skip if trading is paused
             if hasattr(self.binance_client, 'telegram_bot') and self.binance_client.telegram_bot.is_paused:
                 logger.info(f"Trading is paused, skipping {symbol}")
@@ -143,8 +149,9 @@ class OrderManager:
 
         while self.running:
             try:
-                # Clear terminal at start of new cycle
-                os.system(self.clear_command)
+                # Only clear terminal if not running in Docker
+                if not self.running_in_docker:
+                    os.system(self.clear_command)
                 
                 current_time = time.time()
                 time_since_last = current_time - last_check
@@ -183,10 +190,16 @@ class OrderManager:
                 if not self.telegram_bot.is_paused:
                     logger.info("\n" + "="*50)
                     logger.info("Starting price check cycle")
-                    symbols = self.config['trading']['pairs']
+                    
+                    # Get configured symbols, filtering out invalid ones
+                    configured_symbols = self.config['trading']['pairs']
+                    valid_symbols = [s for s in configured_symbols if s not in self.binance_client.invalid_symbols]
+                    
+                    if len(valid_symbols) < len(configured_symbols):
+                        logger.info(f"Processing {len(valid_symbols)} valid symbols (skipping {len(configured_symbols) - len(valid_symbols)} invalid)")
 
                     # Process symbols sequentially to maintain log order
-                    for symbol in symbols:
+                    for symbol in valid_symbols:
                         await self.process_symbol(symbol)
                         await asyncio.sleep(0.5)  # Small delay between symbols
 
