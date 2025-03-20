@@ -7,6 +7,7 @@ import logging
 from typing import Dict, List, Optional, Tuple
 import aiohttp
 import json
+import re  # Add import for regex support
 from ..types.models import Order, OrderStatus, TimeFrame, OrderType, TradeDirection, TakeProfit, StopLoss, TPSLStatus  # Add TP/SL imports
 from ..utils.rate_limiter import RateLimiter
 from ..types.constants import PRECISION, MIN_NOTIONAL, TIMEFRAME_INTERVALS, TRADING_FEES, ORDER_TYPE_FEES
@@ -110,6 +111,9 @@ class BinanceClient:
         
         # Initialize thresholds dictionary with nested structure to track triggered thresholds
         self.triggered_thresholds = {}
+        
+        # Add regex pattern for valid Binance symbols
+        self.valid_symbol_pattern = re.compile(r'^[A-Z0-9\-.]{1,20}$')
         
     def set_telegram_bot(self, bot):
         """Set telegram bot for notifications"""
@@ -270,50 +274,65 @@ class BinanceClient:
                 "prices": []
             }
             
-            # Get opening prices for all symbols
+            # Get opening prices for all symbols, with format pre-validation
             for symbol in self.reference_prices.keys():
-                ticker = await self.client.get_symbol_ticker(symbol=symbol)
-                current_price = float(ticker['price'])
-                ref_price = await self.get_reference_price(symbol, timeframe)
-                
-                price_data = {
-                    "symbol": symbol,
-                    "current_price": current_price,
-                    "reference_price": ref_price,
-                    "price_change": ((current_price - ref_price) / ref_price * 100) if ref_price else 0
-                }
-                reset_data["prices"].append(price_data)
-                
-                self.reference_prices[symbol][timeframe] = ref_price or current_price
-                
-                # Standardize the triggered_thresholds structure
-                if symbol not in self.triggered_thresholds:
-                    self.triggered_thresholds[symbol] = {
-                        'daily': set(),
-                        'weekly': set(),
-                        'monthly': set()
+                # Skip invalid symbols
+                if not self._is_valid_symbol_format(symbol) or symbol in self.invalid_symbols:
+                    continue
+                    
+                try:
+                    ticker = await self.client.get_symbol_ticker(symbol=symbol)
+                    current_price = float(ticker['price'])
+                    ref_price = await self.get_reference_price(symbol, timeframe)
+                    
+                    price_data = {
+                        "symbol": symbol,
+                        "current_price": current_price,
+                        "reference_price": ref_price,
+                        "price_change": ((current_price - ref_price) / ref_price * 100) if ref_price else 0
                     }
-                
-                # Clear triggered thresholds - ensure we use the timeframe.value consistently
-                self.triggered_thresholds[symbol][timeframe.value] = set()
-                
-                # Clear in database as well
-                if self.mongo_client:
-                    await self.mongo_client.save_triggered_threshold(
-                        symbol, timeframe.value, []
-                    )
+                    reset_data["prices"].append(price_data)
+                    
+                    self.reference_prices[symbol][timeframe] = ref_price or current_price
+                    
+                    # Standardize the triggered_thresholds structure
+                    if symbol not in self.triggered_thresholds:
+                        self.triggered_thresholds[symbol] = {
+                            'daily': set(),
+                            'weekly': set(),
+                            'monthly': set()
+                        }
+                    
+                    # Clear triggered thresholds - ensure we use the timeframe.value consistently
+                    self.triggered_thresholds[symbol][timeframe.value] = set()
+                    
+                    # Clear in database as well
+                    if self.mongo_client:
+                        await self.mongo_client.save_triggered_threshold(
+                            symbol, timeframe.value, []
+                        )
+                except BinanceAPIException as e:
+                    if e.code == -1121 or e.code == -1100:
+                        logger.warning(f"Invalid symbol during reset: {symbol}, skipping")
+                        self.invalid_symbols.add(symbol)
+                        if self.mongo_client:
+                            await self.mongo_client.save_invalid_symbol(symbol, str(e))
+                    else:
+                        logger.error(f"API error during reset for {symbol}: {e}")
+                except Exception as e:
+                    logger.error(f"Error during reset for {symbol}: {e}")
                     
             self.last_reset[timeframe] = now
             
             # Send notification via telegram bot if available
-            if self.telegram_bot:
+            if self.telegram_bot and reset_data["prices"]:
                 try:
                     logger.info(f"Sending automatic timeframe reset notification for {timeframe.value}")
                     await self.telegram_bot.send_timeframe_reset_notification(reset_data)
                 except Exception as e:
                     logger.error(f"Failed to send automatic reset notification: {e}")
             else:
-                logger.warning(f"No telegram bot available to send {timeframe.value} reset notification")
+                logger.warning(f"No telegram bot available or no valid prices to send {timeframe.value} reset notification")
             
             return True
             
@@ -350,8 +369,13 @@ class BinanceClient:
         return int(reference.timestamp() * 1000)  # Convert to milliseconds
 
     async def get_reference_price(self, symbol: str, timeframe: TimeFrame) -> float:
-        """Get reference price for symbol at timeframe"""
+        """Get reference price for symbol at timeframe with format validation"""
         try:
+            # Validate symbol format first
+            if not self._is_valid_symbol_format(symbol) or symbol in self.invalid_symbols:
+                logger.warning(f"Invalid symbol format or known invalid: {symbol}")
+                return None
+                
             # Use the current candle's open price instead of historical data
             interval_map = {
                 TimeFrame.DAILY: '1d',    # Daily candle
@@ -378,20 +402,37 @@ class BinanceClient:
                 logger.warning(f"No kline data for {symbol} {timeframe.value}")
                 return None
                 
+        except BinanceAPIException as e:
+            if e.code == -1121 or e.code == -1100:
+                logger.warning(f"Invalid symbol during reference price check: {symbol}")
+                self.invalid_symbols.add(symbol)
+                if self.mongo_client:
+                    await self.mongo_client.save_invalid_symbol(symbol, str(e))
+                return None
+            else:
+                logger.error(f"Failed to get reference price for {symbol} {timeframe.value}: {e}", exc_info=True)
+                return None
         except Exception as e:
             logger.error(f"Failed to get reference price for {symbol} {timeframe.value}: {e}", exc_info=True)
             return None
 
     async def update_reference_prices(self, symbols: List[str]):
-        """Update reference prices for all timeframes"""
+        """Update reference prices for all timeframes with symbol pre-validation"""
         try:
             # Filter out known invalid symbols
             valid_symbols = [symbol for symbol in symbols if symbol not in self.invalid_symbols]
             
+            # Also filter by format before attempting API calls
+            valid_symbols = [symbol for symbol in valid_symbols if self._is_valid_symbol_format(symbol)]
+            
             for symbol in valid_symbols:
                 if (symbol not in self.reference_prices):
                     self.reference_prices[symbol] = {}
-                    self.triggered_thresholds[symbol] = {tf: [] for tf in TimeFrame}
+                    self.triggered_thresholds[symbol] = {
+                        'daily': set(),
+                        'weekly': set(),
+                        'monthly': set()
+                    }
 
                 # Get current price first with better error handling
                 try:
@@ -414,7 +455,7 @@ class BinanceClient:
                             logger.warning(f"    Using current price as {timeframe.value} reference")
                             self.reference_prices[symbol][timeframe] = current_price
                 except BinanceAPIException as e:
-                    if e.code == -1121:  # Invalid symbol
+                    if e.code == -1121 or e.code == -1100:  # Added -1100 error code
                         logger.error(f"Invalid symbol: {symbol}. Adding to invalid symbols list.")
                         self.invalid_symbols.add(symbol)
                         if self.mongo_client:
@@ -431,8 +472,13 @@ class BinanceClient:
             raise
             
     async def check_thresholds(self, symbol: str, timeframe: TimeFrame) -> List[float]:
-        """Check price thresholds for a symbol and timeframe"""
+        """Check price thresholds for a symbol and timeframe with format validation"""
         try:
+            # Validate symbol format first
+            if not self._is_valid_symbol_format(symbol) or symbol in self.invalid_symbols:
+                logger.warning(f"Invalid symbol format or known invalid: {symbol}")
+                return []
+                
             # Get reference price (or calculate if not available)
             reference_price = await self.get_reference_price(symbol, timeframe)
             if not reference_price:
@@ -1023,11 +1069,21 @@ class BinanceClient:
             return []
 
     async def get_current_price(self, symbol: str) -> float:
-        """Get the current price for a symbol"""
+        """Get the current price for a symbol with enhanced validation"""
         try:
             # First check if it's a known invalid symbol
             if symbol in self.invalid_symbols:
                 logger.debug(f"Skipping known invalid symbol: {symbol}")
+                return None
+                
+            # Validate symbol format before sending API request
+            if not self._is_valid_symbol_format(symbol):
+                logger.warning(f"Invalid symbol format: {symbol}. Adding to invalid symbols list.")
+                self.invalid_symbols.add(symbol)
+                
+                # Save to database if possible
+                if self.mongo_client:
+                    await self.mongo_client.save_invalid_symbol(symbol, "Invalid symbol format")
                 return None
                 
             await self.rate_limiter.acquire()
@@ -1035,7 +1091,7 @@ class BinanceClient:
             return float(ticker['price'])
         except BinanceAPIException as e:
             # Check specifically for invalid symbol error
-            if e.code == -1121:  # Invalid symbol error code
+            if e.code == -1121 or e.code == -1100:  # Add code -1100 for illegal character errors
                 logger.warning(f"Invalid symbol detected: {symbol}. Adding to invalid symbols list.")
                 self.invalid_symbols.add(symbol)
                 
@@ -1427,10 +1483,20 @@ class BinanceClient:
             }
 
     async def check_symbol_validity(self, symbol: str) -> bool:
-        """Check if a symbol is valid on Binance"""
+        """Check if a symbol is valid on Binance with format pre-validation"""
         # Return early if already known to be invalid
         if symbol in self.invalid_symbols:
             logger.debug(f"Symbol {symbol} previously identified as invalid, skipping check")
+            return False
+            
+        # First check symbol format before making an API call
+        if not self._is_valid_symbol_format(symbol):
+            logger.warning(f"Invalid symbol format: {symbol}")
+            self.invalid_symbols.add(symbol)
+            
+            # Save to database if possible
+            if self.mongo_client:
+                await self.mongo_client.save_invalid_symbol(symbol, "Invalid symbol format")
             return False
             
         try:
@@ -1439,7 +1505,7 @@ class BinanceClient:
             await self.client.get_symbol_ticker(symbol=symbol)
             return True
         except BinanceAPIException as e:
-            if e.code == -1121:  # Invalid symbol error code
+            if e.code == -1121 or e.code == -1100:  # Add code -1100 for illegal character errors
                 logger.warning(f"Invalid symbol detected: {symbol}")
                 self.invalid_symbols.add(symbol)
                 
@@ -1456,9 +1522,21 @@ class BinanceClient:
             return True  # Consider valid for now
             
     async def filter_valid_symbols(self, symbols: List[str]) -> List[str]:
-        """Filter out invalid symbols from a list"""
+        """Filter out invalid symbols from a list with format pre-validation"""
         valid_symbols = []
         for symbol in symbols:
+            # First check format without API call
+            if not self._is_valid_symbol_format(symbol):
+                logger.debug(f"Filtering out invalid symbol format: {symbol}")
+                
+                # Add to invalid symbols list
+                if symbol not in self.invalid_symbols:
+                    self.invalid_symbols.add(symbol)
+                    if self.mongo_client:
+                        await self.mongo_client.save_invalid_symbol(symbol, "Invalid symbol format")
+                continue
+                
+            # Then check validity with API
             if await self.check_symbol_validity(symbol):
                 valid_symbols.append(symbol)
                 
@@ -1466,5 +1544,9 @@ class BinanceClient:
         if filtered_count > 0:
             logger.info(f"Filtered out {filtered_count} invalid symbols, {len(valid_symbols)} symbols remaining")
         return valid_symbols
+
+    def _is_valid_symbol_format(self, symbol: str) -> bool:
+        """Check if symbol format is valid according to Binance requirements"""
+        return bool(self.valid_symbol_pattern.match(symbol))
 
     # ...rest of existing code...

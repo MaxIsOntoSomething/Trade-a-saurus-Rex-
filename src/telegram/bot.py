@@ -2514,7 +2514,6 @@ To change this setting:
         except Exception as e:
             logger.error(f"Error creating portfolio composition chart: {e}", exc_info=True)
             return None
-
     async def send_tp_notification(self, order: Order):
         """Send notification when Take Profit level is triggered"""
         if not order.take_profit or not order.take_profit.triggered_at:
@@ -3448,3 +3447,4 @@ To change this setting:
         except Exception as e:
             logger.error(f"Error creating portfolio composition chart: {e}", exc_info=True)
             return None
+

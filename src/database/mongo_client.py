@@ -1123,16 +1123,23 @@ class MongoClient:
             return None
 
     async def save_invalid_symbol(self, symbol: str, error_message: str = None):
-        """Save an invalid symbol to the database"""
+        """Save an invalid symbol to the database with better error handling"""
         try:
+            if not symbol:  # Skip empty symbols
+                return False
+                
+            now = datetime.utcnow()
             await self.invalid_symbols.update_one(
                 {"symbol": symbol},
                 {"$set": {
                     "symbol": symbol,
                     "error_message": error_message,
-                    "last_checked": datetime.utcnow(),
-                    "check_count": 1
-                }},
+                    "last_checked": now,
+                    "updated_at": now
+                },
+                "$inc": {"check_count": 1},  # Increment check count
+                "$setOnInsert": {"created_at": now}  # Set creation time only on first insert
+                },
                 upsert=True
             )
             logger.info(f"Marked {symbol} as invalid in database")
@@ -1148,6 +1155,7 @@ class MongoClient:
             symbols = []
             async for doc in cursor:
                 symbols.append(doc["symbol"])
+            logger.info(f"Loaded {len(symbols)} invalid symbols from database")
             return symbols
         except Exception as e:
             logger.error(f"Error getting invalid symbols: {e}")
@@ -1156,6 +1164,9 @@ class MongoClient:
     async def check_symbol_validity(self, symbol: str) -> bool:
         """Check if a symbol is marked as invalid in database"""
         try:
+            if not symbol:  # Skip empty symbols
+                return False
+                
             doc = await self.invalid_symbols.find_one({"symbol": symbol})
             return doc is None  # Return True if symbol is not in invalid collection
         except Exception as e:
