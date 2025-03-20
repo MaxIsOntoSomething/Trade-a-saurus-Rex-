@@ -89,6 +89,12 @@ class OrderManager:
                 
             # Get current price
             current_price = await self.binance_client.get_current_price(symbol)
+            
+            # Check if price is None (could happen with invalid symbols)
+            if current_price is None:
+                logger.warning(f"Unable to get current price for {symbol}, skipping")
+                return
+                
             logger.info(f"Current {symbol} price: ${current_price:,.2f}")
             
             # Check if we have enough balance for at least one order
@@ -107,7 +113,7 @@ class OrderManager:
                 
                 # Process each triggered threshold
                 for threshold in triggered_thresholds:
-                    logger.info(f"🎯 Trigger: {symbol} {threshold}% on {timeframe.value}")
+                    logger.info(f"🎯 Processing trigger: {symbol} {threshold}% on {timeframe.value}")
                     
                     # Skip order placement if balance is insufficient
                     if not has_enough_balance:

@@ -461,11 +461,16 @@ class BinanceClient:
                     timeframe.value in self.triggered_thresholds[symbol] and
                     threshold in self.triggered_thresholds[symbol][timeframe.value]
                 ):
+                    logger.debug(f"Threshold {threshold}% for {symbol} {timeframe.value} already triggered, skipping")
                     continue
                     
                 # Check if price dropped by the threshold percentage or more
                 if price_change <= -threshold:
                     triggered.append(threshold)
+                    logger.info(f"✅ Threshold triggered: {symbol} {threshold}% on {timeframe.value}")
+                    
+                    # Mark threshold as triggered immediately after detection
+                    await self.mark_threshold_triggered(symbol, timeframe, threshold)
                     
                     # If we have a Telegram bot, send notification
                     if hasattr(self, 'telegram_bot') and self.telegram_bot:
@@ -477,10 +482,10 @@ class BinanceClient:
             return triggered
             
         except Exception as e:
-            logger.error(f"Error checking thresholds: {e}")
+            logger.error(f"Error checking thresholds: {e}", exc_info=True)
             return []
 
-    def mark_threshold_triggered(self, symbol: str, timeframe: TimeFrame, threshold: float):
+    async def mark_threshold_triggered(self, symbol: str, timeframe: TimeFrame, threshold: float):
         """Mark a threshold as triggered in memory and persist to database"""
         try:
             # Convert timeframe to value string if it's an enum
@@ -503,15 +508,24 @@ class BinanceClient:
                 self.triggered_thresholds[symbol][timeframe_value].add(threshold)
                 logger.info(f"Marking threshold {threshold}% as triggered for {symbol} {timeframe_value}")
                 
-            # Persist to database in background
-            if self.mongo_client:
-                threshold_list = list(self.triggered_thresholds[symbol][timeframe_value])
-                asyncio.create_task(self.mongo_client.save_triggered_threshold(
-                    symbol, timeframe_value, threshold_list
-                ))
+                # Persist to database immediately with await instead of background task
+                if self.mongo_client:
+                    threshold_list = list(self.triggered_thresholds[symbol][timeframe_value])
+                    try:
+                        success = await self.mongo_client.save_triggered_threshold(
+                            symbol, timeframe_value, threshold_list
+                        )
+                        if success:
+                            logger.info(f"Successfully saved triggered threshold state to database for {symbol} {timeframe_value}")
+                        else:
+                            logger.error(f"Failed to save triggered threshold state to database for {symbol} {timeframe_value}")
+                    except Exception as db_error:
+                        logger.error(f"Error saving threshold state to database: {db_error}", exc_info=True)
+            else:
+                logger.debug(f"Threshold {threshold}% already marked as triggered for {symbol} {timeframe_value}")
                 
         except Exception as e:
-            logger.error(f"Error marking threshold triggered: {e}")
+            logger.error(f"Error marking threshold triggered: {e}", exc_info=True)
 
     async def reset_timeframe_thresholds(self, timeframe_str: str):
         """Reset all thresholds for a specific timeframe"""
@@ -1011,9 +1025,26 @@ class BinanceClient:
     async def get_current_price(self, symbol: str) -> float:
         """Get the current price for a symbol"""
         try:
+            # First check if it's a known invalid symbol
+            if symbol in self.invalid_symbols:
+                logger.debug(f"Skipping known invalid symbol: {symbol}")
+                return None
+                
             await self.rate_limiter.acquire()
             ticker = await self.client.get_symbol_ticker(symbol=symbol)
             return float(ticker['price'])
+        except BinanceAPIException as e:
+            # Check specifically for invalid symbol error
+            if e.code == -1121:  # Invalid symbol error code
+                logger.warning(f"Invalid symbol detected: {symbol}. Adding to invalid symbols list.")
+                self.invalid_symbols.add(symbol)
+                
+                # Save to database if possible
+                if self.mongo_client:
+                    await self.mongo_client.save_invalid_symbol(symbol, str(e))
+            else:
+                logger.error(f"Failed to get current price for {symbol}: {e}")
+            return None
         except Exception as e:
             logger.error(f"Failed to get current price for {symbol}: {e}")
             return None

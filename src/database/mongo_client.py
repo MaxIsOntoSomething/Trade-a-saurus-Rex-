@@ -659,36 +659,50 @@ class MongoClient:
             logger.error(f"Error getting buy orders: {e}")
             return []
 
-    async def save_triggered_threshold(self, symbol: str, timeframe: TimeFrame, threshold: float):
-        """Save a triggered threshold to the database"""
+    async def save_triggered_threshold(self, symbol: str, timeframe: str, thresholds: list):
+        """Save triggered thresholds to database for persistence"""
         try:
-            # Convert TimeFrame enum to string value to prevent BSON serialization errors
+            # Convert timeframe to string if it's an enum to prevent BSON encoding errors
             timeframe_value = timeframe.value if hasattr(timeframe, 'value') else str(timeframe)
             
-            # Prepare document
-            doc = {
-                'symbol': symbol,
-                'timeframe': timeframe_value,
-                'threshold': threshold,
-                'triggered_at': datetime.utcnow()
-            }
+            # Convert thresholds to float to ensure consistent storage
+            thresholds_float = [float(t) for t in thresholds]
             
-            # Use upsert to avoid duplicates
-            await self.thresholds.update_one(
-                {
-                    'symbol': symbol,
-                    'timeframe': timeframe_value,
-                    'threshold': threshold
-                },
-                {'$set': doc},
+            # Use upsert to create or update
+            result = await self.threshold_state.update_one(
+                {"symbol": symbol, "timeframe": timeframe_value},
+                {"$set": {
+                    "symbol": symbol,
+                    "timeframe": timeframe_value,
+                    "thresholds": thresholds_float, 
+                    "updated_at": datetime.utcnow()
+                }},
                 upsert=True
             )
             
-            logger.debug(f"Saved triggered threshold: {symbol} {timeframe_value} {threshold}%")
+            logger.info(f"Saved threshold state for {symbol} {timeframe_value}: {thresholds_float} "
+                       f"(modified: {result.modified_count}, upserted: {result.upserted_id is not None})")
             return True
         except Exception as e:
-            logger.error(f"Error saving triggered threshold: {e}")
+            logger.error(f"Failed to save threshold state: {e}", exc_info=True)
             return False
+            
+    async def check_triggered_threshold(self, symbol: str, timeframe: str, threshold: float) -> bool:
+        """Check if a specific threshold is already triggered for a symbol/timeframe"""
+        try:
+            timeframe_value = timeframe.value if hasattr(timeframe, 'value') else str(timeframe)
+            threshold_float = float(threshold)
+            
+            doc = await self.threshold_state.find_one({
+                "symbol": symbol, 
+                "timeframe": timeframe_value,
+                "thresholds": {"$in": [threshold_float]}
+            })
+            
+            return doc is not None
+        except Exception as e:
+            logger.error(f"Error checking triggered threshold: {e}")
+            return False  # Default to false on error to prevent double-triggers
 
     async def get_all_triggered_thresholds(self):
         """Get all triggered thresholds from the database"""
