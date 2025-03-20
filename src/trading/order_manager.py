@@ -160,16 +160,23 @@ class OrderManager:
                 now = datetime.now()
                 if (now - last_balance_record).total_seconds() > 3600:  # 1 hour in seconds
                     try:
-                        # Get current balance
-                        balance = await self.binance_client.get_balance()
+                        # Get current balance - explicitly use the configured base currency
+                        base_currency = self.binance_client.base_currency
+                        balance = await self.binance_client.get_balance(base_currency)
                         
-                        # Calculate invested amount
+                        # Get total invested amount - Fix: use the correct method name
                         invested = await self.calculate_invested_amount()
                         
-                        # Record to database
-                        await self.mongo_client.record_balance(now, balance, invested)
+                        # Record balance to MongoDB
+                        if self.mongo_client:
+                            await self.mongo_client.record_balance(
+                                now, balance, invested
+                            )
+                            
+                        # Log with the proper currency
+                        logger.info(f"Recorded balance: ${float(balance):.2f} {base_currency}, Invested: ${float(invested):.2f}")
+                        
                         last_balance_record = now
-                        logger.info(f"Recorded balance: ${float(balance):.2f}, Invested: ${float(invested):.2f}")
                     except Exception as e:
                         logger.error(f"Failed to record balance: {e}")
 

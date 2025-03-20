@@ -228,17 +228,17 @@ class ChartGenerator:
                 f"Current: ${float(df.iloc[-1]['close']):.2f} ({current_change:+.2f}%)"
             )
             
-            # Additional TP/SL line for title if configured
+            # Additional TP/SL line for title - Remove dollar signs to avoid parsing issues
             tp_sl_line = ""
             if order.take_profit and hasattr(order.take_profit, 'price') and order.take_profit.price:
                 tp_price = float(order.take_profit.price)
                 tp_percentage = float(order.take_profit.percentage) if hasattr(order.take_profit, 'percentage') else ((tp_price / float(order.price) - 1) * 100)
-                tp_sl_line += f"TP: ${tp_price:.2f} (+{tp_percentage:.2f}%) "
+                tp_sl_line += f"TP: {tp_price:.2f} (+{tp_percentage:.2f}%) "
                 
             if order.stop_loss and hasattr(order.stop_loss, 'price') and order.stop_loss.price:
                 sl_price = float(order.stop_loss.price)
                 sl_percentage = float(order.stop_loss.percentage) if hasattr(order.stop_loss, 'percentage') else ((1 - sl_price / float(order.price)) * 100)
-                tp_sl_line += f"SL: ${sl_price:.2f} (-{sl_percentage:.2f}%)"
+                tp_sl_line += f"SL: {sl_price:.2f} (-{sl_percentage:.2f}%)"
                 
             if tp_sl_line:
                 title += f"\n{tp_sl_line}"
@@ -806,19 +806,19 @@ class ChartGenerator:
             if reference_price is not None:
                 ax.axhline(y=float(reference_price), color='g', linestyle='--', alpha=0.8, label=f"Reference: ${float(reference_price):,.2f}")
             
-            # Add Take Profit line if configured
+            # Add Take Profit line if configured - Remove dollar signs
             if order.take_profit and hasattr(order.take_profit, 'price') and order.take_profit.price:
                 tp_price = float(order.take_profit.price)
                 tp_percentage = float(order.take_profit.percentage) if hasattr(order.take_profit, 'percentage') else ((tp_price / float(order.price) - 1) * 100)
                 ax.axhline(y=tp_price, color='green', linestyle='--', alpha=0.8, 
-                          label=f"TP: ${tp_price:,.2f} (+{tp_percentage:.2f}%)")
+                          label=f"TP: {tp_price:,.2f} (+{tp_percentage:.2f}%)")
             
-            # Add Stop Loss line if configured
+            # Add Stop Loss line if configured - Remove dollar signs
             if order.stop_loss and hasattr(order.stop_loss, 'price') and order.stop_loss.price:
                 sl_price = float(order.stop_loss.price)
                 sl_percentage = float(order.stop_loss.percentage) if hasattr(order.stop_loss, 'percentage') else ((1 - sl_price / float(order.price)) * 100)
                 ax.axhline(y=sl_price, color='red', linestyle='--', alpha=0.8, 
-                          label=f"SL: ${sl_price:,.2f} (-{sl_percentage:.2f}%)")
+                          label=f"SL: {sl_price:,.2f} (-{sl_percentage:.2f}%)")
             
             # Format x-axis to show clean dates
             ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
@@ -852,3 +852,68 @@ class ChartGenerator:
         except Exception as e:
             logger.error(f"Error in simplified chart generation: {e}", exc_info=True)
             return None
+
+    def format_info_text(self, order, ref_price=None) -> str:
+        """Format trade information for chart display"""
+        try:
+            # Base text
+            avg_price = f"${float(order.price):.2f}"
+            symbol = order.symbol
+            
+            # Format the TP/SL text with proper escaping for currency symbols
+            tp_sl_text = ""
+            if order.take_profit:
+                tp_sl_text += f"TP: {float(order.take_profit.price):.2f} (+{order.take_profit.percentage:.2f}%)"
+            if order.stop_loss:
+                if tp_sl_text:
+                    tp_sl_text += " "
+                tp_sl_text += f"SL: {float(order.stop_loss.price):.2f} (-{order.stop_loss.percentage:.2f}%)"
+                
+            # Build the complete info text without $ symbols in the TP/SL section
+            info_text = f"{symbol} @ {avg_price}"
+            if ref_price:
+                # Calculate price change from reference
+                change = ((float(order.price) / float(ref_price)) - 1) * 100
+                info_text += f" ({change:+.2f}%)"
+                
+            if tp_sl_text:
+                info_text += f"\n{tp_sl_text}"
+                
+            return info_text
+            
+        except Exception as e:
+            logger.error(f"Error formatting chart info: {e}")
+            return f"{order.symbol} @ ${float(order.price):.2f}"
+
+    def _add_tp_sl_lines(self, ax, order, min_price, max_price):
+        """Add take profit and stop loss lines to the chart with fixed formatting"""
+        try:
+            entry_price = float(order.price)
+            
+            # Add entry price line
+            ax.axhline(y=entry_price, color='blue', linestyle='-', linewidth=1, alpha=0.7)
+            ax.text(0.02, entry_price, f"Entry: ${entry_price:.2f}", transform=ax.get_yaxis_transform(),
+                    va='center', ha='left', fontsize=9, backgroundcolor='white', alpha=0.7)
+            
+            # Add take profit line if configured
+            if order.take_profit:
+                tp_price = float(order.take_profit.price)
+                tp_pct = order.take_profit.percentage
+                ax.axhline(y=tp_price, color='green', linestyle='--', linewidth=1, alpha=0.7)
+                # Format the text without $ symbol inside the text method
+                ax.text(0.02, tp_price, f"TP: {tp_price:.2f} (+{tp_pct:.2f}%)", transform=ax.get_yaxis_transform(),
+                       va='center', ha='left', fontsize=9, backgroundcolor='white', alpha=0.7)
+            
+            # Add stop loss line if configured
+            if order.stop_loss:
+                sl_price = float(order.stop_loss.price)
+                sl_pct = order.stop_loss.percentage
+                ax.axhline(y=sl_price, color='red', linestyle='--', linewidth=1, alpha=0.7)
+                # Format the text without $ symbol inside the text method
+                ax.text(0.02, sl_price, f"SL: {sl_price:.2f} (-{sl_pct:.2f}%)", transform=ax.get_yaxis_transform(),
+                       va='center', ha='left', fontsize=9, backgroundcolor='white', alpha=0.7)
+            
+            return True
+        except Exception as e:
+            logger.error(f"Failed to add TP/SL lines: {e}")
+            return False

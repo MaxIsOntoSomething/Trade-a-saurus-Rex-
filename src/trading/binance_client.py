@@ -785,10 +785,14 @@ class BinanceClient:
             logger.error(f"Failed to check order status: {e}")
             return None
             
-    async def get_balance(self, symbol: str = 'USDT') -> Decimal:
+    async def get_balance(self, symbol: str = None) -> Decimal:
         """Get balance for a specific asset"""
         await self.rate_limiter.acquire()
         try:
+            # Use the instance base_currency if no symbol is provided
+            if symbol is None:
+                symbol = self.base_currency or 'USDT'
+                
             account = await self.client.get_account()
             for balance in account['balances']:
                 if (balance['asset'] == symbol):

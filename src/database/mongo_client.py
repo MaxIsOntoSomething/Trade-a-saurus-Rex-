@@ -87,7 +87,53 @@ class MongoClient:
             return None
 
         try:
-            # Serialize take profit data if present
+            # Check if order with this ID already exists
+            existing_order = await self.orders.find_one({"order_id": order.order_id})
+            if existing_order:
+                logger.info(f"Order {order.order_id} already exists, updating instead of inserting")
+                
+                # Serialize take profit data if present
+                tp_data = None
+                if order.take_profit:
+                    tp_data = {
+                        "price": str(order.take_profit.price),
+                        "percentage": order.take_profit.percentage,
+                        "status": order.take_profit.status.value,
+                        "triggered_at": order.take_profit.triggered_at,
+                        "order_id": order.take_profit.order_id
+                    }
+
+                # Serialize stop loss data if present
+                sl_data = None
+                if order.stop_loss:
+                    sl_data = {
+                        "price": str(order.stop_loss.price),
+                        "percentage": order.stop_loss.percentage,
+                        "status": order.stop_loss.status.value,
+                        "triggered_at": order.stop_loss.triggered_at,
+                        "order_id": order.stop_loss.order_id
+                    }
+                
+                # Update the existing order
+                update_data = {
+                    "status": order.status.value,
+                    "updated_at": order.updated_at,
+                    "filled_at": order.filled_at,
+                    "cancelled_at": order.cancelled_at,
+                    "take_profit": tp_data,
+                    "stop_loss": sl_data,
+                    "metadata.last_checked": datetime.utcnow(),
+                    "metadata.check_count": existing_order.get("metadata", {}).get("check_count", 0) + 1
+                }
+                
+                result = await self.orders.update_one(
+                    {"order_id": order.order_id},
+                    {"$set": update_data}
+                )
+                
+                return str(existing_order["_id"])
+                
+            # If order doesn't exist, proceed with insertion as before
             tp_data = None
             if order.take_profit:
                 tp_data = {
@@ -942,7 +988,9 @@ class MongoClient:
     async def reset_all_triggered_thresholds(self):
         """Reset all triggered thresholds in the database"""
         try:
-            result = await self.triggered_thresholds.delete_many({})
+            # Clear all threshold state documents
+            result = await self.threshold_state.delete_many({})
+            logger.info(f"Cleared {result.deleted_count} threshold states from database")
             return result.deleted_count
         except Exception as e:
             logger.error(f"Error resetting all triggered thresholds: {e}")
