@@ -73,6 +73,16 @@ def load_config_from_env() -> dict:
         logger.error(f"[CONFIG] Error parsing reserve balance: {e}")
         reserve_balance = 500  # Fallback to default
 
+    # Parse TP/SL settings - add proper error handling and logging
+    try:
+        take_profit_setting = os.getenv('TRADING_TAKE_PROFIT', '5%')
+        stop_loss_setting = os.getenv('TRADING_STOP_LOSS', '3%')
+        logger.info(f"[CONFIG] Raw TP/SL settings from ENV - TP: {take_profit_setting}, SL: {stop_loss_setting}")
+    except Exception as e:
+        logger.error(f"[CONFIG] Error accessing TP/SL settings: {e}")
+        take_profit_setting = '5%'
+        stop_loss_setting = '3%'
+
     # Rest of the config loading with spot_testnet/mainnet API keys
     config = {
         'binance': {
@@ -100,6 +110,9 @@ def load_config_from_env() -> dict:
             'cancel_after_hours': int(os.getenv('TRADING_CANCEL_HOURS', '8')),
             'pairs': os.getenv('TRADING_PAIRS', 'BTCUSDT,ETHUSDT').split(','),
             'reserve_balance': reserve_balance,  # Use parsed reserve balance
+            'take_profit': take_profit_setting,  # Add explicit take profit setting
+            'stop_loss': stop_loss_setting,      # Add explicit stop loss setting
+            'only_lower_entries': os.getenv('TRADING_ONLY_LOWER_ENTRIES', 'true').lower() == 'true',
             'thresholds': {
                 'daily': [float(x) for x in os.getenv('TRADING_THRESHOLDS_DAILY', '1,2,5').split(',') if x],
                 'weekly': [float(x) for x in os.getenv('TRADING_THRESHOLDS_WEEKLY', '5,10,15').split(',') if x],
@@ -107,6 +120,10 @@ def load_config_from_env() -> dict:
             }
         }
     }
+    
+    # Log the TP/SL settings specifically for debugging
+    logger.info(f"[CONFIG] Take Profit setting: {config['trading']['take_profit']}")
+    logger.info(f"[CONFIG] Stop Loss setting: {config['trading']['stop_loss']}")
     
     return config
 
@@ -236,6 +253,8 @@ async def initialize_services(config):
         
         # Log reserve balance after initialization to verify
         logger.info(f"[VERIFY] Reserve balance after BinanceClient init: ${binance_client.reserve_balance:,.2f}")
+        logger.info(f"[VERIFY] Take Profit setting: {binance_client.default_tp_percentage}%")
+        logger.info(f"[VERIFY] Stop Loss setting: {binance_client.default_sl_percentage}%")
         
         # Initialize Telegram bot
         telegram_bot = TelegramBot(
@@ -285,13 +304,15 @@ async def main():
         # Debug log the configuration
         logger.info("=" * 50)
         logger.info("[CONFIG] Active Configuration:")
+        logger.info(f"[CONFIG] Environment: {'TESTNET' if config['binance']['use_testnet'] else 'MAINNET'}")
         logger.info(f"[CONFIG] Base Currency: {config['trading']['base_currency']}")
         logger.info(f"[CONFIG] Reserve Balance: ${config['trading']['reserve_balance']:,.2f}")
         logger.info(f"[CONFIG] Trading Pairs: {', '.join(config['trading']['pairs'])}")
         logger.info(f"[CONFIG] Order Amount: ${config['trading']['order_amount']:,.2f}")
-        logger.info(f"[CONFIG] Environment: {'TESTNET' if config['binance']['use_testnet'] else 'MAINNET'}")
+        logger.info(f"[CONFIG] Take Profit: {config['trading']['take_profit']}")
+        logger.info(f"[CONFIG] Stop Loss: {config['trading']['stop_loss']}")
         logger.info("=" * 50)
-
+        
         if not validate_config(config):
             logger.error("Invalid configuration, exiting...")
             return
@@ -300,11 +321,6 @@ async def main():
         binance_client = services['binance_client']
         telegram_bot = services['telegram_bot']
         order_manager = services['order_manager']
-        
-        # Check initial connection with all configured pairs
-        if not await check_initial_connection(binance_client, config):
-            logger.error("Initial connection check failed, exiting...")
-            return
         
         # Run both components concurrently
         try:

@@ -77,19 +77,32 @@ class BinanceClient:
             tp_setting = config['trading'].get('take_profit', '0%')
             sl_setting = config['trading'].get('stop_loss', '0%')
             
+            # Extra logging to debug the raw values
+            logger.info(f"[TP/SL DEBUG] Raw settings from config - TP: '{tp_setting}', SL: '{sl_setting}'")
+            
             # Extract percentage values (remove % sign and convert to float)
             try:
-                self.default_tp_percentage = float(tp_setting.strip('%').strip())
+                # Handle both string and numeric inputs
+                if isinstance(tp_setting, (int, float)):
+                    self.default_tp_percentage = float(tp_setting)
+                else:
+                    cleaned_tp = tp_setting.strip().replace('%', '')
+                    self.default_tp_percentage = float(cleaned_tp) if cleaned_tp else 0
                 logger.info(f"[INIT] Take Profit configured: {self.default_tp_percentage}%")
-            except (ValueError, AttributeError):
-                logger.warning(f"[INIT] Invalid Take Profit setting: {tp_setting}, using 0%")
+            except (ValueError, AttributeError) as e:
+                logger.warning(f"[INIT] Invalid Take Profit setting: '{tp_setting}', using 0% (Error: {e})")
                 self.default_tp_percentage = 0
                 
             try:
-                self.default_sl_percentage = float(sl_setting.strip('%').strip())
+                # Handle both string and numeric inputs
+                if isinstance(sl_setting, (int, float)):
+                    self.default_sl_percentage = float(sl_setting)
+                else:
+                    cleaned_sl = sl_setting.strip().replace('%', '')
+                    self.default_sl_percentage = float(cleaned_sl) if cleaned_sl else 0
                 logger.info(f"[INIT] Stop Loss configured: {self.default_sl_percentage}%")
-            except (ValueError, AttributeError):
-                logger.warning(f"[INIT] Invalid Stop Loss setting: {sl_setting}, using 0%")
+            except (ValueError, AttributeError) as e:
+                logger.warning(f"[INIT] Invalid Stop Loss setting: '{sl_setting}', using 0% (Error: {e})")
                 self.default_sl_percentage = 0
         
         # Add tracking of invalid symbols
