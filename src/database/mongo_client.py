@@ -1,6 +1,6 @@
-import inspect
+from inspect import iscoroutine
 from datetime import datetime, timedelta
-from typing import List, Optional, Dict, Any, AsyncIterator
+from typing import List, Optional, Dict, Any
 from ..types.models import Order, OrderStatus, TimeFrame, OrderType, TradeDirection, TPSLStatus, TakeProfit, StopLoss  # Add TPSLStatus and related classes
 from ..types.constants import TAX_RATE, PRICE_PRECISION
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
@@ -54,8 +54,8 @@ class MongoClient:
         
         logger.info("Database indexes initialized")
 
-    async def _prepare_async_cursor(self, cursor: Any) -> AsyncIterator:
-        if inspect.iscoroutine(cursor):
+    async def resolve_cursor(self, cursor: Any) -> Any:
+        if iscoroutine(cursor):
             cursor = await cursor
         return cursor
     
@@ -312,7 +312,7 @@ class MongoClient:
         ]
         
         stats = {}
-        cursor = await self._prepare_async_cursor(self.orders.aggregate(pipeline))
+        cursor = await self.resolve_cursor(self.orders.aggregate(pipeline))
         async for result in cursor:
             stats[result["_id"]] = {
                 "total_orders": result["total_orders"],
@@ -362,7 +362,7 @@ class MongoClient:
         ]
 
         positions = {}
-        cursor = await self._prepare_async_cursor(self.orders.aggregate(pipeline))
+        cursor = await self.resolve_cursor(self.orders.aggregate(pipeline))
         async for doc in cursor:
             positions[doc["_id"]] = {
                 "total_quantity": Decimal(doc["total_quantity"]),
@@ -587,7 +587,7 @@ class MongoClient:
                 raise ValueError(f"Unknown visualization type: {viz_type}")
 
             results = []
-            cursor = await self._prepare_async_cursor(self.orders.aggregate(pipeline))
+            cursor = await self.resolve_cursor(self.orders.aggregate(pipeline))
             async for doc in cursor:
                 # Convert all numeric values to float
                 if 'volume' in doc:
@@ -1007,7 +1007,7 @@ class MongoClient:
             
             # Process results into dictionary
             result = {}
-            cursor = await self._prepare_async_cursor(self.orders.aggregate(pipeline))
+            cursor = await self.resolve_cursor(self.orders.aggregate(pipeline))
             async for doc in cursor:
                 symbol = doc["_id"]
                 if symbol not in result:
@@ -1128,7 +1128,7 @@ class MongoClient:
                 }}
             ]
 
-            cursor = await self._prepare_async_cursor(self.orders.aggregate(pipeline))
+            cursor = await self.resolve_cursor(self.orders.aggregate(pipeline))
             async for doc in cursor:
                 return {
                     "symbol": doc["_id"],
