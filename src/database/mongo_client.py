@@ -1,5 +1,6 @@
+import inspect
 from datetime import datetime, timedelta
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, AsyncIterator
 from ..types.models import Order, OrderStatus, TimeFrame, OrderType, TradeDirection, TPSLStatus, TakeProfit, StopLoss  # Add TPSLStatus and related classes
 from ..types.constants import TAX_RATE, PRICE_PRECISION
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
@@ -10,11 +11,12 @@ logger = logging.getLogger(__name__)
 
 class MongoClient:
     def __init__(self, uri: str, database: str, driver: str = "motor"):
-        if driver.lower() == "motor":
+        driver = driver.lower()
+        if driver == "motor":
             import motor.motor_asyncio
             
             self.client = motor.motor_asyncio.AsyncIOMotorClient(uri)  # Use Motor
-        elif driver.lower() == "pymongo":
+        elif driver == "pymongo":
             from pymongo import AsyncMongoClient
             
             self.client = AsyncMongoClient(uri)  # Use PyMongo Async
@@ -52,6 +54,11 @@ class MongoClient:
         
         logger.info("Database indexes initialized")
 
+    async def _prepare_async_cursor(self, cursor: Any) -> AsyncIterator:
+        if inspect.iscoroutine(cursor):
+            cursor = await cursor
+        return cursor
+    
     def _validate_order_data(self, order: Order) -> bool:
         """Validate order data before insertion"""
         required_fields = {
@@ -305,7 +312,8 @@ class MongoClient:
         ]
         
         stats = {}
-        async for result in self.orders.aggregate(pipeline):
+        cursor = await self._prepare_async_cursor(self.orders.aggregate(pipeline))
+        async for result in cursor:
             stats[result["_id"]] = {
                 "total_orders": result["total_orders"],
                 "avg_price": float(result["avg_price"]),
@@ -354,7 +362,8 @@ class MongoClient:
         ]
 
         positions = {}
-        async for doc in self.orders.aggregate(pipeline):
+        cursor = await self._prepare_async_cursor(self.orders.aggregate(pipeline))
+        async for doc in cursor:
             positions[doc["_id"]] = {
                 "total_quantity": Decimal(doc["total_quantity"]),
                 "total_cost": Decimal(doc["total_cost"]),
@@ -578,7 +587,8 @@ class MongoClient:
                 raise ValueError(f"Unknown visualization type: {viz_type}")
 
             results = []
-            async for doc in self.orders.aggregate(pipeline):
+            cursor = await self._prepare_async_cursor(self.orders.aggregate(pipeline))
+            async for doc in cursor:
                 # Convert all numeric values to float
                 if 'volume' in doc:
                     doc['volume'] = float(doc['volume'])
@@ -997,7 +1007,8 @@ class MongoClient:
             
             # Process results into dictionary
             result = {}
-            async for doc in self.orders.aggregate(pipeline):
+            cursor = await self._prepare_async_cursor(self.orders.aggregate(pipeline))
+            async for doc in cursor:
                 symbol = doc["_id"]
                 if symbol not in result:
                     result[symbol] = {
@@ -1116,8 +1127,9 @@ class MongoClient:
                     "order_count": 1
                 }}
             ]
-            
-            async for doc in self.orders.aggregate(pipeline):
+
+            cursor = await self._prepare_async_cursor(self.orders.aggregate(pipeline))
+            async for doc in cursor:
                 return {
                     "symbol": doc["_id"],
                     "total_quantity": Decimal(doc["total_quantity"]),
