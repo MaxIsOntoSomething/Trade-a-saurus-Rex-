@@ -1,4 +1,3 @@
-import motor.motor_asyncio
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 from ..types.models import Order, OrderStatus, TimeFrame, OrderType, TradeDirection, TPSLStatus, TakeProfit, StopLoss  # Add TPSLStatus and related classes
@@ -10,8 +9,18 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 class MongoClient:
-    def __init__(self, uri: str, database: str):
-        self.client = motor.motor_asyncio.AsyncIOMotorClient(uri)
+    def __init__(self, uri: str, database: str, driver: str = "motor"):
+        if driver.lower() == "motor":
+            import motor.motor_asyncio
+            
+            self.client = motor.motor_asyncio.AsyncIOMotorClient(uri)  # Use Motor
+        elif driver.lower() == "pymongo":
+            from pymongo import AsyncMongoClient
+            
+            self.client = AsyncMongoClient(uri)  # Use PyMongo Async
+        else:
+            raise ValueError("Invalid driver. Use 'motor' or 'pymongo'.")
+            
         self.db = self.client[database]
         self.orders = self.db.orders
         self.balance_history = self.db.balance_history  # Add balance_history collection
