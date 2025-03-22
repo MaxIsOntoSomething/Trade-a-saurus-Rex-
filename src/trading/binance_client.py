@@ -814,7 +814,7 @@ class BinanceClient:
                 
                 # Only update triggered thresholds if it's not a manual trade
                 if not is_manual and threshold and symbol in self.triggered_thresholds and timeframe:
-                    self.mark_threshold_triggered(symbol, timeframe.value, threshold)
+                    await self.mark_threshold_triggered(symbol, timeframe.value, threshold)
                 
                 # Generate unique order ID
                 order_id = str(int(datetime.utcnow().timestamp() * 1000))
