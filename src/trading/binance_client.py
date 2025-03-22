@@ -13,6 +13,7 @@ from ..utils.rate_limiter import RateLimiter
 from ..types.constants import PRECISION, MIN_NOTIONAL, TIMEFRAME_INTERVALS, TRADING_FEES, ORDER_TYPE_FEES
 from ..utils.chart_generator import ChartGenerator
 from ..utils.yahoo_scrapooooor_sp500 import YahooSP500Scraper  # Import the new Yahoo scraper
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -261,92 +262,43 @@ class BinanceClient:
             await self.client.close_connection()
             
     async def check_timeframe_reset(self, timeframe: TimeFrame) -> bool:
-        """Check if timeframe needs to be reset and return True if reset occurred"""
-        now = datetime.utcnow()
-        interval = TIMEFRAME_INTERVALS[timeframe.value.upper()]
-        
-        if now - self.last_reset[timeframe] >= interval:
-            logger.info(f"Resetting {timeframe.value} thresholds")
+        """Check if a timeframe needs to be reset based on elapsed time"""
+        try:
+            # Get reference timestamp for timeframe
+            reference_ts = await self.get_reference_timestamp(timeframe)
+            current_time = datetime.now()
+            reference_time = datetime.fromtimestamp(reference_ts / 1000)  # Convert ms to seconds
             
-            # Prepare reset data
-            reset_data = {
-                "timeframe": timeframe,
-                "prices": []
-            }
+            # Determine if reset is needed based on timeframe
+            reset_needed = False
             
-            # Get opening prices for all symbols, with format pre-validation
-            for symbol in self.config['trading']['pairs']:
-                # Skip invalid symbols
-                if not self._is_valid_symbol_format(symbol) or symbol in self.invalid_symbols:
-                    continue
-                    
-                try:
-                    ticker = await self.client.get_symbol_ticker(symbol=symbol)
-                    current_price = float(ticker['price'])
-                    
-                    # Get previous reference price
-                    ref_price = self.reference_prices.get(symbol, {}).get(timeframe)
-                    
-                    price_data = {
-                        "symbol": symbol,
-                        "current_price": current_price,
-                        "reference_price": ref_price or current_price,
-                        "price_change": ((current_price - ref_price) / ref_price * 100) if ref_price else 0
-                    }
-                    reset_data["prices"].append(price_data)
-                    
-                    # Store current price as new reference
-                    if symbol not in self.reference_prices:
-                        self.reference_prices[symbol] = {}
-                    self.reference_prices[symbol][timeframe] = current_price
-                    
-                    # Standardize the triggered_thresholds structure
-                    if symbol not in self.triggered_thresholds:
-                        self.triggered_thresholds[symbol] = {
-                            'daily': set(),
-                            'weekly': set(),
-                            'monthly': set()
-                        }
-                    
-                    # Clear triggered thresholds - ensure we use the timeframe.value consistently
-                    self.triggered_thresholds[symbol][timeframe.value] = set()
-                    
-                    # Clear in database as well
-                    if self.mongo_client:
-                        await self.mongo_client.save_triggered_threshold(
-                            symbol, timeframe.value, []
-                        )
-                    
-                except BinanceAPIException as e:
-                    if e.code == -1121 or e.code == -1100:
-                        logger.warning(f"Invalid symbol during reset: {symbol}, skipping")
-                        self.invalid_symbols.add(symbol)
-                        if self.mongo_client:
-                            await self.mongo_client.save_invalid_symbol(symbol, str(e))
-                    else:
-                        logger.error(f"API error during reset for {symbol}: {e}")
-                except Exception as e:
-                    logger.error(f"Error during reset for {symbol}: {e}")
-                    
-            self.last_reset[timeframe] = now
+            if timeframe == TimeFrame.DAILY:
+                # Reset if day has changed
+                reset_needed = current_time.day != reference_time.day or current_time.month != reference_time.month or current_time.year != reference_time.year
+                
+            elif timeframe == TimeFrame.WEEKLY:
+                # Reset if week has changed (using ISO week number for consistency)
+                current_week = current_time.isocalendar()[1]
+                reference_week = reference_time.isocalendar()[1]
+                reset_needed = current_week != reference_week or current_time.year != reference_time.year
+                
+            elif timeframe == TimeFrame.MONTHLY:
+                # Reset if month has changed
+                reset_needed = current_time.month != reference_time.month or current_time.year != reference_time.year
             
-            # Save reference prices to database
-            if self.mongo_client:
-                await self.mongo_client.save_reference_prices(self.reference_prices)
+            if reset_needed:
+                logger.info(f"Time to reset {timeframe.value} thresholds. " +
+                           f"Last reset: {reference_time.strftime('%Y-%m-%d')}, Current: {current_time.strftime('%Y-%m-%d')}")
+                
+                # Perform the reset
+                await self.reset_timeframe_thresholds(timeframe.value)
+                return True
             
-            # Send notification via telegram bot if available
-            if hasattr(self, 'telegram_bot') and self.telegram_bot and reset_data["prices"]:
-                try:
-                    logger.info(f"Sending automatic timeframe reset notification for {timeframe.value}")
-                    await self.telegram_bot.send_timeframe_reset_notification(reset_data)
-                except Exception as e:
-                    logger.error(f"Failed to send automatic reset notification: {e}")
-            else:
-                logger.warning(f"No telegram bot available or no valid prices to send {timeframe.value} reset notification")
+            return False
             
-            return True
-            
-        return False
+        except Exception as e:
+            logger.error(f"Error checking timeframe reset: {e}")
+            return False
 
     async def get_reference_timestamp(self, timeframe: TimeFrame) -> int:
         """Get the reference timestamp for a timeframe"""
@@ -584,92 +536,49 @@ class BinanceClient:
             logger.error(f"Error marking threshold triggered: {e}", exc_info=True)
 
     async def reset_timeframe_thresholds(self, timeframe_str: str):
-        """Reset all thresholds for a specific timeframe"""
+        """Reset triggered thresholds for a specific timeframe"""
         try:
-            # Convert string to TimeFrame enum if it's not already
-            if isinstance(timeframe_str, str):
-                timeframe = TimeFrame(timeframe_str)
-            else:
-                timeframe = timeframe_str
+            # Reset triggered thresholds in database
+            if self.mongo_client:
+                await self.mongo_client.reset_timeframe_thresholds(timeframe_str)
             
-            logger.info(f"Resetting all thresholds for {timeframe.value} timeframe...")
+            # Update reference prices for all trading pairs
+            await self.update_reference_prices(self.config['trading']['pairs'])
             
-            # Get reference prices for all symbols
-            reset_data = {
-                "timeframe": timeframe,
-                "prices": []
+            # Prepare reset information for notification
+            reset_info = {
+                'timeframe': timeframe_str,
+                'timestamp': datetime.now(),
+                'pairs': []
             }
             
-            # Track which symbols were reset for logging
-            reset_symbols = []
-            
+            # Gather information about reference prices for notification
             for symbol in self.config['trading']['pairs']:
-                # Get current price
-                current_price = await self.get_current_price(symbol)
-                if not current_price:
-                    logger.warning(f"Could not get current price for {symbol}, skipping")
+                if symbol in self.invalid_symbols:
                     continue
-                    
-                # Store current price as new reference
-                if symbol not in self.reference_prices:
-                    self.reference_prices[symbol] = {}
                 
-                # Update reference price to current price
-                old_reference = self.reference_prices.get(symbol, {}).get(timeframe)
-                self.reference_prices[symbol][timeframe] = current_price
+                timeframe = TimeFrame(timeframe_str)
+                price = await self.get_reference_price(symbol, timeframe)
                 
-                # Calculate price change from previous reference (if exists)
-                price_change = 0
-                if old_reference:
-                    price_change = ((current_price - old_reference) / old_reference) * 100
-                
-                # Add to reset data for notification
-                reset_data["prices"].append({
-                    "symbol": symbol,
-                    "current_price": current_price,
-                    "reference_price": current_price,  # New reference is current price
-                    "previous_reference": old_reference,
-                    "price_change": price_change
-                })
-                
-                # Check if symbol had triggered thresholds to reset and standardize the dictionary structure
-                if symbol not in self.triggered_thresholds:
-                    self.triggered_thresholds[symbol] = {
-                        'daily': set(),
-                        'weekly': set(),
-                        'monthly': set()
-                    }
-                
-                # Only log if there were thresholds to clear
-                if timeframe.value in self.triggered_thresholds[symbol] and self.triggered_thresholds[symbol][timeframe.value]:
-                    reset_symbols.append(symbol)
-                    logger.info(f"Cleared thresholds for {symbol} {timeframe.value}: {list(self.triggered_thresholds[symbol][timeframe.value])}")
-                
-                # Clear triggered thresholds for this symbol and timeframe
-                self.triggered_thresholds[symbol][timeframe.value] = set()
+                if price:
+                    reset_info['pairs'].append({
+                        'symbol': symbol,
+                        'reference_price': price,
+                        'thresholds': self.config['trading']['thresholds'][timeframe_str]
+                    })
             
-            # Persist changes to database
-            if self.mongo_client:
-                await self.mongo_client.save_reference_prices(self.reference_prices)
-                await self.mongo_client.reset_timeframe_thresholds(timeframe.value)
+            # Log the reset
+            logger.info(f"Reset {timeframe_str} thresholds for {len(reset_info['pairs'])} pairs")
             
-            # Update last reset time
-            self.last_reset[timeframe] = datetime.utcnow()
+            # Send notification about the reset
+            if self.telegram_bot:
+                await self.telegram_bot.send_timeframe_reset_notification(reset_info)
             
-            # Send notification if telegram bot is available
-            if reset_data["prices"] and hasattr(self, 'telegram_bot') and self.telegram_bot:
-                await self.telegram_bot.send_timeframe_reset_notification(reset_data)
-                
-            if reset_symbols:
-                logger.info(f"Reset thresholds for {len(reset_symbols)} symbols: {', '.join(reset_symbols)}")
-            else:
-                logger.info(f"No triggered thresholds were found to reset for {timeframe.value} timeframe")
-                
-            return True
+            return reset_info
             
         except Exception as e:
-            logger.error(f"Error resetting {timeframe_str} thresholds: {e}", exc_info=True)
-            return False
+            logger.error(f"Error resetting {timeframe_str} thresholds: {e}")
+            return None
 
     async def restore_triggered_thresholds(self):
         """Restore triggered thresholds from database on startup"""

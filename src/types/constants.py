@@ -12,7 +12,7 @@ PRECISION = {
 TIMEFRAME_INTERVALS = {
     'DAILY': timedelta(days=1),
     'WEEKLY': timedelta(weeks=1),
-    'MONTHLY': timedelta(days=30)
+    'MONTHLY': None  # Special handling for calendar months
 }
 
 # Rate limiting

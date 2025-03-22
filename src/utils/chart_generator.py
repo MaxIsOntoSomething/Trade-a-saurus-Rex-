@@ -853,38 +853,6 @@ class ChartGenerator:
             logger.error(f"Error in simplified chart generation: {e}", exc_info=True)
             return None
 
-    def format_info_text(self, order, ref_price=None) -> str:
-        """Format trade information for chart display"""
-        try:
-            # Base text
-            avg_price = f"${float(order.price):.2f}"
-            symbol = order.symbol
-            
-            # Format the TP/SL text with proper escaping for currency symbols
-            tp_sl_text = ""
-            if order.take_profit:
-                tp_sl_text += f"TP: {float(order.take_profit.price):.2f} (+{order.take_profit.percentage:.2f}%)"
-            if order.stop_loss:
-                if tp_sl_text:
-                    tp_sl_text += " "
-                tp_sl_text += f"SL: {float(order.stop_loss.price):.2f} (-{order.stop_loss.percentage:.2f}%)"
-                
-            # Build the complete info text without $ symbols in the TP/SL section
-            info_text = f"{symbol} @ {avg_price}"
-            if ref_price:
-                # Calculate price change from reference
-                change = ((float(order.price) / float(ref_price)) - 1) * 100
-                info_text += f" ({change:+.2f}%)"
-                
-            if tp_sl_text:
-                info_text += f"\n{tp_sl_text}"
-                
-            return info_text
-            
-        except Exception as e:
-            logger.error(f"Error formatting chart info: {e}")
-            return f"{order.symbol} @ ${float(order.price):.2f}"
-
     def _add_tp_sl_lines(self, ax, order, min_price, max_price):
         """Add take profit and stop loss lines to the chart with fixed formatting"""
         try:

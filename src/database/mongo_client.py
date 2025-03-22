@@ -830,19 +830,17 @@ class MongoClient:
             return []
 
     async def reset_timeframe_thresholds(self, timeframe: str):
-        """Reset all thresholds for a specific timeframe"""
+        """Reset triggered thresholds for a specific timeframe"""
         try:
-            # Convert timeframe to string if it's an enum
-            timeframe_value = timeframe.value if hasattr(timeframe, 'value') else str(timeframe)
+            # Delete all triggered thresholds for this timeframe
+            result = await self.thresholds.delete_many({"timeframe": timeframe})
+            deleted_count = result.deleted_count
             
-            result = await self.threshold_state.delete_many({"timeframe": timeframe_value})
-            affected = result.deleted_count
-            
-            logger.info(f"Reset all thresholds for {timeframe_value} timeframe. {affected} threshold states removed.")
-            return True
+            logger.info(f"Reset {deleted_count} triggered thresholds for {timeframe}")
+            return deleted_count
         except Exception as e:
-            logger.error(f"Failed to reset timeframe thresholds: {e}", exc_info=True)
-            return False
+            logger.error(f"Error resetting {timeframe} thresholds: {e}")
+            return 0
 
     async def reset_all_triggered_thresholds(self):
         """Reset all triggered thresholds in the database"""
