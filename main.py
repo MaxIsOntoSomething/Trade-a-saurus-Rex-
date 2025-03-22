@@ -215,7 +215,7 @@ async def initialize_services(config):
     try:
         logger.info("Initializing services...")
         
-        # Create MongoDB client
+        # Create MongoDB client with async support
         mongo_client = MongoClient(
             uri=config['mongodb']['uri'],
             database=config['mongodb']['database']
