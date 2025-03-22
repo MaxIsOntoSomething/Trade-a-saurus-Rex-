@@ -16,8 +16,7 @@
     },
     "mongodb": {
         "uri": "mongodb://localhost:27017",
-        "database": "tradeasaurus",
-        "driver": "motor"
+        "database": "tradeasaurus"
     },
     "trading": {
         "base_currency": "USDT",
