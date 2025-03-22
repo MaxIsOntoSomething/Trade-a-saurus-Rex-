@@ -1,48 +1,86 @@
 import motor.motor_asyncio
+import logging
+import pymongo
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 from ..types.models import Order, OrderStatus, TimeFrame, OrderType, TradeDirection, TPSLStatus, TakeProfit, StopLoss  # Add TPSLStatus and related classes
 from ..types.constants import TAX_RATE, PRICE_PRECISION
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
-import logging
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
 class MongoClient:
     def __init__(self, uri: str, database: str):
-        self.client = motor.motor_asyncio.AsyncIOMotorClient(uri)
-        self.db = self.client[database]
-        self.orders = self.db.orders
-        self.balance_history = self.db.balance_history  # Add balance_history collection
-        self.threshold_state = self.db.threshold_state  # Add collection for threshold state
-        self.thresholds = self.db.thresholds  # Add this line for thresholds collection
-        self.reference_prices = self.db.reference_prices  # Add this line for reference prices collection
-        self.invalid_symbols = self.db.invalid_symbols  # Add collection for invalid symbols
-        self.trading_symbols = self.db.trading_symbols  # New collection for trading symbols
-
+        """Initialize MongoDB client with async support using Motor"""
+        try:
+            # Check if using a replica set and add readPreference
+            if "replicaSet" in uri:
+                if "readPreference" not in uri:
+                    uri += "&readPreference=primaryPreferred"
+            
+            # Replace pymongo with motor.motor_asyncio
+            self.client = motor.motor_asyncio.AsyncIOMotorClient(uri)
+            self.db = self.client[database]
+            
+            # Define collections
+            self.orders = self.db.orders
+            self.threshold_state = self.db.threshold_state
+            self.triggered_thresholds = self.db.triggered_thresholds
+            self.balance_history = self.db.balance_history
+            self.reference_prices = self.db.reference_prices
+            self.invalid_symbols = self.db.invalid_symbols
+            self.trading_symbols = self.db.trading_symbols
+            self.removed_symbols = self.db.removed_symbols
+            
+            logger.info("MongoDB client initialized with async support")
+        except Exception as e:
+            logger.error(f"Failed to initialize MongoDB client: {e}")
+            raise
+    
     async def init_indexes(self):
-        await self.orders.create_index("order_id", unique=True)
-        await self.orders.create_index("status")
-        await self.orders.create_index("symbol")
-        await self.orders.create_index("created_at")
-        
-        # Add index for balance history
-        await self.balance_history.create_index("timestamp")
-        
-        # Add index for threshold state
-        await self.threshold_state.create_index([("symbol", 1), ("timeframe", 1)], unique=True)
-        
-        # Add index for thresholds collection
-        await self.thresholds.create_index([("symbol", 1), ("timeframe", 1), ("threshold", 1)], unique=True)
-        
-        # Add index for reference prices
-        await self.reference_prices.create_index([("symbol", 1), ("timeframe", 1)], unique=True)
-        
-        # Add index for invalid symbols
-        await self.invalid_symbols.create_index("symbol", unique=True)
-        
-        logger.info("Database indexes initialized")
+        """Initialize database indexes for optimized queries"""
+        try:
+            # Create indexes for the orders collection
+            await self.orders.create_index([("order_id", pymongo.ASCENDING)], unique=True)
+            await self.orders.create_index([("symbol", pymongo.ASCENDING)])
+            await self.orders.create_index([("status", pymongo.ASCENDING)])
+            await self.orders.create_index([("created_at", pymongo.DESCENDING)])
+            
+            # Create indexes for threshold state
+            await self.threshold_state.create_index([
+                ("symbol", pymongo.ASCENDING), 
+                ("timeframe", pymongo.ASCENDING)
+            ], unique=True)
+            
+            # Create indexes for triggered thresholds
+            await self.triggered_thresholds.create_index([
+                ("symbol", pymongo.ASCENDING), 
+                ("timeframe", pymongo.ASCENDING)
+            ], unique=True)
+            
+            # Create indexes for balance history
+            await self.balance_history.create_index([("timestamp", pymongo.DESCENDING)])
+            
+            # Create index for reference prices
+            await self.reference_prices.create_index([
+                ("symbol", pymongo.ASCENDING), 
+                ("timeframe", pymongo.ASCENDING)
+            ], unique=True)
+            
+            # Create index for invalid symbols
+            await self.invalid_symbols.create_index([("symbol", pymongo.ASCENDING)], unique=True)
+            
+            # Create index for trading symbols
+            await self.trading_symbols.create_index([("symbol", pymongo.ASCENDING)], unique=True)
+            
+            # Create index for removed symbols
+            await self.removed_symbols.create_index([("symbol", pymongo.ASCENDING)], unique=True)
+            
+            logger.info("MongoDB indexes initialized")
+        except Exception as e:
+            logger.error(f"Failed to initialize MongoDB indexes: {e}")
+            raise
 
     def _validate_order_data(self, order: Order) -> bool:
         """Validate order data before insertion"""
@@ -245,65 +283,54 @@ class MongoClient:
         return result.modified_count > 0
 
     async def get_pending_orders(self) -> List[Order]:
-        """Get pending orders with improved error handling"""
-        orders = []
+        """Get all pending orders from database"""
         try:
-            cursor = self.orders.find({
-                "status": OrderStatus.PENDING.value
-            }).sort("created_at", 1)  # Sort by creation time
+            # Convert the find cursor to a list using to_list
+            docs = await self.orders.find(
+                {"status": OrderStatus.PENDING.value}
+            ).sort("created_at", 1).to_list(None)
             
-            async for doc in cursor:
-                try:
-                    order = self._document_to_order(doc)
-                    if order:
-                        orders.append(order)
-                except Exception as e:
-                    logger.error(f"Error converting document to order: {e}")
-                    # Update error count in metadata
-                    await self.orders.update_one(
-                        {"_id": doc["_id"]},
-                        {
-                            "$inc": {"metadata.error_count": 1},
-                            "$set": {"metadata.last_error": str(e)}
-                        }
-                    )
-            
-            # Update last checked time for all fetched orders
-            if orders:
-                order_ids = [order.order_id for order in orders]
-                await self.orders.update_many(
-                    {"order_id": {"$in": order_ids}},
-                    {
-                        "$set": {"metadata.last_checked": datetime.utcnow()},
-                        "$inc": {"metadata.check_count": 1}
-                    }
-                )
-                
+            # Convert documents to Order objects
+            return [self._document_to_order(doc) for doc in docs if doc]
         except Exception as e:
-            logger.error(f"Error fetching pending orders: {e}")
-            
-        return orders
+            logger.error(f"Error retrieving pending orders: {e}")
+            return []
 
     async def get_performance_stats(self) -> dict:
-        """Get trading performance statistics"""
-        pipeline = [
-            {"$match": {"status": "filled"}},
-            {"$group": {
-                "_id": "$symbol",
-                "total_orders": {"$sum": 1},
-                "avg_price": {"$avg": {"$toDecimal": "$price"}},
-                "total_quantity": {"$sum": {"$toDecimal": "$quantity"}}
-            }}
-        ]
-        
-        stats = {}
-        async for result in self.orders.aggregate(pipeline):
-            stats[result["_id"]] = {
-                "total_orders": result["total_orders"],
-                "avg_price": float(result["avg_price"]),
-                "total_quantity": float(result["total_quantity"])
-            }
-        return stats
+        """Get aggregated performance statistics"""
+        try:
+            # Define the aggregation pipeline for filled orders
+            pipeline = [
+                {"$match": {"status": OrderStatus.FILLED.value}},
+                {"$group": {
+                    "_id": None,
+                    "total_orders": {"$sum": 1},
+                    "total_value": {
+                        "$sum": {
+                            "$multiply": [
+                                {"$toDecimal": "$price"}, 
+                                {"$toDecimal": "$quantity"}
+                            ]
+                        }
+                    }
+                }}
+            ]
+            
+            # Execute the aggregation pipeline and get results
+            result = await self.orders.aggregate(pipeline).to_list(length=1)
+            
+            # If there are results, return them, otherwise return default values
+            if result and len(result) > 0:
+                return {
+                    "total_orders": result[0]["total_orders"],
+                    "total_value": float(result[0]["total_value"])
+                }
+            else:
+                return {"total_orders": 0, "total_value": 0.0}
+                
+        except Exception as e:
+            logger.error(f"Error getting performance stats: {e}")
+            return {"total_orders": 0, "total_value": 0.0}
 
     async def get_position_stats(self, allowed_symbols: set = None) -> dict:
         """Get detailed position statistics including profits"""
@@ -405,93 +432,89 @@ class MongoClient:
         return diagram
 
     def _document_to_order(self, doc: dict) -> Optional[Order]:
-        """Convert MongoDB document to Order object with error handling"""
+        """Convert MongoDB document to Order object"""
         try:
-            # Updated required fields list
-            required_fields = ['symbol', 'status', 'price', 'quantity', 
-                             'order_id', 'created_at', 'updated_at']
-            
-            if not all(field in doc for field in required_fields):
-                missing = [field for field in required_fields if field not in doc]
-                logger.error(f"Document missing required fields: {missing}")
+            # Return None if document is empty
+            if not doc:
                 return None
-
-            # Create order with mandatory fields
+                
+            # Create Take Profit object if it exists
+            take_profit = None
+            if "take_profit" in doc and doc["take_profit"]:
+                tp_data = doc["take_profit"]
+                take_profit = TakeProfit(
+                    price=Decimal(str(tp_data.get("price", 0))),
+                    percentage=float(tp_data.get("percentage", 0)),
+                    status=TPSLStatus(tp_data.get("status", TPSLStatus.PENDING.value)),
+                    triggered_at=tp_data.get("triggered_at"),
+                    order_id=tp_data.get("order_id")
+                )
+                
+            # Create Stop Loss object if it exists
+            stop_loss = None
+            if "stop_loss" in doc and doc["stop_loss"]:
+                sl_data = doc["stop_loss"]
+                stop_loss = StopLoss(
+                    price=Decimal(str(sl_data.get("price", 0))),
+                    percentage=float(sl_data.get("percentage", 0)),
+                    status=TPSLStatus(sl_data.get("status", TPSLStatus.PENDING.value)),
+                    triggered_at=sl_data.get("triggered_at"),
+                    order_id=sl_data.get("order_id")
+                )
+                
+            # Create and return Order object
             order = Order(
                 symbol=doc["symbol"],
                 status=OrderStatus(doc["status"]),
-                order_type=OrderType(doc.get("order_type", "spot")),  # Default to spot
-                price=Decimal(doc["price"]),
-                quantity=Decimal(doc["quantity"]),
-                timeframe=TimeFrame(doc.get("timeframe", "daily")),  # Default to daily
+                order_type=OrderType(doc["order_type"]),
+                price=Decimal(str(doc["price"])),
+                quantity=Decimal(str(doc["quantity"])),
+                timeframe=TimeFrame(doc["timeframe"]),
                 order_id=doc["order_id"],
                 created_at=doc["created_at"],
                 updated_at=doc["updated_at"],
                 filled_at=doc.get("filled_at"),
                 cancelled_at=doc.get("cancelled_at"),
-                fees=Decimal(doc.get("fees", "0")),
-                fee_asset=doc.get("fee_asset", "USDT"),
-                threshold=float(doc["threshold"]) if doc.get("threshold") not in [None, "Manual"] else None
+                fees=Decimal(str(doc.get("fees", "0"))),
+                fee_asset=doc.get("fee_asset"),
+                leverage=doc.get("leverage"),
+                direction=TradeDirection(doc["direction"]) if "direction" in doc else None,
+                threshold=doc.get("threshold"),
+                is_manual=doc.get("is_manual", False),
+                take_profit=take_profit,
+                stop_loss=stop_loss
             )
-
-            # Add futures-specific fields if present
-            if doc.get("leverage") is not None:
-                order.leverage = int(doc["leverage"])
-            if doc.get("direction"):
-                order.direction = TradeDirection(doc["direction"])
-
-            # Add take profit data if present
-            tp_data = doc.get("take_profit")
-            if tp_data:
-                try:
-                    order.take_profit = TakeProfit(
-                        price=Decimal(tp_data["price"]),
-                        percentage=float(tp_data["percentage"]),
-                        status=TPSLStatus(tp_data["status"]),
-                        triggered_at=tp_data.get("triggered_at"),
-                        order_id=tp_data.get("order_id")
-                    )
-                except (KeyError, ValueError, TypeError) as e:
-                    logger.error(f"Error parsing take profit data for {doc.get('order_id')}: {e}")
-
-            # Add stop loss data if present
-            sl_data = doc.get("stop_loss")
-            if sl_data:
-                try:
-                    order.stop_loss = StopLoss(
-                        price=Decimal(sl_data["price"]),
-                        percentage=float(sl_data["percentage"]),
-                        status=TPSLStatus(sl_data["status"]),
-                        triggered_at=sl_data.get("triggered_at"),
-                        order_id=sl_data.get("order_id")
-                    )
-                except (KeyError, ValueError, TypeError) as e:
-                    logger.error(f"Error parsing stop loss data for {doc.get('order_id')}: {e}")
-
+            
             return order
             
-        except (ValueError, KeyError, TypeError, InvalidOperation) as e:  # Replace DecimalException with InvalidOperation
-            logger.error(f"Error converting document {doc.get('order_id', 'unknown')}: {e}")
+        except Exception as e:
+            logger.error(f"Error converting document to order: {e}")
             return None
 
     async def cleanup_stale_orders(self, hours: int = 24) -> int:
-        """Cleanup orders that haven't been checked in a while"""
-        cutoff = datetime.utcnow() - timedelta(hours=hours)
+        """Cleanup orders that have been pending for too long"""
         try:
+            cutoff_time = datetime.utcnow() - timedelta(hours=hours)
+            
+            # Find stale pending orders
             result = await self.orders.update_many(
                 {
                     "status": OrderStatus.PENDING.value,
-                    "metadata.last_checked": {"$lt": cutoff}
+                    "created_at": {"$lt": cutoff_time}
                 },
                 {
                     "$set": {
                         "status": OrderStatus.CANCELLED.value,
-                        "cancelled_at": datetime.utcnow(),
-                        "metadata.cleanup_reason": "stale"
+                        "cancelled_at": datetime.utcnow()
                     }
                 }
             )
-            return result.modified_count
+            
+            count = result.modified_count
+            if count > 0:
+                logger.info(f"Cleaned up {count} stale orders")
+            return count
+            
         except Exception as e:
             logger.error(f"Error cleaning up stale orders: {e}")
             return 0
@@ -716,7 +739,7 @@ class MongoClient:
     async def get_all_triggered_thresholds(self):
         """Get all triggered thresholds from the database"""
         try:
-            cursor = self.thresholds.find()
+            cursor = self.triggered_thresholds.find()
             result = []
             async for doc in cursor:
                 result.append(doc)
@@ -731,7 +754,7 @@ class MongoClient:
             # Convert timeframe to string if it's an enum
             timeframe_value = timeframe.value if hasattr(timeframe, 'value') else str(timeframe)
             
-            result = await self.thresholds.delete_many({'timeframe': timeframe_value})
+            result = await self.triggered_thresholds.delete_many({'timeframe': timeframe_value})
             logger.info(f"Cleared {result.deleted_count} thresholds for {timeframe_value} timeframe")
             return True
         except Exception as e:
@@ -789,28 +812,6 @@ class MongoClient:
             logger.error(f"Error getting reference prices: {e}")
             return {}
 
-    async def save_triggered_threshold(self, symbol: str, timeframe: str, thresholds: list):
-        """Save triggered thresholds to database for persistence"""
-        try:
-            # Convert timeframe to string if it's an enum to prevent BSON encoding errors
-            timeframe_value = timeframe.value if hasattr(timeframe, 'value') else str(timeframe)
-            
-            # Convert thresholds to float to ensure consistent storage
-            thresholds_float = [float(t) for t in thresholds]
-            
-            # Use upsert to create or update
-            await self.threshold_state.update_one(
-                {"symbol": symbol, "timeframe": timeframe_value},
-                {"$set": {"thresholds": thresholds_float, "updated_at": datetime.utcnow()}},
-                upsert=True
-            )
-            
-            logger.info(f"Saved threshold state for {symbol} {timeframe_value}: {thresholds_float}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to save threshold state: {e}")
-            return False
-
     async def get_triggered_thresholds(self):
         """Get all triggered thresholds from database"""
         try:
@@ -834,7 +835,7 @@ class MongoClient:
         """Reset triggered thresholds for a specific timeframe"""
         try:
             # Delete all triggered thresholds for this timeframe
-            result = await self.thresholds.delete_many({"timeframe": timeframe})
+            result = await self.triggered_thresholds.delete_many({"timeframe": timeframe})
             deleted_count = result.deleted_count
             
             logger.info(f"Reset {deleted_count} triggered thresholds for {timeframe}")
@@ -1019,19 +1020,6 @@ class MongoClient:
             logger.error(f"Error getting portfolio composition: {e}")
             return {}
 
-    # Add this method to the MongoClient class:
-
-    async def reset_all_triggered_thresholds(self):
-        """Reset all triggered thresholds in the database"""
-        try:
-            # Clear all threshold state documents
-            result = await self.threshold_state.delete_many({})
-            logger.info(f"Cleared {result.deleted_count} threshold states from database")
-            return result.deleted_count
-        except Exception as e:
-            logger.error(f"Error resetting all triggered thresholds: {e}")
-            return 0
-
     async def update_tp_sl_status(self, order_id: str, tp_status: Optional[TPSLStatus] = None, 
                                 sl_status: Optional[TPSLStatus] = None,
                                 tp_triggered_at: Optional[datetime] = None,
@@ -1192,59 +1180,56 @@ class MongoClient:
             return True  # Default to assuming symbol is valid on error
 
     async def save_trading_symbol(self, symbol: str) -> bool:
-        """Save a trading symbol to the database"""
+        """Save a new trading symbol to the database"""
         try:
-            # Normalize the symbol (convert to uppercase)
-            symbol = symbol.upper().strip()
+            # Use update_one with upsert instead of insert to avoid duplicates
+            result = await self.trading_symbols.update_one(
+                {"symbol": symbol},
+                {"$set": {
+                    "symbol": symbol,
+                    "added_at": datetime.utcnow(),
+                    "active": True
+                }},
+                upsert=True
+            )
             
-            # Check if symbol already exists
-            existing = await self.trading_symbols.find_one({"symbol": symbol})
-            if existing:
-                logger.info(f"Symbol {symbol} already in trading symbols list")
-                return False
-            
-            # Insert the new symbol with timestamp
-            await self.trading_symbols.insert_one({
-                "symbol": symbol,
-                "added_at": datetime.utcnow(),
-                "active": True
-            })
-            
-            logger.info(f"Added new trading symbol: {symbol}")
-            return True
+            # Return True if the document was updated or inserted
+            return result.modified_count > 0 or result.upserted_id is not None
         except Exception as e:
             logger.error(f"Error saving trading symbol {symbol}: {e}")
             return False
-        
+
     async def remove_trading_symbol(self, symbol: str) -> bool:
-        """Remove a trading symbol from the database"""
+        """Remove a trading symbol (mark as inactive)"""
         try:
-            symbol = symbol.upper().strip()
-            result = await self.trading_symbols.delete_one({"symbol": symbol})
+            # Update the symbol to be inactive rather than deleting
+            result = await self.trading_symbols.update_one(
+                {"symbol": symbol},
+                {"$set": {
+                    "active": False,
+                    "removed_at": datetime.utcnow()
+                }}
+            )
             
-            if result.deleted_count > 0:
-                logger.info(f"Removed trading symbol: {symbol}")
-                return True
-            else:
-                logger.info(f"Symbol {symbol} not found in trading symbols list")
-                return False
+            # Return true if a document was modified
+            return result.modified_count > 0
         except Exception as e:
             logger.error(f"Error removing trading symbol {symbol}: {e}")
             return False
-        
+
     async def get_trading_symbols(self) -> List[str]:
-        """Get all active trading symbols from the database"""
+        """Get list of all active trading symbols"""
         try:
-            cursor = self.trading_symbols.find({"active": True})
-            symbols = []
+            # Convert the find cursor to a list using to_list
+            symbols_docs = await self.trading_symbols.find(
+                {"active": True}
+            ).to_list(length=None)
             
-            async for doc in cursor:
-                symbols.append(doc["symbol"])
-            
-            logger.info(f"Retrieved {len(symbols)} trading symbols from database")
+            # Extract symbol field from each document
+            symbols = [doc["symbol"] for doc in symbols_docs]
             return symbols
         except Exception as e:
-            logger.error(f"Error getting trading symbols: {e}")
+            logger.error(f"Error retrieving trading symbols: {e}")
             return []
 
     async def add_removed_symbol(self, symbol: str) -> bool:
@@ -1254,7 +1239,7 @@ class MongoClient:
             symbol = symbol.upper().strip()
             
             # Add to the removed symbols collection with timestamp
-            await self.db.removed_symbols.update_one(
+            await self.removed_symbols.update_one(
                 {"symbol": symbol},
                 {"$set": {
                     "symbol": symbol,
@@ -1272,7 +1257,7 @@ class MongoClient:
     async def get_removed_symbols(self) -> List[str]:
         """Get all symbols that were intentionally removed"""
         try:
-            cursor = self.db.removed_symbols.find({})
+            cursor = self.removed_symbols.find({})
             removed_symbols = []
             
             async for doc in cursor:
@@ -1283,5 +1268,3 @@ class MongoClient:
         except Exception as e:
             logger.error(f"Error getting removed symbols: {e}")
             return []
-
-    # ...rest of existing code...
