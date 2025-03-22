@@ -275,7 +275,7 @@ class BinanceClient:
             }
             
             # Get opening prices for all symbols, with format pre-validation
-            for symbol in self.reference_prices.keys():
+            for symbol in self.config['trading']['pairs']:
                 # Skip invalid symbols
                 if not self._is_valid_symbol_format(symbol) or symbol in self.invalid_symbols:
                     continue
@@ -283,17 +283,22 @@ class BinanceClient:
                 try:
                     ticker = await self.client.get_symbol_ticker(symbol=symbol)
                     current_price = float(ticker['price'])
-                    ref_price = await self.get_reference_price(symbol, timeframe)
+                    
+                    # Get previous reference price
+                    ref_price = self.reference_prices.get(symbol, {}).get(timeframe)
                     
                     price_data = {
                         "symbol": symbol,
                         "current_price": current_price,
-                        "reference_price": ref_price,
+                        "reference_price": ref_price or current_price,
                         "price_change": ((current_price - ref_price) / ref_price * 100) if ref_price else 0
                     }
                     reset_data["prices"].append(price_data)
                     
-                    self.reference_prices[symbol][timeframe] = ref_price or current_price
+                    # Store current price as new reference
+                    if symbol not in self.reference_prices:
+                        self.reference_prices[symbol] = {}
+                    self.reference_prices[symbol][timeframe] = current_price
                     
                     # Standardize the triggered_thresholds structure
                     if symbol not in self.triggered_thresholds:
@@ -311,6 +316,7 @@ class BinanceClient:
                         await self.mongo_client.save_triggered_threshold(
                             symbol, timeframe.value, []
                         )
+                    
                 except BinanceAPIException as e:
                     if e.code == -1121 or e.code == -1100:
                         logger.warning(f"Invalid symbol during reset: {symbol}, skipping")
@@ -324,8 +330,12 @@ class BinanceClient:
                     
             self.last_reset[timeframe] = now
             
+            # Save reference prices to database
+            if self.mongo_client:
+                await self.mongo_client.save_reference_prices(self.reference_prices)
+            
             # Send notification via telegram bot if available
-            if self.telegram_bot and reset_data["prices"]:
+            if hasattr(self, 'telegram_bot') and self.telegram_bot and reset_data["prices"]:
                 try:
                     logger.info(f"Sending automatic timeframe reset notification for {timeframe.value}")
                     await self.telegram_bot.send_timeframe_reset_notification(reset_data)
@@ -596,7 +606,10 @@ class BinanceClient:
             for symbol in self.config['trading']['pairs']:
                 # Get current price
                 current_price = await self.get_current_price(symbol)
-                
+                if not current_price:
+                    logger.warning(f"Could not get current price for {symbol}, skipping")
+                    continue
+                    
                 # Store current price as new reference
                 if symbol not in self.reference_prices:
                     self.reference_prices[symbol] = {}
@@ -633,13 +646,15 @@ class BinanceClient:
                     logger.info(f"Cleared thresholds for {symbol} {timeframe.value}: {list(self.triggered_thresholds[symbol][timeframe.value])}")
                 
                 # Clear triggered thresholds for this symbol and timeframe
-                # Ensure we're using a consistent structure
                 self.triggered_thresholds[symbol][timeframe.value] = set()
             
             # Persist changes to database
             if self.mongo_client:
                 await self.mongo_client.save_reference_prices(self.reference_prices)
-                await self.mongo_client.clear_triggered_thresholds(timeframe)
+                await self.mongo_client.reset_timeframe_thresholds(timeframe.value)
+            
+            # Update last reset time
+            self.last_reset[timeframe] = datetime.utcnow()
             
             # Send notification if telegram bot is available
             if reset_data["prices"] and hasattr(self, 'telegram_bot') and self.telegram_bot:

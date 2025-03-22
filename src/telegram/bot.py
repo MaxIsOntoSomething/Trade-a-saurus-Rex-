@@ -1473,27 +1473,34 @@ Menu:
             
             # Get timeframe value, handling both enum and string cases
             timeframe_value = timeframe.value if hasattr(timeframe, "value") else str(timeframe)
+            
+            # Get prices
+            prices = reset_data.get("prices", [])
+            if not prices:
+                logger.warning(f"No price data available for {timeframe_value} reset notification")
+                return
                 
             message_parts = [
-                f"{emoji} {timeframe_value.title()} Reset",
-                f"\nOpening Prices:"
+                f"{emoji} *{timeframe_value.title()} Timeframe Reset*",
+                f"\nThresholds have been reset for all tracked symbols.",
+                f"\n*Reference Prices:*"
             ]
             
+            # Sort symbols alphabetically for better presentation
+            sorted_prices = sorted(prices, key=lambda p: p.get("symbol", ""))
+            
             # Add price information for each symbol
-            for price_data in reset_data.get("prices", []):
+            for price_data in sorted_prices:
                 symbol = price_data.get("symbol", "Unknown")
                 current = price_data.get("current_price", 0)
                 reference = price_data.get("reference_price", 0)
                 change = price_data.get("price_change", 0)
                 
                 message_parts.append(
-                    f"\n{symbol}:"
-                    f"\nOpening: ${reference:,.2f}"
-                    f"\nCurrent: ${current:,.2f}"
-                    f"\nChange: {change:+.2f}%"
+                    f"\n*{symbol}*: ${reference:,.2f} (Current: ${current:,.2f}, {change:+.2f}%)"
                 )
             
-            message_parts.append(f"\n\nAll {timeframe_value} thresholds have been reset.")
+            message_parts.append(f"\n\n_New threshold alerts can now be triggered._")
             
             final_message = "\n".join(message_parts)
             
@@ -1508,6 +1515,7 @@ Menu:
                     await self.app.bot.send_message(
                         chat_id=user_id,
                         text=final_message,
+                        parse_mode="Markdown",
                         reply_markup=self.markup
                     )
                     successful_sends += 1
@@ -1718,6 +1726,14 @@ Menu:
             # Log action
             logger.info(f"User {update.effective_user.id} requested manual reset of all thresholds")
             
+            # First clear database to ensure consistency
+            if hasattr(self, 'mongo_client') and self.mongo_client:
+                try:
+                    await self.mongo_client.reset_all_triggered_thresholds()
+                    logger.info("Successfully cleared all triggered thresholds in database")
+                except Exception as e:
+                    logger.error(f"Error clearing triggered thresholds in database: {e}")
+            
             # Reset thresholds for each timeframe
             results = {}
             timeframes = ['daily', 'weekly', 'monthly']
@@ -1754,17 +1770,8 @@ Menu:
                 
                 await progress_message.edit_text(message, reply_markup=self.markup)
                 
-            # Update the MongoDB database to ensure consistency
-            if self.mongo_client:
-                try:
-                    # Clear all triggered thresholds in database for complete consistency
-                    await self.mongo_client.reset_all_triggered_thresholds()
-                    logger.info("Successfully cleared all triggered thresholds in database")
-                except Exception as e:
-                    logger.error(f"Error clearing triggered thresholds in database: {e}")
-                    
         except Exception as e:
-            logger.error(f"Failed to reset all thresholds: {e}")
+            logger.error(f"Failed to reset all thresholds: {e}", exc_info=True)
             await update.message.reply_text(
                 f"❌ Error resetting thresholds: {str(e)}",
                 reply_markup=self.markup
@@ -2514,6 +2521,7 @@ To change this setting:
         except Exception as e:
             logger.error(f"Error creating portfolio composition chart: {e}", exc_info=True)
             return None
+
     async def send_tp_notification(self, order: Order):
         """Send notification when Take Profit level is triggered"""
         if not order.take_profit or not order.take_profit.triggered_at:
@@ -2981,6 +2989,472 @@ To change this setting:
             logger.error(f"Error creating portfolio composition chart: {e}", exc_info=True)
             return None
 
+    async def send_tp_notification(self, order: Order):
+        """Send notification when Take Profit level is triggered"""
+        if not order.take_profit or not order.take_profit.triggered_at:
+            return
+            
+        # Get base currency from config
+        base_currency = self.config['trading'].get('base_currency', 'USDT')
+        
+        # Extract base asset (remove base currency suffix)
+        base_asset = order.symbol.replace(base_currency, '')
+        
+        # Calculate profit
+        entry_price = float(order.price)
+        tp_price = float(order.take_profit.price)
+        quantity = float(order.quantity)
+        profit_amount = (tp_price - entry_price) * quantity
+        profit_percentage = order.take_profit.percentage
+        
+        message = (
+            f"✅ Take Profit Triggered!\n\n"
+            f"Symbol: {order.symbol}\n"
+            f"Entry Price: ${entry_price:.2f}\n"
+            f"TP Price: ${tp_price:.2f}\n"
+            f"Quantity: {quantity:.8f} {base_asset}\n"
+            f"Profit: ${profit_amount:.2f} (+{profit_percentage:.2f}%)\n"
+            f"Triggered at: {order.take_profit.triggered_at.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        
+        for user_id in self.allowed_users:
+            try:
+                await self.app.bot.send_message(
+                    chat_id=user_id,
+                    text=message,
+                    reply_markup=self.markup
+                )
+            except Exception as e:
+                logger.error(f"Failed to send TP notification to {user_id}: {e}")
+
+    async def send_sl_notification(self, order: Order):
+        """Send notification when Stop Loss level is triggered"""
+        if not order.stop_loss or not order.stop_loss.triggered_at:
+            return
+            
+        # Get base currency from config
+        base_currency = self.config['trading'].get('base_currency', 'USDT')
+        
+        # Extract base asset (remove base currency suffix)
+        base_asset = order.symbol.replace(base_currency, '')
+        
+        # Calculate loss
+        entry_price = float(order.price)
+        sl_price = float(order.stop_loss.price)
+        quantity = float(order.quantity)
+        loss_amount = (sl_price - entry_price) * quantity
+        loss_percentage = -order.stop_loss.percentage  # Make negative for display purposes
+        
+        message = (
+            f"⛔ Stop Loss Triggered!\n\n"
+            f"Symbol: {order.symbol}\n"
+            f"Entry Price: ${entry_price:.2f}\n"
+            f"SL Price: ${sl_price:.2f}\n"
+            f"Quantity: {quantity:.8f} {base_asset}\n"
+            f"Loss: ${loss_amount:.2f} ({loss_percentage:.2f}%)\n"
+            f"Triggered at: {order.stop_loss.triggered_at.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        
+        for user_id in self.allowed_users:
+            try:
+                await self.app.bot.send_message(
+                    chat_id=user_id,
+                    text=message,
+                    reply_markup=self.markup
+                )
+            except Exception as e:
+                logger.error(f"Failed to send SL notification to {user_id}: {e}")
+
+    async def send_api_rate_limit_alert(self, service_name: str, feature: str):
+        """Send alert when an external API rate limit is reached"""
+        message = (
+            f"⚠️ API RATE LIMIT EXCEEDED\n\n"
+            f"Service: {service_name}\n"
+            f"Feature: {feature}\n\n"
+            f"The bot will use simulated data until the rate limit resets."
+        )
+        
+        for user_id in self.allowed_users:
+            try:
+                await self.app.bot.send_message(
+                    chat_id=user_id,
+                    text=message,
+                    reply_markup=self.markup
+                )
+            except Exception as e:
+                logger.error(f"Failed to send API rate limit alert to {user_id}: {e}")
+
+    async def send_api_error_alert(self, service_name: str, error_details: str, feature: str):
+        """Send alert when an external API returns an error"""
+        message = (
+            f"⚠️ API ERROR DETECTED\n\n"
+            f"Service: {service_name}\n"
+            f"Feature: {feature}\n"
+            f"Error: {error_details}\n\n"
+            f"The bot will use simulated data until the API is available again."
+        )
+        
+        for user_id in self.allowed_users:
+            try:
+                await self.app.bot.send_message(
+                    chat_id=user_id,
+                    text=message,
+                    reply_markup=self.markup
+                )
+            except Exception as e:
+                logger.error(f"Failed to send API error alert to {user_id}: {e}")
+
+    async def _generate_sp500_vs_btc_comparison(self, chat_id: int):
+        """Generate and send S&P 500 vs BTC year-to-date comparison chart"""
+        try:
+            # Get current year
+            current_year = datetime.now().year
+            start_date = datetime(current_year, 1, 1)
+            days_since_start = (datetime.now() - start_date).days
+            
+            # Get BTC data for current year
+            btc_data = await self.binance_client.get_historical_prices("BTCUSDT", days_since_start + 5)  # Add buffer days
+            
+            if not btc_data or len(btc_data) < 2:
+                await self.app.bot.send_message(
+                    chat_id=chat_id,
+                    text="Not enough BTC price data for year-to-date comparison.",
+                    reply_markup=self.markup
+                )
+                return
+                
+            # Filter BTC data to only include this year
+            btc_ytd_prices = {}
+            btc_start_price = None
+            
+            for data_point in btc_data:
+                if data_point['timestamp'].year == current_year:
+                    date_str = data_point['timestamp'].strftime('%Y-%m-%d')
+                    price = float(data_point['price'])
+                    
+                    # Set start price to first entry of the year
+                    if btc_start_price is None:
+                        btc_start_price = price
+                    
+                    # Calculate percentage change from start of year
+                    btc_ytd_prices[date_str] = ((price - btc_start_price) / btc_start_price) * 100
+            
+            # Get S&P 500 data from Yahoo scraper
+            sp500_data = await self.binance_client.yahoo_scraper.get_sp500_data(days_since_start + 5)
+            
+            if not sp500_data or len(sp500_data) < 2:
+                await self.app.bot.send_message(
+                    chat_id=chat_id,
+                    text="Failed to get S&P 500 data for year-to-date comparison.",
+                    reply_markup=self.markup
+                )
+                return
+                
+            # Filter S&P 500 data to only include this year
+            sp500_ytd = {}
+            first_date = None
+            first_value = 0
+            
+            # Sort the dates to find the earliest one in the current year
+            dates = sorted(sp500_data.keys())
+            for date in dates:
+                year = int(date.split('-')[0])
+                if year == current_year:
+                    if first_date is None:
+                        first_date = date
+                        first_value = sp500_data[date]
+                    
+                    # Adjust values to be relative to the first day of the year
+                    sp500_ytd[date] = sp500_data[date] - first_value
+            
+            # Create the comparison chart
+            chart_bytes = await self._create_ytd_comparison_chart(btc_ytd_prices, sp500_ytd, current_year)
+            
+            if not chart_bytes:
+                await self.app.bot.send_message(
+                    chat_id=chat_id,
+                    text="Failed to generate comparison chart.",
+                    reply_markup=self.markup
+                )
+                return
+                
+            # Get current values for caption
+            btc_current = list(btc_ytd_prices.values())[-1] if btc_ytd_prices else 0
+            sp500_current = list(sp500_ytd.values())[-1] if sp500_ytd else 0
+            
+            # Send the chart
+            await self.app.bot.send_photo(
+                chat_id=chat_id,
+                photo=chart_bytes,
+                caption=f"📈 {current_year} Year-to-Date Performance Comparison\n\n"
+                        f"🟠 Bitcoin: {btc_current:.2f}%\n"
+                        f"🔵 S&P 500: {sp500_current:.2f}%\n\n"
+                        f"Chart shows percentage change since January 1, {current_year}",
+                reply_markup=self.markup
+            )
+            
+        except Exception as e:
+            logger.error(f"Error generating S&P 500 vs BTC comparison: {e}", exc_info=True)
+            await self.app.bot.send_message(
+                chat_id=chat_id,
+                text=f"❌ Error generating comparison chart: {str(e)}",
+                reply_markup=self.markup
+            )
+            
+    async def _create_ytd_comparison_chart(self, btc_data: dict, sp500_data: dict, year: int) -> Optional[bytes]:
+        """Create year-to-date comparison chart between BTC and S&P 500"""
+        try:
+            import matplotlib.pyplot as plt
+            from matplotlib.ticker import FuncFormatter
+            import matplotlib.dates as mdates
+            import pandas as pd
+            import io
+
+            # Convert data to DataFrames
+            btc_df = pd.DataFrame([
+                {'date': date, 'value': value} for date, value in btc_data.items()
+            ])
+            
+            if not btc_df.empty:
+                btc_df['date'] = pd.to_datetime(btc_df['date'])
+                btc_df.set_index('date', inplace=True)
+                
+            sp500_df = pd.DataFrame([
+                {'date': date, 'value': value} for date, value in sp500_data.items()
+            ])
+            
+            if not sp500_df.empty:
+                sp500_df['date'] = pd.to_datetime(sp500_df['date'])
+                sp500_df.set_index('date', inplace=True)
+            
+            # Create figure
+            fig, ax = plt.subplots(figsize=(12, 8))
+            
+            # Plot both datasets
+            if not btc_df.empty:
+                btc_df['value'].plot(ax=ax, color='orange', linewidth=2, label='Bitcoin')
+            
+            if not sp500_df.empty:
+                sp500_df['value'].plot(ax=ax, color='blue', linewidth=2, label='S&P 500')
+            
+            # Add zero line
+            ax.axhline(y=0, color='gray', linestyle='--', alpha=0.7)
+            
+            # Format chart
+            ax.set_title(f'BTC vs S&P 500 Year-to-Date Performance ({year})')
+            ax.set_ylabel('YTD Change (%)')
+            ax.grid(True, alpha=0.3)
+            
+            # Format y-axis as percentage
+            ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f'{x:.1f}%'))
+            
+            # Format x-axis to show months
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%b'))
+            ax.xaxis.set_major_locator(mdates.MonthLocator())
+            
+            # Add legend
+            ax.legend(loc='best')
+            
+            # Get final values for annotation
+            if not btc_df.empty:
+                final_btc = btc_df['value'].iloc[-1]
+                ax.annotate(f"{final_btc:.1f}%", 
+                          xy=(btc_df.index[-1], final_btc),
+                          xytext=(5, 5), textcoords='offset points')
+            
+            if not sp500_df.empty:
+                final_sp500 = sp500_df['value'].iloc[-1]
+                ax.annotate(f"{final_sp500:.1f}%", 
+                          xy=(sp500_df.index[-1], final_sp500),
+                          xytext=(5, -15), textcoords='offset points')
+            
+            # Save to buffer
+            buf = io.BytesIO()
+            plt.tight_layout()
+            plt.savefig(buf, format='png', dpi=150)
+            plt.close(fig)
+            buf.seek(0)
+            
+            return buf.getvalue()
+            
+        except Exception as e:
+            logger.error(f"Error creating YTD comparison chart: {e}", exc_info=True)
+            return None
+
+    async def _generate_portfolio_composition_chart(self, chat_id: int):
+        """Generate and send portfolio composition pie chart"""
+        try:
+            # Get positions from MongoDB for configured pairs
+            allowed_symbols = set(self.config['trading']['pairs'])
+            positions = await self.mongo_client.get_position_stats(allowed_symbols)
+            
+            if not positions or len(positions) == 0:
+                await self.app.bot.send_message(
+                    chat_id=chat_id,
+                    text="No portfolio data available for composition chart.",
+                    reply_markup=self.markup
+                )
+                return
+            
+            # Get the base currency from config
+            base_currency = self.config['trading'].get('base_currency', 'USDT')
+                
+            # Get base currency balance
+            base_balance = await self.binance_client.get_balance(base_currency)
+            
+            # Get current prices for all positions to calculate current values
+            portfolio_data = []
+            total_value = float(base_balance)  # Start with base currency balance
+            asset_values = {base_currency: float(base_balance)}
+            
+            for symbol, position in positions.items():
+                if float(position['total_quantity']) <= 0:
+                    continue
+                    
+                try:
+                    # Get current price for the symbol
+                    ticker = await self.binance_client.client.get_symbol_ticker(symbol=symbol)
+                    current_price = float(ticker['price'])
+                    
+                    # Calculate current value of the position
+                    position_value = float(position['total_quantity']) * current_price
+                    
+                    # Add to total portfolio value
+                    total_value += position_value
+                    
+                    # Store the value for this asset
+                    base_asset = symbol.replace(base_currency, '')
+                    asset_values[base_asset] = position_value
+                    
+                except Exception as e:
+                    logger.error(f"Error getting price for {symbol}: {e}")
+            
+            # Generate the chart
+            chart_bytes = await self._create_portfolio_composition_chart(asset_values, total_value, base_currency)
+            
+            if not chart_bytes:
+                await self.app.bot.send_message(
+                    chat_id=chat_id,
+                    text="Failed to generate portfolio composition chart.",
+                    reply_markup=self.markup
+                )
+                return
+                
+            # Format a detailed text for the caption
+            caption_lines = ["📊 Portfolio Composition"]
+            for asset, value in sorted(asset_values.items(), key=lambda x: x[1], reverse=True):
+                percentage = (value / total_value * 100) if total_value > 0 else 0
+                caption_lines.append(f"{asset}: ${value:.2f} ({percentage:.1f}%)")
+            
+            caption_lines.append(f"\nTotal Portfolio Value: ${total_value:.2f}")
+            
+            # Send chart to user
+            await self.app.bot.send_photo(
+                chat_id=chat_id,
+                photo=chart_bytes,
+                caption="\n".join(caption_lines),
+                reply_markup=self.markup
+            )
+            
+        except Exception as e:
+            logger.error(f"Error generating portfolio composition chart: {e}", exc_info=True)
+            await self.app.bot.send_message(
+                chat_id=chat_id,
+                text=f"❌ Error generating portfolio composition chart: {str(e)}",
+                reply_markup=self.markup
+            )
+            
+    async def _create_portfolio_composition_chart(self, asset_values: dict, total_value: float, base_currency: str = 'USDT') -> Optional[bytes]:
+        """Create portfolio composition pie chart"""
+        try:
+            import matplotlib.pyplot as plt
+            import numpy as np
+            import io
+            from matplotlib.patches import Wedge
+            
+            # Remove assets with very small percentages to avoid cluttering
+            filtered_assets = {}
+            other_value = 0
+            
+            for asset, value in asset_values.items():
+                percentage = (value / total_value * 100) if total_value > 0 else 0
+                if percentage >= 1.0:  # Only show assets that are at least 1% of portfolio
+                    filtered_assets[asset] = value
+                else:
+                    other_value += value
+                    
+            # Add an "Other" category if needed
+            if other_value > 0:
+                filtered_assets["Other"] = other_value
+                
+            # Sort by value for better presentation
+            sorted_items = sorted(filtered_assets.items(), key=lambda x: x[1], reverse=True)
+            
+            # Create labels and values
+            labels = [item[0] for item in sorted_items]
+            values = [item[1] for item in sorted_items]
+            percentages = [(value / total_value * 100) if total_value > 0 else 0 for value in values]
+            
+            # Generate colors - ensure base currency is a specific color if present
+            colors = plt.cm.tab20.colors[:len(labels)]
+            if base_currency in labels:
+                base_index = labels.index(base_currency)
+                # Use a specific color for base currency - light green
+                colors = list(colors)
+                colors[base_index] = (0.2, 0.8, 0.2, 1.0)  # RGBA for green
+            
+            # Create figure
+            plt.figure(figsize=(10, 8))
+            
+            # Create a slightly more visually appealing pie chart with shadow and explode effect
+            explode = [0.05] * len(labels)  # Small explode effect for all pieces
+            if base_currency in labels:
+                base_index = labels.index(base_currency)
+                explode[base_index] = 0.1  # Larger explode for base currency
+            
+            # Create the pie chart with percentages displayed in legend
+            patches, texts, autotexts = plt.pie(
+                values, 
+                labels=None,  # We'll add custom legend
+                explode=explode,
+                shadow=True,
+                startangle=90,
+                colors=colors,
+                autopct='%1.1f%%',
+                pctdistance=0.85,
+                wedgeprops=dict(width=0.5, edgecolor='w')
+            )
+            
+            # Customize the appearance of percentage text
+            for autotext in autotexts:
+                autotext.set_color('white')
+                autotext.set_fontsize(10)
+                autotext.set_fontweight('bold')
+            
+            # Create a custom legend with both asset and percentage
+            legend_labels = [f"{label} (${value:.2f})" for label, value in zip(labels, values)]
+            plt.legend(
+                patches,
+                legend_labels,
+                loc="center left",
+                bbox_to_anchor=(1, 0.5),
+                frameon=False
+            )
+            
+            plt.title(f"Portfolio Composition ({base_currency})", fontsize=16, pad=20)
+            plt.tight_layout()
+            
+            # Save to buffer
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+            plt.close()
+            buf.seek(0)
+            
+            return buf.getvalue()
+            
+        except Exception as e:
+            logger.error(f"Error creating portfolio composition chart: {e}", exc_info=True)
+            return None
     async def send_tp_notification(self, order: Order):
         """Send notification when Take Profit level is triggered"""
         if not order.take_profit or not order.take_profit.triggered_at:

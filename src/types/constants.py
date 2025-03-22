@@ -36,6 +36,18 @@ PRICE_PRECISION = {
     'QUANTITY': 8
 }
 
+# Notification formatting
+NOTIFICATION_EMOJI = {
+    'DAILY': '📅',
+    'WEEKLY': '📆',
+    'MONTHLY': '📊',
+    'THRESHOLD': '🎯',
+    'RESET': '🔄',
+    'SUCCESS': '✅',
+    'ERROR': '❌',
+    'WARNING': '⚠️'
+}
+
 # Update trading fees based on provided rates
 TRADING_FEES = {
     'DEFAULT': 0.001,  # 0.10% default for spot

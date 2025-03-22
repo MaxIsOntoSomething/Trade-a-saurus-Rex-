@@ -668,6 +668,14 @@ class MongoClient:
             # Convert thresholds to float to ensure consistent storage
             thresholds_float = [float(t) for t in thresholds]
             
+            if not thresholds_float:
+                # If empty, delete the record instead of storing empty list
+                result = await self.threshold_state.delete_one(
+                    {"symbol": symbol, "timeframe": timeframe_value}
+                )
+                logger.info(f"Removed threshold state for {symbol} {timeframe_value} (empty thresholds)")
+                return True
+            
             # Use upsert to create or update
             result = await self.threshold_state.update_one(
                 {"symbol": symbol, "timeframe": timeframe_value},
@@ -827,14 +835,25 @@ class MongoClient:
             # Convert timeframe to string if it's an enum
             timeframe_value = timeframe.value if hasattr(timeframe, 'value') else str(timeframe)
             
-            await self.threshold_state.update_many(
-                {"timeframe": timeframe_value},
-                {"$set": {"thresholds": [], "updated_at": datetime.utcnow()}}
-            )
+            result = await self.threshold_state.delete_many({"timeframe": timeframe_value})
+            affected = result.deleted_count
+            
+            logger.info(f"Reset all thresholds for {timeframe_value} timeframe. {affected} threshold states removed.")
             return True
         except Exception as e:
-            logger.error(f"Failed to reset timeframe thresholds: {e}")
+            logger.error(f"Failed to reset timeframe thresholds: {e}", exc_info=True)
             return False
+
+    async def reset_all_triggered_thresholds(self):
+        """Reset all triggered thresholds in the database"""
+        try:
+            # Clear all threshold state documents
+            result = await self.threshold_state.delete_many({})
+            logger.info(f"Cleared {result.deleted_count} threshold states from database")
+            return result.deleted_count
+        except Exception as e:
+            logger.error(f"Error resetting all triggered thresholds: {e}", exc_info=True)
+            return 0
 
     async def get_portfolio_performance(self, days: int = 90, allowed_symbols: set = None) -> Dict:
         """
@@ -998,7 +1017,7 @@ class MongoClient:
             return result
             
         except Exception as e:
-            logger.error(f"Error getting portfolio composition: {e}", exc_info=True)
+            logger.error(f"Error getting portfolio composition: {e}")
             return {}
 
     # Add this method to the MongoClient class:
