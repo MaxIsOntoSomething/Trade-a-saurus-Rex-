@@ -353,9 +353,8 @@ class OrderManager:
                     "grand_total": {"$sum": "$total_invested"}
                 }}
             ]
-
-            cursor = await self.mongo_client.resolve_cursor(self.mongo_client.orders.aggregate(pipeline))
-            result = await cursor.to_list(1)
+            
+            result = await self.mongo_client.orders.aggregate(pipeline).to_list(1)
             
             if result and len(result) > 0:
                 return Decimal(str(result[0]["grand_total"]))

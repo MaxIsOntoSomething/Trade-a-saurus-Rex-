@@ -21,7 +21,6 @@ services:
       # MongoDB Configuration
       - MONGODB_URI=mongodb://mongodb:27017
       - MONGODB_DATABASE=tradeasaurus
-      - MONGODB_DRIVER=motor
       # Trading Configuration
       - TRADING_BASE_CURRENCY=${TRADING_BASE_CURRENCY:-USDT}
       - TRADING_ORDER_AMOUNT=${TRADING_ORDER_AMOUNT:-100}
