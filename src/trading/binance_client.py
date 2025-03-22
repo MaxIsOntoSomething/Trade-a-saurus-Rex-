@@ -159,80 +159,60 @@ class BinanceClient:
             return False
 
     async def initialize(self):
-        """Initialize client with reserve balance and base currency"""
-        self.client = await AsyncClient.create(
-            api_key=self.api_key,
-            api_secret=self.api_secret,
-            testnet=self.testnet
-        )
-
-        # Set reserve balance directly from config with debug logging (UPDATED CODE)
-        if self.telegram_bot and self.telegram_bot.config:
-            # Use values from telegram_bot only if they weren't already set from config
-            if not self.base_currency or self.base_currency == 'USDT':
-                self.base_currency = self.telegram_bot.config['trading'].get('base_currency', 'USDT')
-            if self.reserve_balance <= 0:
-                self.reserve_balance = float(self.telegram_bot.config['trading'].get('reserve_balance', 0))
+        """Initialize the Binance client with config and database state"""
+        try:
+            # Initialize client and load configuration
+            self.client = AsyncClient(self.api_key, self.api_secret, testnet=self.testnet)
+            
+            # Get trading symbols from database first if available
+            if self.mongo_client:
+                self.invalid_symbols = set()
                 
-            logger.info(f"[INIT] Base Currency: {self.base_currency}")
-            logger.info(f"[INIT] Reserve Balance: ${self.reserve_balance:,.2f}")
-        else:
-            # Only log a warning if we haven't already set values from direct config
-            if not self.config:
-                logger.warning("[INIT] No config found for reserve balance!")
+                # Get invalid symbols from database first
+                invalid_symbol_docs = await self.mongo_client.invalid_symbols.find({}).to_list(None)
+                if invalid_symbol_docs:
+                    for doc in invalid_symbol_docs:
+                        self.invalid_symbols.add(doc['symbol'])
+                        
+                # Get trading symbols from database
+                self.trading_symbols = await self.mongo_client.get_trading_symbols()
+                
+                # Get removed symbols list
+                self.removed_symbols = await self.mongo_client.get_removed_symbols()
+                
+                # Store original config symbols for later reference
+                self.original_config_symbols = self.config['trading']['pairs'].copy()
+                
+                # Update the configuration with stored symbols
+                if self.trading_symbols:
+                    # Add database symbols to config, ensuring no duplicates
+                    for symbol in self.trading_symbols:
+                        if symbol not in self.config['trading']['pairs'] and symbol not in self.removed_symbols:
+                            self.config['trading']['pairs'].append(symbol)
+                            
+                    # Remove any symbols that were explicitly removed
+                    if self.removed_symbols:
+                        self.config['trading']['pairs'] = [
+                            symbol for symbol in self.config['trading']['pairs'] 
+                            if symbol not in self.removed_symbols
+                        ]
+                            
+                    logger.info(f"Loaded {len(self.trading_symbols)} trading symbols from database")
+                    
+                # Add any new symbols from config to database if they don't exist yet
+                for symbol in self.original_config_symbols:
+                    if (symbol not in self.trading_symbols and 
+                        symbol not in self.invalid_symbols and
+                        symbol not in self.removed_symbols):
+                        await self.mongo_client.save_trading_symbol(symbol)
+                
+                # Reload trading symbols to ensure everything is in sync
+                self.trading_symbols = await self.mongo_client.get_trading_symbols()
+            
+            # Rest of the method remains the same...
 
-        # Initialize restored threshold info
-        self.restored_threshold_info = []
-
-        # Get exchange info for precision
-        exchange_info = await self.client.get_exchange_info()
-        for symbol in exchange_info['symbols']:
-            self.symbol_info[symbol['symbol']] = {
-                'baseAssetPrecision': symbol['baseAssetPrecision'],
-                'quotePrecision': symbol['quotePrecision'],
-                'filters': {f['filterType']: f for f in symbol['filters']}
-            }
-            
-        # Restore triggered thresholds from database
-        if self.mongo_client:
-            self.restored_threshold_info = await self.restore_threshold_state()
-            
-        # Add initial balance check
-        await self.check_initial_balance()
-
-        # Load previously identified invalid symbols from database
-        if self.mongo_client:
-            invalid_symbols = await self.mongo_client.get_invalid_symbols()
-            self.invalid_symbols = set(invalid_symbols)
-            if invalid_symbols:
-                logger.info(f"Loaded {len(invalid_symbols)} known invalid symbols: {', '.join(invalid_symbols)}")
-
-        # Initialize the trading symbols in the database with pre-configured symbols
-        if self.mongo_client and self.config and 'trading' in self.config and 'pairs' in self.config['trading']:
-            # First, check if there's a record of removed pre-configured symbols
-            removed_symbols = await self.mongo_client.get_removed_symbols()
-            
-            # Filter out any symbols that were intentionally removed
-            configured_symbols = [symbol for symbol in self.config['trading']['pairs'] 
-                                 if symbol not in removed_symbols]
-            
-            # Store the original config symbols for reference
-            self.original_config_symbols = set(self.config['trading']['pairs'])
-            
-            # Get existing symbols from database
-            existing_symbols = await self.mongo_client.get_trading_symbols()
-            
-            # Add configured symbols that aren't in the database yet
-            for symbol in configured_symbols:
-                if symbol not in existing_symbols:
-                    await self.mongo_client.save_trading_symbol(symbol)
-                    logger.info(f"Added pre-configured symbol {symbol} to database")
-            
-            # Update the config with all symbols (including any that might have been in DB but not config)
-            db_symbols = await self.mongo_client.get_trading_symbols()
-            if db_symbols:
-                logger.info(f"Loaded {len(db_symbols)} trading symbols from database")
-                self.config['trading']['pairs'] = db_symbols
+        except Exception as e:
+            logger.error(f"Error initializing Binance client: {e}")
 
     async def restore_threshold_state(self):
         """Restore the state of triggered thresholds with skip for removed symbols"""

@@ -354,7 +354,9 @@ class OrderManager:
                 }}
             ]
             
-            result = await self.mongo_client.orders.aggregate(pipeline).to_list(1)
+            # Update to proper cursor handling for async
+            cursor = self.mongo_client.orders.aggregate(pipeline)
+            result = await cursor.to_list(length=1)
             
             if result and len(result) > 0:
                 return Decimal(str(result[0]["grand_total"]))
