@@ -207,55 +207,92 @@ class BinanceClient:
             if invalid_symbols:
                 logger.info(f"Loaded {len(invalid_symbols)} known invalid symbols: {', '.join(invalid_symbols)}")
 
+        # Initialize the trading symbols in the database with pre-configured symbols
+        if self.mongo_client and self.config and 'trading' in self.config and 'pairs' in self.config['trading']:
+            # First, check if there's a record of removed pre-configured symbols
+            removed_symbols = await self.mongo_client.get_removed_symbols()
+            
+            # Filter out any symbols that were intentionally removed
+            configured_symbols = [symbol for symbol in self.config['trading']['pairs'] 
+                                 if symbol not in removed_symbols]
+            
+            # Store the original config symbols for reference
+            self.original_config_symbols = set(self.config['trading']['pairs'])
+            
+            # Get existing symbols from database
+            existing_symbols = await self.mongo_client.get_trading_symbols()
+            
+            # Add configured symbols that aren't in the database yet
+            for symbol in configured_symbols:
+                if symbol not in existing_symbols:
+                    await self.mongo_client.save_trading_symbol(symbol)
+                    logger.info(f"Added pre-configured symbol {symbol} to database")
+            
+            # Update the config with all symbols (including any that might have been in DB but not config)
+            db_symbols = await self.mongo_client.get_trading_symbols()
+            if db_symbols:
+                logger.info(f"Loaded {len(db_symbols)} trading symbols from database")
+                self.config['trading']['pairs'] = db_symbols
+
     async def restore_threshold_state(self):
-        """Restore triggered thresholds from database on startup"""
+        """Restore the state of triggered thresholds with skip for removed symbols"""
         try:
-            logger.info("Restoring threshold state from database...")
-            threshold_states = await self.mongo_client.get_triggered_thresholds()
+            if not self.mongo_client:
+                logger.error("Cannot restore thresholds without MongoDB client")
+                return
             
-            restored_count = 0
-            restored_info = {}  # Change to dictionary to properly track thresholds by symbol/timeframe
+            # Get list of removed symbols
+            removed_symbols = set(await self.mongo_client.get_removed_symbols())
             
-            # Process each threshold state and update the internal dictionary
-            for state in threshold_states:
-                symbol = state.get("symbol")
-                timeframe_str = state.get("timeframe")
-                thresholds = state.get("thresholds", [])
+            # Get all triggered thresholds from database
+            all_thresholds = await self.mongo_client.get_triggered_thresholds()
+            
+            if not all_thresholds:
+                logger.info("No previously triggered thresholds to restore")
+                return
+            
+            # Dictionary to store by symbol for telegram notification
+            restored_by_symbol = {}
+            
+            for entry in all_thresholds:
+                symbol = entry.get('symbol')
+                timeframe = entry.get('timeframe')
+                thresholds = entry.get('thresholds', [])
                 
-                # Skip if any required data is missing
-                if not symbol or not timeframe_str:
+                # Skip if this symbol has been removed by the user
+                if symbol in removed_symbols:
+                    logger.info(f"Skipping threshold restoration for removed symbol: {symbol}")
                     continue
-                    
-                # Ensure pair is in our tracking dictionary
+                
+                # Skip if invalid data
+                if not symbol or not timeframe or not thresholds:
+                    continue
+                
+                # Skip if the symbol is not in configured trading pairs
+                if symbol not in self.config['trading']['pairs']:
+                    logger.warning(f"Skipping threshold restoration for unconfigured symbol: {symbol}")
+                    continue
+                
+                # Restore to in-memory state
                 if symbol not in self.triggered_thresholds:
-                    self.triggered_thresholds[symbol] = {
-                        'daily': set(),
-                        'weekly': set(),
-                        'monthly': set()
-                    }
+                    self.triggered_thresholds[symbol] = {}
                 
-                # Convert thresholds to a set of floats and update internal state
-                threshold_set = set(float(t) for t in thresholds)
-                self.triggered_thresholds[symbol][timeframe_str] = threshold_set
+                self.triggered_thresholds[symbol][timeframe] = thresholds
                 
-                # Track restored thresholds in a structured way for notifications
-                if symbol not in restored_info:
-                    restored_info[symbol] = {}
-                    
-                if threshold_set:  # Only include timeframes with thresholds
-                    timeframe_enum = TimeFrame(timeframe_str)
-                    restored_info[symbol][timeframe_enum] = threshold_set
-                    restored_count += len(threshold_set)
-                    logger.info(f"Restored {len(threshold_set)} thresholds for {symbol} {timeframe_str}")
+                # Build data for telegram notification
+                if symbol not in restored_by_symbol:
+                    restored_by_symbol[symbol] = {}
+                
+                restored_by_symbol[symbol][timeframe] = thresholds
+                
+            # Notify via telegram
+            if restored_by_symbol and self.telegram_bot:
+                await self.telegram_bot.send_threshold_restoration_notification(restored_by_symbol)
             
-            logger.info(f"Restored {restored_count} thresholds across {len(restored_info)} symbols")
-            self.restored_threshold_info = restored_info
-            return restored_info
+            logger.info(f"Restored triggered thresholds: {self.triggered_thresholds}")
             
         except Exception as e:
-            logger.error(f"Failed to restore threshold state: {e}")
-            self.restored_threshold_info = {}
-            return {}
+            logger.error(f"Error restoring triggered thresholds: {e}")
 
     async def close(self):
         if self.client:
@@ -787,11 +824,21 @@ class BinanceClient:
             raise
 
     async def cancel_order(self, symbol: str, order_id: str) -> bool:
-        """Cancel an order"""
+        """Cancel an order with proper error handling"""
         try:
             await self.client.cancel_order(symbol=symbol, orderId=order_id)
+            logger.info(f"Successfully cancelled order {order_id} for {symbol}")
             return True
-        except BinanceAPIException as e:
+        except Exception as e:
+            error_msg = str(e)
+            
+            # Handle specific API errors more gracefully
+            if "Unknown order sent" in error_msg or "code=-2011" in error_msg:
+                # Order already filled, cancelled, or doesn't exist
+                logger.warning(f"Order {order_id} for {symbol} already cancelled or doesn't exist")
+                # Return True so the calling code knows to update the DB
+                return True
+            
             logger.error(f"Failed to cancel order: {e}")
             return False
             

@@ -77,6 +77,11 @@ class OrderManager:
     async def process_symbol(self, symbol: str):
         """Process a single symbol for threshold checking"""
         try:
+            # Skip if the symbol was removed during this cycle
+            if hasattr(self.binance_client, 'removed_symbols_this_cycle') and symbol in self.binance_client.removed_symbols_this_cycle:
+                logger.info(f"Skipping symbol {symbol} that was removed this cycle")
+                return
+                
             # Skip invalid symbols
             if symbol in self.binance_client.invalid_symbols:
                 logger.debug(f"Skipping known invalid symbol: {symbol}")
@@ -86,6 +91,13 @@ class OrderManager:
             if hasattr(self.binance_client, 'telegram_bot') and self.binance_client.telegram_bot.is_paused:
                 logger.info(f"Trading is paused, skipping {symbol}")
                 return
+            
+            # Also, double-check against current trading_symbols list in database
+            if self.mongo_client:
+                trading_symbols = await self.mongo_client.get_trading_symbols()
+                if trading_symbols is not None and symbol not in trading_symbols:
+                    logger.info(f"Skipping {symbol} - not in active trading symbols list")
+                    return
                 
             # Get current price
             current_price = await self.binance_client.get_current_price(symbol)
@@ -163,6 +175,10 @@ class OrderManager:
                 time_since_last = current_time - last_check
                 logger.info(f"Time since last check: {time_since_last:.2f}s")
                 last_check = current_time
+
+                # Reset the removed_symbols_this_cycle at the start of each new cycle
+                if hasattr(self.binance_client, 'removed_symbols_this_cycle'):
+                    self.binance_client.removed_symbols_this_cycle = set()
 
                 if not await self.check_connection_health():
                     logger.error("Connection health check failed, waiting 30s...")

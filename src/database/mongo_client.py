@@ -19,6 +19,7 @@ class MongoClient:
         self.thresholds = self.db.thresholds  # Add this line for thresholds collection
         self.reference_prices = self.db.reference_prices  # Add this line for reference prices collection
         self.invalid_symbols = self.db.invalid_symbols  # Add collection for invalid symbols
+        self.trading_symbols = self.db.trading_symbols  # New collection for trading symbols
 
     async def init_indexes(self):
         await self.orders.create_index("order_id", unique=True)
@@ -1189,5 +1190,98 @@ class MongoClient:
         except Exception as e:
             logger.error(f"Error checking symbol validity for {symbol}: {e}")
             return True  # Default to assuming symbol is valid on error
+
+    async def save_trading_symbol(self, symbol: str) -> bool:
+        """Save a trading symbol to the database"""
+        try:
+            # Normalize the symbol (convert to uppercase)
+            symbol = symbol.upper().strip()
+            
+            # Check if symbol already exists
+            existing = await self.trading_symbols.find_one({"symbol": symbol})
+            if existing:
+                logger.info(f"Symbol {symbol} already in trading symbols list")
+                return False
+            
+            # Insert the new symbol with timestamp
+            await self.trading_symbols.insert_one({
+                "symbol": symbol,
+                "added_at": datetime.utcnow(),
+                "active": True
+            })
+            
+            logger.info(f"Added new trading symbol: {symbol}")
+            return True
+        except Exception as e:
+            logger.error(f"Error saving trading symbol {symbol}: {e}")
+            return False
+        
+    async def remove_trading_symbol(self, symbol: str) -> bool:
+        """Remove a trading symbol from the database"""
+        try:
+            symbol = symbol.upper().strip()
+            result = await self.trading_symbols.delete_one({"symbol": symbol})
+            
+            if result.deleted_count > 0:
+                logger.info(f"Removed trading symbol: {symbol}")
+                return True
+            else:
+                logger.info(f"Symbol {symbol} not found in trading symbols list")
+                return False
+        except Exception as e:
+            logger.error(f"Error removing trading symbol {symbol}: {e}")
+            return False
+        
+    async def get_trading_symbols(self) -> List[str]:
+        """Get all active trading symbols from the database"""
+        try:
+            cursor = self.trading_symbols.find({"active": True})
+            symbols = []
+            
+            async for doc in cursor:
+                symbols.append(doc["symbol"])
+            
+            logger.info(f"Retrieved {len(symbols)} trading symbols from database")
+            return symbols
+        except Exception as e:
+            logger.error(f"Error getting trading symbols: {e}")
+            return []
+
+    async def add_removed_symbol(self, symbol: str) -> bool:
+        """Add a symbol to the removed symbols list"""
+        try:
+            # Normalize the symbol
+            symbol = symbol.upper().strip()
+            
+            # Add to the removed symbols collection with timestamp
+            await self.db.removed_symbols.update_one(
+                {"symbol": symbol},
+                {"$set": {
+                    "symbol": symbol,
+                    "removed_at": datetime.utcnow(),
+                }},
+                upsert=True
+            )
+            
+            logger.info(f"Added {symbol} to removed symbols list")
+            return True
+        except Exception as e:
+            logger.error(f"Error adding symbol to removed list: {e}")
+            return False
+
+    async def get_removed_symbols(self) -> List[str]:
+        """Get all symbols that were intentionally removed"""
+        try:
+            cursor = self.db.removed_symbols.find({})
+            removed_symbols = []
+            
+            async for doc in cursor:
+                removed_symbols.append(doc["symbol"])
+            
+            logger.info(f"Found {len(removed_symbols)} removed symbols")
+            return removed_symbols
+        except Exception as e:
+            logger.error(f"Error getting removed symbols: {e}")
+            return []
 
     # ...rest of existing code...

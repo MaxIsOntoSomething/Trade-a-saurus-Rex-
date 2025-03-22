@@ -139,6 +139,14 @@ Status: Ready to ROAR! 🦖
         self.app.add_handler(CommandHandler("viz", self.show_viz_menu))
         self.app.add_handler(CallbackQueryHandler(self.handle_viz_selection, pattern="^(daily_volume|profit_distribution|order_types|hourly_activity|balance_chart|roi_comparison|sp500_vs_btc|portfolio_composition)$"))
         
+        # Add symbol management commands
+        self.app.add_handler(CommandHandler("add_symbol", self.add_symbol_command))
+        self.app.add_handler(CommandHandler("remove_symbol", self.remove_symbol_command))
+        self.app.add_handler(CommandHandler("list_symbols", self.list_symbols_command))
+        
+        # Add callback handler for symbol management
+        self.app.add_handler(CallbackQueryHandler(self.handle_symbol_callback, pattern="^remove_symbol:"))
+        
         await self.app.initialize()
         await self.app.start()
         await self.send_restored_thresholds_message()
@@ -280,31 +288,84 @@ Menu:
         )
 
     async def get_balance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Get current balance"""
+        """Get current balance information"""
         if not self._is_authorized(update.effective_user.id):
-            await update.message.reply_text("⛔ Unauthorized access")
+            await update.message.reply_text("You're not authorized to use this bot.")
             return
-            
+
         try:
-            account = await self.binance_client.client.get_account()
+            # Get all balances from Binance
+            all_balances = await self.binance_client.client.get_account()
             
-            # Get base currency from config
-            base_currency = self.config['trading'].get('base_currency', 'USDT')
+            if not all_balances or 'balances' not in all_balances:
+                await update.message.reply_text("❌ Error retrieving balance information.")
+                return
+                
+            # Get list of active trading symbols
+            active_symbols = await self.mongo_client.get_trading_symbols()
             
-            # Highlight the base currency in the list
+            # Extract base currency from symbols (e.g., USDT from BTCUSDT)
+            base_currency = self.binance_client.base_currency
+            
+            # Create set of traded assets by extracting the first part of each symbol
+            traded_assets = set()
+            for symbol in active_symbols:
+                if symbol.endswith(base_currency):
+                    # For pairs like BTCUSDT, extract BTC
+                    traded_assets.add(symbol[:-len(base_currency)])
+                elif base_currency in symbol:
+                    # Fallback for other formats
+                    traded_assets.add(symbol.replace(base_currency, ''))
+                    
+            # Format the balances
             balances = []
-            for asset in account['balances']:
-                if float(asset['free']) > 0:
-                    if asset['asset'] == base_currency:
-                        # Highlight base currency
-                        balances.append(f"💵 {asset['asset']}: {asset['free']} (Base Currency)")
-                    else:
-                        balances.append(f"{asset['asset']}: {asset['free']}")
+            for balance in all_balances['balances']:
+                asset = balance['asset']
+                free = float(balance['free'])
+                locked = float(balance['locked'])
+                total = free + locked
+                
+                # Skip assets with zero balance
+                if total <= 0:
+                    continue
+                    
+                # Highlight active trading assets
+                prefix = ""
+                if asset in traded_assets:
+                    prefix = "🔵 "  # Blue dot for active trading assets
+                elif asset == base_currency:
+                    prefix = "💵 "  # Cash symbol for base currency
+                    
+                if asset == base_currency:
+                    # Format base currency with special label
+                    balances.append(f"{prefix}{asset}: {total:.8f} (Base Currency)")
+                else:
+                    balances.append(f"{prefix}{asset}: {total:.8f}")
+                
+            # Sort balances: first base currency, then active trading assets, then others
+            sorted_balances = []
             
-            message = "💰 Current Balance:\n" + "\n".join(balances)
-            await update.message.reply_text(message)
+            # First add base currency
+            base_entries = [b for b in balances if f"💵 {base_currency}:" in b]
+            sorted_balances.extend(base_entries)
+            
+            # Then add active trading assets
+            active_entries = [b for b in balances if b.startswith("🔵 ") and f"💵 {base_currency}:" not in b]
+            sorted_balances.extend(active_entries)
+            
+            # Then add remaining assets
+            other_entries = [b for b in balances if not b.startswith("🔵 ") and f"💵 {base_currency}:" not in b]
+            sorted_balances.extend(other_entries)
+            
+            # Create response text
+            response = "💰 Current Balance:\n" + "\n".join(sorted_balances)
+            
+            # Send response
+            await update.message.reply_text(response)
+            
         except Exception as e:
-            await update.message.reply_text(f"❌ Error getting balance: {str(e)}")
+            logging.error(f"Error getting balance: {e}")
+            await update.message.reply_text(f"❌ Error: {str(e)}")
 
     async def get_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Get trading statistics"""
@@ -584,41 +645,46 @@ Menu:
                     logger.error(f"Completely failed to send notification: {e2}")
 
     async def show_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show all available commands with descriptions"""
+        """Show available commands"""
         if not self._is_authorized(update.effective_user.id):
-            await update.message.reply_text("⛔ Unauthorized access")
+            await update.message.reply_text("You're not authorized to use this bot.")
             return
-            
-        menu_text = """
-🦖 Trade-a-saurus Rex Commands:
 
-Trading Controls:
-/start - Start the bot and show welcome message
-/power - Toggle trading on/off
-
-Trading Information:
-/balance - Check current balance
-/stats - View trading statistics
-/history - View recent order history
-/thresholds - Show threshold status and resets
-/viz - Show data visualizations 📊
-
-Trading Actions:
-/add - Add a manual trade (interactive)
-/resetthresholds - Reset all thresholds across timeframes
-
-Take Profit & Stop Loss:
-/tp_sl - View current TP/SL settings
-/set_tp - Set take profit percentage (example: /set_tp 5)
-/set_sl - Set stop loss percentage (example: /set_sl 3)
-
-Entry Protection:
-/lower_entries - View lower entries protection status
-/set_lower_entries - Toggle protection on/off (example: /set_lower_entries on)
-
-Menu:
-/menu - Show this command list
-"""
+        menu_text = "🦖 Trade-a-saurus Rex Commands:\n\n"
+        
+        menu_text += "Trading Controls:\n"
+        menu_text += "/start - Start the bot and show welcome message\n"
+        menu_text += "/power - Toggle trading on/off\n\n"
+        
+        menu_text += "Trading Information:\n"
+        menu_text += "/balance - Check current balance\n"
+        menu_text += "/stats - View trading statistics\n"
+        menu_text += "/history - View recent order history\n"
+        menu_text += "/thresholds - Show threshold status and resets\n"
+        menu_text += "/viz - Show data visualizations 📊\n\n"
+        
+        menu_text += "Trading Actions:\n"
+        menu_text += "/add - Add a manual trade (interactive)\n"
+        menu_text += "/resetthresholds - Reset all thresholds across timeframes\n\n"
+        
+        menu_text += "Take Profit & Stop Loss:\n"
+        menu_text += "/tp_sl - View current TP/SL settings\n"
+        menu_text += "/set_tp - Set take profit percentage (example: /set_tp 5)\n"
+        menu_text += "/set_sl - Set stop loss percentage (example: /set_sl 3)\n\n"
+        
+        menu_text += "Entry Protection:\n"
+        menu_text += "/lower_entries - View lower entries protection status\n"
+        menu_text += "/set_lower_entries - Toggle protection on/off (example: /set_lower_entries on)\n\n"
+        
+        # Add new section for Symbol Management
+        menu_text += "Symbol Management:\n"
+        menu_text += "/add_symbol - Add a new trading symbol (example: /add_symbol BTCUSDT)\n"
+        menu_text += "/remove_symbol - Remove a trading symbol\n"
+        menu_text += "/list_symbols - List all configured trading symbols\n\n"
+        
+        menu_text += "Menu:\n"
+        menu_text += "/menu - Show this command list"
+        
         await update.message.reply_text(menu_text)
 
     async def show_thresholds(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2478,4 +2544,295 @@ To change this setting:
         except Exception as e:
             logger.error(f"Error creating portfolio composition chart: {e}", exc_info=True)
             return None
+
+    async def add_symbol_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Add a new symbol to the trading list"""
+        if not self._is_authorized(update.effective_user.id):
+            await update.message.reply_text("You're not authorized to use this bot.")
+            return
+            
+        # Check if we have arguments (symbol)
+        if not context.args or len(context.args) < 1:
+            await update.message.reply_text(
+                "Please provide a symbol to add. Example: /add_symbol BTCUSDT"
+            )
+            return
+            
+        symbol = context.args[0].upper().strip()
+        
+        # Validate the symbol format
+        if not self.binance_client._is_valid_symbol_format(symbol):
+            await update.message.reply_text(
+                f"❌ Invalid symbol format: {symbol}\n"
+                "Symbol should be in the format BTCUSDT, ETHUSDT, etc."
+            )
+            return
+            
+        # Check if the symbol is valid on Binance
+        is_valid = await self.binance_client.check_symbol_validity(symbol)
+        
+        if not is_valid:
+            await update.message.reply_text(
+                f"❌ Symbol {symbol} is not valid on Binance."
+            )
+            return
+            
+        # Add to database
+        success = await self.mongo_client.save_trading_symbol(symbol)
+        
+        if success:
+            # Add to the active config as well
+            if symbol not in self.binance_client.config['trading']['pairs']:
+                self.binance_client.config['trading']['pairs'].append(symbol)
+                
+            await update.message.reply_text(
+                f"✅ Successfully added {symbol} to the trading symbols list."
+            )
+        else:
+            await update.message.reply_text(
+                f"ℹ️ Symbol {symbol} is already in the trading list."
+            )
+
+    async def remove_symbol_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Remove a symbol from the trading list"""
+        if not self._is_authorized(update.effective_user.id):
+            await update.message.reply_text("You're not authorized to use this bot.")
+            return
+            
+        # Check if we have arguments (symbol)
+        if not context.args or len(context.args) < 1:
+            # Show a list of symbols with buttons to remove
+            symbols = await self.mongo_client.get_trading_symbols()
+            
+            if not symbols:
+                await update.message.reply_text("No trading symbols configured.")
+                return
+                
+            keyboard = []
+            for symbol in symbols:
+                keyboard.append([InlineKeyboardButton(f"Remove {symbol}", callback_data=f"remove_symbol:{symbol}")])
+                
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.message.reply_text(
+                "Select a symbol to remove:",
+                reply_markup=reply_markup
+            )
+            return
+            
+        symbol = context.args[0].upper().strip() if context.args else None
+        
+        if not symbol:
+            # Show list of symbols with buttons - existing code
+            return
+        
+        # Check if this was a pre-configured symbol
+        was_preconfigured = hasattr(self.binance_client, 'original_config_symbols') and \
+                           symbol in self.binance_client.original_config_symbols
+        
+        # Remove from database
+        success = await self.mongo_client.remove_trading_symbol(symbol)
+        
+        if success:
+            # IMPORTANT: Update the active config immediately
+            if symbol in self.binance_client.config['trading']['pairs']:
+                self.binance_client.config['trading']['pairs'].remove(symbol)
+                
+            # 1. Cancel any pending orders for this symbol
+            canceled_orders = await self._cancel_symbol_orders(symbol)
+            
+            # 2. Clear any triggered thresholds for this symbol
+            cleared_thresholds = await self._clear_symbol_thresholds(symbol)
+                
+            # If it was a pre-configured symbol, add it to the removed list
+            if was_preconfigured:
+                await self.mongo_client.add_removed_symbol(symbol)
+                message = f"✅ Successfully removed {symbol} from the trading symbols list.\n" \
+                         f"• Canceled {canceled_orders} pending orders\n" \
+                         f"• Cleared thresholds for all timeframes\n" \
+                         f"(This pre-configured symbol will not be auto-added on restart)"
+            else:
+                message = f"✅ Successfully removed {symbol} from the trading symbols list.\n" \
+                         f"• Canceled {canceled_orders} pending orders\n" \
+                         f"• Cleared thresholds for all timeframes"
+            
+            await update.message.reply_text(message)
+        else:
+            await update.message.reply_text(
+                f"❌ Symbol {symbol} not found in the trading list."
+            )
+
+    async def list_symbols_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """List all trading symbols"""
+        if not self._is_authorized(update.effective_user.id):
+            await update.message.reply_text("You're not authorized to use this bot.")
+            return
+            
+        symbols = await self.mongo_client.get_trading_symbols()
+        
+        if not symbols:
+            await update.message.reply_text("No trading symbols configured.")
+            return
+            
+        # Format the message
+        message = "📊 *Configured Trading Symbols*\n\n"
+        for i, symbol in enumerate(sorted(symbols), 1):
+            # Get current price if possible
+            try:
+                price = await self.binance_client.get_current_price(symbol)
+                price_text = f"${price:,.2f}" if price else "N/A"
+            except:
+                price_text = "N/A"
+            
+            # Check if this was in the original config
+            was_preconfigured = symbol in self.config.get('trading', {}).get('original_pairs', [])
+            symbol_marker = "🔹" if was_preconfigured else "🆕"
+                
+            message += f"{i}. {symbol_marker} `{symbol}` - {price_text}\n"
+        
+        message += "\n🔹 Pre-configured  🆕 Manually added"
+        
+        await update.message.reply_text(
+            message,
+            parse_mode='Markdown'
+        )
+
+    async def handle_symbol_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle callback for symbol management"""
+        query = update.callback_query
+        await query.answer()
+        
+        data = query.data
+        
+        if data.startswith("remove_symbol:"):
+            symbol = data.split(":")[1]
+            
+            # Check if this was a pre-configured symbol
+            was_preconfigured = hasattr(self.binance_client, 'original_config_symbols') and \
+                               symbol in self.binance_client.original_config_symbols
+            
+            # Remove from database
+            success = await self.mongo_client.remove_trading_symbol(symbol)
+            
+            if success:
+                # Remove from the active config as well
+                if symbol in self.binance_client.config['trading']['pairs']:
+                    self.binance_client.config['trading']['pairs'].remove(symbol)
+                
+                # Cancel any pending orders for this symbol
+                canceled_orders = await self._cancel_symbol_orders(symbol)
+                
+                # Clear any triggered thresholds for this symbol
+                cleared_thresholds = await self._clear_symbol_thresholds(symbol)
+                    
+                # If it was a pre-configured symbol, add it to the removed list
+                if was_preconfigured:
+                    await self.mongo_client.add_removed_symbol(symbol)
+                    message = f"✅ Successfully removed {symbol} from the trading symbols list.\n" \
+                             f"• Canceled {canceled_orders} pending orders\n" \
+                             f"• Cleared thresholds for all timeframes\n" \
+                             f"(This pre-configured symbol will not be auto-added on restart)"
+                else:
+                    message = f"✅ Successfully removed {symbol} from the trading symbols list.\n" \
+                             f"• Canceled {canceled_orders} pending orders\n" \
+                             f"• Cleared thresholds for all timeframes"
+                
+                await query.edit_message_text(message)
+            else:
+                await query.edit_message_text(
+                    f"❌ Symbol {symbol} not found in the trading list."
+                )
+
+    # Add helper methods to cancel orders and clear thresholds
+    async def _cancel_symbol_orders(self, symbol: str) -> int:
+        """Cancel all pending orders for a specific symbol"""
+        try:
+            # Find all pending orders for this symbol
+            pending_orders = await self.mongo_client.orders.find({
+                "symbol": symbol,
+                "status": "pending"
+            }).to_list(None)
+            
+            cancelled_count = 0
+            skipped_count = 0
+            for order in pending_orders:
+                order_id = order.get("order_id")
+                if order_id:
+                    try:
+                        # Try to cancel on Binance
+                        if await self.binance_client.cancel_order(symbol, order_id):
+                            # Update status in database
+                            await self.mongo_client.update_order_status(
+                                order_id, 
+                                OrderStatus.CANCELLED,
+                                cancelled_at=datetime.utcnow()
+                            )
+                            cancelled_count += 1
+                        else:
+                            # If cancel_order returns False, still update DB status
+                            await self.mongo_client.update_order_status(
+                                order_id, 
+                                OrderStatus.CANCELLED,
+                                cancelled_at=datetime.utcnow()
+                            )
+                            cancelled_count += 1
+                    except Exception as e:
+                        # Handle "Unknown order" errors by updating DB anyway
+                        if "Unknown order sent" in str(e) or "code=-2011" in str(e):
+                            logging.warning(f"Order {order_id} already cancelled or filled on exchange, updating database")
+                            await self.mongo_client.update_order_status(
+                                order_id, 
+                                OrderStatus.CANCELLED,
+                                cancelled_at=datetime.utcnow()
+                            )
+                            cancelled_count += 1
+                        else:
+                            logging.error(f"Error cancelling order {order_id}: {e}")
+                            skipped_count += 1
+                        
+            # Return the results
+            if skipped_count > 0:
+                logging.warning(f"Cancelled {cancelled_count} orders, skipped {skipped_count} orders due to errors")
+            return cancelled_count
+        except Exception as e:
+            logging.error(f"Error canceling orders for {symbol}: {e}")
+            return 0
+
+    async def _clear_symbol_thresholds(self, symbol: str) -> bool:
+        """Clear all triggered thresholds for a specific symbol"""
+        try:
+            # Clear from database - update to be more thorough
+            for timeframe in TimeFrame:
+                # Delete from threshold_state collection
+                await self.mongo_client.threshold_state.delete_one({
+                    "symbol": symbol,
+                    "timeframe": timeframe.value
+                })
+                
+                # Also clear from triggered_thresholds collection
+                await self.mongo_client.triggered_thresholds.delete_one({
+                    "symbol": symbol,
+                    "timeframe": timeframe.value
+                })
+            
+            # Clear from BinanceClient memory
+            if hasattr(self.binance_client, 'triggered_thresholds') and symbol in self.binance_client.triggered_thresholds:
+                del self.binance_client.triggered_thresholds[symbol]
+                
+            # Also remove from reference_prices if it exists there
+            if hasattr(self.binance_client, 'reference_prices') and symbol in self.binance_client.reference_prices:
+                for timeframe in TimeFrame:
+                    timeframe_key = f"{symbol}_{timeframe.value}"
+                    if timeframe_key in self.binance_client.reference_prices:
+                        del self.binance_client.reference_prices[timeframe_key]
+                    
+            # Add to a "blacklist" for the current trading cycle to prevent immediate reprocessing
+            if not hasattr(self.binance_client, 'removed_symbols_this_cycle'):
+                self.binance_client.removed_symbols_this_cycle = set()
+            self.binance_client.removed_symbols_this_cycle.add(symbol)
+                
+            return True
+        except Exception as e:
+            logging.error(f"Error clearing thresholds for {symbol}: {e}")
+            return False
 
