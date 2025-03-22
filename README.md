@@ -1,4 +1,3 @@
-```
           ___                                      .-~. /_"-._
         `-._~-.                                  / /_ "~o\  :Y
               \  \                                / : \~x.  ` ')
@@ -40,11 +39,15 @@ This bot watches for significant price drops in cryptocurrencies and automatical
 - 🤖 Telegram integration for monitoring and control
 - 📈 Tax-adjusted profit calculations (28%)
 - 🎨 Chart position visualizations after Order Executions
-- 💰 USDT balance protection
+- 💰 USDT/USDC balance protection
 - 📊 Enhanced visualization tools with balance history charts
 - 🗄️ MongoDB persistence of thresholds and reference prices
 - 🔁 Threshold state restoration after restart
 - 🐳 Docker support (works best when running on Server)
+- ⚡ Flexible database driver support (async Motor or sync PyMongo)
+- 📋 Symbol management with persistent storage
+- 🧹 Proper cleanup of orders and thresholds when removing symbols
+- 💎 Visual highlighting of active trading assets in balance output
 
 ## Prerequisites
 
@@ -82,6 +85,9 @@ This bot watches for significant price drops in cryptocurrencies and automatical
 
 ## Recent Updates and Improvements
 
+- **Flexible Database Driver Support**: Choose between Motor (async) and PyMongo (sync) database drivers
+- **Asynchronous MongoDB Implementation**: Upgraded to Motor for async MongoDB operations, boosting performance and responsiveness
+- **Symbol Management System**: Added complete lifecycle management for trading symbols with persistence across bot restarts
 - **Enhanced Data Persistence**: All thresholds and reference prices are now stored in MongoDB for reliable recovery after restarts
 - **Threshold Restoration**: Bot now properly restores triggered thresholds after a restart
 - **Improved Visualization Tools**: Added balance history charts and improved trade visualizations

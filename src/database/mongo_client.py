@@ -1,29 +1,56 @@
-import motor.motor_asyncio
 import logging
-import pymongo
+import asyncio
 from datetime import datetime, timedelta
-from typing import List, Optional, Dict, Any
+from decimal import Decimal
+from typing import Dict, List, Optional, Union, Any
+
+# Import both drivers
+import motor.motor_asyncio
+import pymongo
+
 from ..types.models import Order, OrderStatus, TimeFrame, OrderType, TradeDirection, TPSLStatus, TakeProfit, StopLoss  # Add TPSLStatus and related classes
 from ..types.constants import TAX_RATE, PRICE_PRECISION
-from decimal import Decimal, ROUND_DOWN, InvalidOperation
+from decimal import ROUND_DOWN, InvalidOperation
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
 class MongoClient:
-    def __init__(self, uri: str, database: str):
-        """Initialize MongoDB client with async support using Motor"""
+    def __init__(self, uri: str, database: str, driver: str = "motor"):
+        """
+        Initialize MongoDB client with support for both async (Motor) and sync (PyMongo) drivers
+        
+        Args:
+            uri: MongoDB connection string
+            database: Database name
+            driver: 'motor' for async or 'pymongo' for sync (default: motor)
+        """
+        self.uri = uri
+        self.db_name = database
+        self.driver = driver.lower()
+        self.is_async = self.driver == "motor"
+        
+        logger.info(f"Initializing MongoDB client with {self.driver} driver")
+        
         try:
-            # Check if using a replica set and add readPreference
-            if "replicaSet" in uri:
-                if "readPreference" not in uri:
+            # Handle replica set options for better read performance
+            if "replicaSet=" in uri and "readPreference=" not in uri:
+                if "?" in uri:
                     uri += "&readPreference=primaryPreferred"
+                else:
+                    uri += "?readPreference=primaryPreferred"
+                    
+            # Initialize the appropriate client based on driver selection
+            if self.is_async:
+                # Motor for async operations
+                self.client = motor.motor_asyncio.AsyncIOMotorClient(uri)
+                self.db = self.client[database]
+            else:
+                # PyMongo for sync operations
+                self.client = pymongo.MongoClient(uri)
+                self.db = self.client[database]
             
-            # Replace pymongo with motor.motor_asyncio
-            self.client = motor.motor_asyncio.AsyncIOMotorClient(uri)
-            self.db = self.client[database]
-            
-            # Define collections
+            # Initialize collections
             self.orders = self.db.orders
             self.threshold_state = self.db.threshold_state
             self.triggered_thresholds = self.db.triggered_thresholds
@@ -33,53 +60,46 @@ class MongoClient:
             self.trading_symbols = self.db.trading_symbols
             self.removed_symbols = self.db.removed_symbols
             
-            logger.info("MongoDB client initialized with async support")
+            logger.info(f"Successfully connected to MongoDB ({self.driver}) at {uri}")
+            
         except Exception as e:
-            logger.error(f"Failed to initialize MongoDB client: {e}")
+            logger.error(f"Failed to connect to MongoDB: {e}")
             raise
     
     async def init_indexes(self):
-        """Initialize database indexes for optimized queries"""
+        """Create indexes for MongoDB collections"""
         try:
-            # Create indexes for the orders collection
-            await self.orders.create_index([("order_id", pymongo.ASCENDING)], unique=True)
-            await self.orders.create_index([("symbol", pymongo.ASCENDING)])
-            await self.orders.create_index([("status", pymongo.ASCENDING)])
-            await self.orders.create_index([("created_at", pymongo.DESCENDING)])
-            
-            # Create indexes for threshold state
-            await self.threshold_state.create_index([
-                ("symbol", pymongo.ASCENDING), 
-                ("timeframe", pymongo.ASCENDING)
-            ], unique=True)
-            
-            # Create indexes for triggered thresholds
-            await self.triggered_thresholds.create_index([
-                ("symbol", pymongo.ASCENDING), 
-                ("timeframe", pymongo.ASCENDING)
-            ], unique=True)
-            
-            # Create indexes for balance history
-            await self.balance_history.create_index([("timestamp", pymongo.DESCENDING)])
-            
-            # Create index for reference prices
-            await self.reference_prices.create_index([
-                ("symbol", pymongo.ASCENDING), 
-                ("timeframe", pymongo.ASCENDING)
-            ], unique=True)
-            
-            # Create index for invalid symbols
-            await self.invalid_symbols.create_index([("symbol", pymongo.ASCENDING)], unique=True)
-            
-            # Create index for trading symbols
-            await self.trading_symbols.create_index([("symbol", pymongo.ASCENDING)], unique=True)
-            
-            # Create index for removed symbols
-            await self.removed_symbols.create_index([("symbol", pymongo.ASCENDING)], unique=True)
-            
-            logger.info("MongoDB indexes initialized")
+            # Create indexes with the appropriate driver method
+            if self.is_async:
+                # Async index creation for Motor
+                await self.orders.create_index([("order_id", 1)], unique=True)
+                await self.orders.create_index([("symbol", 1), ("status", 1)])
+                await self.orders.create_index([("created_at", 1)])
+                
+                await self.threshold_state.create_index([("symbol", 1), ("timeframe", 1)], unique=True)
+                await self.triggered_thresholds.create_index([("symbol", 1), ("timeframe", 1)])
+                await self.balance_history.create_index([("timestamp", -1)])
+                await self.reference_prices.create_index([("symbol", 1)], unique=True)
+                await self.invalid_symbols.create_index([("symbol", 1)], unique=True)
+                await self.trading_symbols.create_index([("symbol", 1)], unique=True)
+                await self.removed_symbols.create_index([("symbol", 1)], unique=True)
+            else:
+                # Sync index creation for PyMongo
+                self.orders.create_index([("order_id", 1)], unique=True)
+                self.orders.create_index([("symbol", 1), ("status", 1)])
+                self.orders.create_index([("created_at", 1)])
+                
+                self.threshold_state.create_index([("symbol", 1), ("timeframe", 1)], unique=True)
+                self.triggered_thresholds.create_index([("symbol", 1), ("timeframe", 1)])
+                self.balance_history.create_index([("timestamp", -1)])
+                self.reference_prices.create_index([("symbol", 1)], unique=True)
+                self.invalid_symbols.create_index([("symbol", 1)], unique=True)
+                self.trading_symbols.create_index([("symbol", 1)], unique=True)
+                self.removed_symbols.create_index([("symbol", 1)], unique=True)
+                
+            logger.info("MongoDB indexes created successfully")
         except Exception as e:
-            logger.error(f"Failed to initialize MongoDB indexes: {e}")
+            logger.error(f"Failed to create MongoDB indexes: {e}")
             raise
 
     def _validate_order_data(self, order: Order) -> bool:
@@ -297,40 +317,34 @@ class MongoClient:
             return []
 
     async def get_performance_stats(self) -> dict:
-        """Get aggregated performance statistics"""
+        """Get performance statistics for all filled orders"""
         try:
-            # Define the aggregation pipeline for filled orders
+            # Define aggregation pipeline
             pipeline = [
                 {"$match": {"status": OrderStatus.FILLED.value}},
                 {"$group": {
                     "_id": None,
                     "total_orders": {"$sum": 1},
-                    "total_value": {
-                        "$sum": {
-                            "$multiply": [
-                                {"$toDecimal": "$price"}, 
-                                {"$toDecimal": "$quantity"}
-                            ]
-                        }
-                    }
+                    "total_volume": {"$sum": {"$multiply": ["$price", "$quantity"]}},
+                    "average_price": {"$avg": "$price"}
                 }}
             ]
             
-            # Execute the aggregation pipeline and get results
-            result = await self.orders.aggregate(pipeline).to_list(length=1)
-            
-            # If there are results, return them, otherwise return default values
-            if result and len(result) > 0:
-                return {
-                    "total_orders": result[0]["total_orders"],
-                    "total_value": float(result[0]["total_value"])
-                }
+            if self.is_async:
+                # Async aggregation for Motor
+                cursor = self.orders.aggregate(pipeline)
+                result = await cursor.to_list(length=1)
             else:
-                return {"total_orders": 0, "total_value": 0.0}
-                
+                # Sync aggregation for PyMongo
+                result = list(self.orders.aggregate(pipeline))
+            
+            # Process the result
+            if result and len(result) > 0:
+                return result[0]
+            return {"total_orders": 0, "total_volume": 0, "average_price": 0}
         except Exception as e:
             logger.error(f"Error getting performance stats: {e}")
-            return {"total_orders": 0, "total_value": 0.0}
+            return {"total_orders": 0, "total_volume": 0, "average_price": 0}
 
     async def get_position_stats(self, allowed_symbols: set = None) -> dict:
         """Get detailed position statistics including profits"""
@@ -364,7 +378,11 @@ class MongoClient:
                 "total_cost": {"$toString": "$total_cost"},
                 "avg_entry_price": {
                     "$toString": {
-                        "$divide": ["$total_cost", "$total_quantity"]
+                        "$cond": [
+                            {"$eq": ["$total_quantity", 0]},
+                            0,
+                            {"$divide": ["$total_cost", "$total_quantity"]}
+                        ]
                     }
                 },
                 "orders": 1,
@@ -432,63 +450,29 @@ class MongoClient:
         return diagram
 
     def _document_to_order(self, doc: dict) -> Optional[Order]:
-        """Convert MongoDB document to Order object"""
+        """Convert a MongoDB document to an Order object"""
         try:
-            # Return None if document is empty
-            if not doc:
-                return None
-                
-            # Create Take Profit object if it exists
-            take_profit = None
-            if "take_profit" in doc and doc["take_profit"]:
-                tp_data = doc["take_profit"]
-                take_profit = TakeProfit(
-                    price=Decimal(str(tp_data.get("price", 0))),
-                    percentage=float(tp_data.get("percentage", 0)),
-                    status=TPSLStatus(tp_data.get("status", TPSLStatus.PENDING.value)),
-                    triggered_at=tp_data.get("triggered_at"),
-                    order_id=tp_data.get("order_id")
-                )
-                
-            # Create Stop Loss object if it exists
-            stop_loss = None
-            if "stop_loss" in doc and doc["stop_loss"]:
-                sl_data = doc["stop_loss"]
-                stop_loss = StopLoss(
-                    price=Decimal(str(sl_data.get("price", 0))),
-                    percentage=float(sl_data.get("percentage", 0)),
-                    status=TPSLStatus(sl_data.get("status", TPSLStatus.PENDING.value)),
-                    triggered_at=sl_data.get("triggered_at"),
-                    order_id=sl_data.get("order_id")
-                )
-                
-            # Create and return Order object
-            order = Order(
+            return Order(
                 symbol=doc["symbol"],
                 status=OrderStatus(doc["status"]),
-                order_type=OrderType(doc["order_type"]),
+                order_type=doc["order_type"],
                 price=Decimal(str(doc["price"])),
                 quantity=Decimal(str(doc["quantity"])),
                 timeframe=TimeFrame(doc["timeframe"]),
                 order_id=doc["order_id"],
                 created_at=doc["created_at"],
                 updated_at=doc["updated_at"],
+                leverage=doc.get("leverage"),
+                direction=doc.get("direction"),
                 filled_at=doc.get("filled_at"),
                 cancelled_at=doc.get("cancelled_at"),
-                fees=Decimal(str(doc.get("fees", "0"))),
+                fees=Decimal(str(doc.get("fees", 0))),
                 fee_asset=doc.get("fee_asset"),
-                leverage=doc.get("leverage"),
-                direction=TradeDirection(doc["direction"]) if "direction" in doc else None,
                 threshold=doc.get("threshold"),
-                is_manual=doc.get("is_manual", False),
-                take_profit=take_profit,
-                stop_loss=stop_loss
+                is_manual=doc.get("is_manual", False)
             )
-            
-            return order
-            
         except Exception as e:
-            logger.error(f"Error converting document to order: {e}")
+            logger.error(f"Error converting document to Order: {e}")
             return None
 
     async def cleanup_stale_orders(self, hours: int = 24) -> int:
@@ -1180,39 +1164,61 @@ class MongoClient:
             return True  # Default to assuming symbol is valid on error
 
     async def save_trading_symbol(self, symbol: str) -> bool:
-        """Save a new trading symbol to the database"""
+        """Add a new trading symbol"""
         try:
-            # Use update_one with upsert instead of insert to avoid duplicates
-            result = await self.trading_symbols.update_one(
-                {"symbol": symbol},
-                {"$set": {
+            # Prepare the update operation
+            update_data = {
+                "$set": {
                     "symbol": symbol,
-                    "added_at": datetime.utcnow(),
-                    "active": True
-                }},
-                upsert=True
-            )
+                    "active": True,
+                    "updated_at": datetime.utcnow()
+                },
+                "$setOnInsert": {
+                    "created_at": datetime.utcnow()
+                }
+            }
             
-            # Return True if the document was updated or inserted
-            return result.modified_count > 0 or result.upserted_id is not None
+            if self.is_async:
+                # Async update for Motor
+                result = await self.trading_symbols.update_one(
+                    {"symbol": symbol},
+                    update_data,
+                    upsert=True
+                )
+                success = result.modified_count > 0 or result.upserted_id is not None
+            else:
+                # Sync update for PyMongo
+                result = self.trading_symbols.update_one(
+                    {"symbol": symbol},
+                    update_data,
+                    upsert=True
+                )
+                success = result.modified_count > 0 or result.upserted_id is not None
+                
+            return success
         except Exception as e:
             logger.error(f"Error saving trading symbol {symbol}: {e}")
             return False
 
     async def remove_trading_symbol(self, symbol: str) -> bool:
-        """Remove a trading symbol (mark as inactive)"""
+        """Remove a trading symbol by marking it as inactive"""
         try:
-            # Update the symbol to be inactive rather than deleting
-            result = await self.trading_symbols.update_one(
-                {"symbol": symbol},
-                {"$set": {
-                    "active": False,
-                    "removed_at": datetime.utcnow()
-                }}
-            )
-            
-            # Return true if a document was modified
-            return result.modified_count > 0
+            if self.is_async:
+                # Async update for Motor
+                result = await self.trading_symbols.update_one(
+                    {"symbol": symbol},
+                    {"$set": {"active": False, "updated_at": datetime.utcnow()}}
+                )
+                success = result.modified_count > 0
+            else:
+                # Sync update for PyMongo
+                result = self.trading_symbols.update_one(
+                    {"symbol": symbol},
+                    {"$set": {"active": False, "updated_at": datetime.utcnow()}}
+                )
+                success = result.modified_count > 0
+                
+            return success
         except Exception as e:
             logger.error(f"Error removing trading symbol {symbol}: {e}")
             return False
@@ -1220,16 +1226,17 @@ class MongoClient:
     async def get_trading_symbols(self) -> List[str]:
         """Get list of all active trading symbols"""
         try:
-            # Convert the find cursor to a list using to_list
-            symbols_docs = await self.trading_symbols.find(
-                {"active": True}
-            ).to_list(length=None)
-            
-            # Extract symbol field from each document
-            symbols = [doc["symbol"] for doc in symbols_docs]
-            return symbols
+            if self.is_async:
+                # Async query for Motor
+                cursor = self.trading_symbols.find({"active": True})
+                documents = await cursor.to_list(length=None)
+            else:
+                # Sync query for PyMongo
+                documents = list(self.trading_symbols.find({"active": True}))
+                
+            return [doc["symbol"] for doc in documents]
         except Exception as e:
-            logger.error(f"Error retrieving trading symbols: {e}")
+            logger.error(f"Error getting trading symbols: {e}")
             return []
 
     async def add_removed_symbol(self, symbol: str) -> bool:

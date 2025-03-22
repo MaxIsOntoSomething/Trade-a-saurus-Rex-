@@ -83,6 +83,13 @@ def load_config_from_env() -> dict:
         take_profit_setting = '5%'
         stop_loss_setting = '3%'
 
+    # Add MongoDB driver configuration
+    mongodb_driver = os.getenv('MONGODB_DRIVER', 'motor').lower()
+    if mongodb_driver not in ['motor', 'pymongo']:
+        logger.warning(f"[CONFIG] Invalid MongoDB driver '{mongodb_driver}'. Using 'motor' as default.")
+        mongodb_driver = 'motor'
+    logger.info(f"[CONFIG] Using MongoDB driver: {mongodb_driver}")
+
     # Rest of the config loading with spot_testnet/mainnet API keys
     config = {
         'binance': {
@@ -102,7 +109,8 @@ def load_config_from_env() -> dict:
         },
         'mongodb': {
             'uri': os.getenv('MONGODB_URI', 'mongodb://localhost:27017'),
-            'database': os.getenv('MONGODB_DATABASE', 'tradeasaurus')
+            'database': os.getenv('MONGODB_DATABASE', 'tradeasaurus'),
+            'driver': mongodb_driver  # Add driver configuration
         },
         'trading': {
             'base_currency': os.getenv('TRADING_BASE_CURRENCY', 'USDT'),
@@ -215,11 +223,14 @@ async def initialize_services(config):
     try:
         logger.info("Initializing services...")
         
-        # Create MongoDB client with async support
+        # Create MongoDB client with driver choice
         mongo_client = MongoClient(
             uri=config['mongodb']['uri'],
-            database=config['mongodb']['database']
+            database=config['mongodb']['database'],
+            driver=config['mongodb'].get('driver', 'motor')  # Pass the driver
         )
+        
+        # Initialize indexes - this works with both drivers
         await mongo_client.init_indexes()
         
         # Ensure we use a consistent base currency throughout
