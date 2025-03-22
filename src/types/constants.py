@@ -12,7 +12,7 @@ PRECISION = {
 TIMEFRAME_INTERVALS = {
     'DAILY': timedelta(days=1),
     'WEEKLY': timedelta(weeks=1),
-    'MONTHLY': timedelta(days=30)
+    'MONTHLY': None  # Special handling for calendar months
 }
 
 # Rate limiting
@@ -34,6 +34,18 @@ PRICE_PRECISION = {
     'PRICE': 2,
     'PERCENTAGE': 2,
     'QUANTITY': 8
+}
+
+# Notification formatting
+NOTIFICATION_EMOJI = {
+    'DAILY': '📅',
+    'WEEKLY': '📆',
+    'MONTHLY': '📊',
+    'THRESHOLD': '🎯',
+    'RESET': '🔄',
+    'SUCCESS': '✅',
+    'ERROR': '❌',
+    'WARNING': '⚠️'
 }
 
 # Update trading fees based on provided rates
