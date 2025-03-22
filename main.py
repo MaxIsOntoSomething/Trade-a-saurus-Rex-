@@ -28,7 +28,7 @@ def validate_config(config: dict) -> bool:
     required_fields = {
         'binance': ['spot_testnet', 'mainnet', 'use_testnet'],
         'telegram': ['bot_token', 'allowed_users'],
-        'mongodb': ['uri', 'database'],
+        'mongodb': ['uri', 'database', 'driver'],
         'trading': ['base_currency', 'order_amount', 'cancel_after_hours', 
                    'pairs', 'thresholds']
     }
@@ -45,12 +45,15 @@ def validate_config(config: dict) -> bool:
                     return False
                     
         # Additional validation for nested API keys
-        if 'api_key' not in config['binance']['spot_testnet'] or 'api_secret' not in config['binance']['spot_testnet']:
-            logger.error("Missing Binance spot testnet API credentials")
-            return False
-            
-        if 'api_key' not in config['binance']['mainnet'] or 'api_secret' not in config['binance']['mainnet']:
-            logger.error("Missing Binance mainnet API credentials")
+        for env in ['spot_testnet', 'mainnet']:
+            if 'api_key' not in config['binance'][env] or 'api_secret' not in config['binance'][env]:
+                logger.error(f"Missing Binance {env} API credentials")
+                return False
+                
+        valid_drivers = ['motor', 'pymongo']
+        mongodb_driver = config['mongodb'].get('driver', '').lower()
+        if mongodb_driver not in valid_drivers:
+            logger.error(f"Invalid MongoDB driver: {mongodb_driver}. Use 'motor' or 'pymongo'.")
             return False
             
         return True
@@ -102,7 +105,8 @@ def load_config_from_env() -> dict:
         },
         'mongodb': {
             'uri': os.getenv('MONGODB_URI', 'mongodb://localhost:27017'),
-            'database': os.getenv('MONGODB_DATABASE', 'tradeasaurus')
+            'database': os.getenv('MONGODB_DATABASE', 'tradeasaurus'),
+            'driver': os.getenv('MONGODB_DRIVER', 'motor').lower()
         },
         'trading': {
             'base_currency': os.getenv('TRADING_BASE_CURRENCY', 'USDT'),
@@ -218,7 +222,8 @@ async def initialize_services(config):
         # Create MongoDB client
         mongo_client = MongoClient(
             uri=config['mongodb']['uri'],
-            database=config['mongodb']['database']
+            database=config['mongodb']['database'],
+            driver=config['mongodb']['driver']
         )
         await mongo_client.init_indexes()
         
