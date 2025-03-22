@@ -154,7 +154,12 @@ class OrderManager:
                         else:
                             logger.error(f"Failed to create buy order for {symbol} at threshold {threshold}%")
                     except Exception as e:
-                        logger.error(f"Error placing order for {symbol} at threshold {threshold}%: {e}")
+                        error_msg = str(e)
+                        if "Filter failure: LOT_SIZE" in error_msg:
+                            logger.warning(f"LOT_SIZE issue for {symbol}: Order quantity doesn't meet exchange requirements. Skipping this threshold.")
+                            # Optionally, you could mark this symbol as problematic in your database
+                        else:
+                            logger.error(f"Error placing order for {symbol} at threshold {threshold}%: {e}")
                         
         except Exception as e:
             logger.error(f"Error processing {symbol}: {e}")

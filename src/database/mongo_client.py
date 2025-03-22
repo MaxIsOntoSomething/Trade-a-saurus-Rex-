@@ -107,7 +107,7 @@ class MongoClient:
         required_fields = {
             'symbol': str,
             'status': OrderStatus,
-            'order_type': OrderType,  # Add order_type validation
+            'order_type': (OrderType, str),  # Accept both enum and string
             'price': (Decimal, float),
             'quantity': (Decimal, float),
             'order_id': str,
@@ -127,9 +127,24 @@ class MongoClient:
             # Check required fields
             for field, expected_type in required_fields.items():
                 value = getattr(order, field)
-                if not isinstance(value, expected_type):
-                    logger.error(f"Invalid type for {field}: expected {expected_type}, got {type(value)}")
-                    return False
+                if isinstance(expected_type, tuple):
+                    if not isinstance(value, expected_type):
+                        logger.error(f"Invalid type for {field}: expected one of {expected_type}, got {type(value)}")
+                        return False
+                else:
+                    if not isinstance(value, expected_type):
+                        # Special handling for OrderType
+                        if field == 'order_type' and isinstance(value, str):
+                            try:
+                                # Try to convert string to enum
+                                order.order_type = OrderType(value)
+                                logger.info(f"Converted order_type string '{value}' to enum")
+                            except ValueError:
+                                logger.error(f"Invalid order_type string: {value}")
+                                return False
+                        else:
+                            logger.error(f"Invalid type for {field}: expected {expected_type}, got {type(value)}")
+                            return False
                     
             # Check optional fields if present
             for field, expected_type in optional_fields.items():
@@ -197,6 +212,9 @@ class MongoClient:
                 return str(existing_order["_id"])
                 
             # If order doesn't exist, proceed with insertion as before
+            # Ensure order_type is converted to string value if it's an enum
+            order_type_value = order.order_type.value if isinstance(order.order_type, OrderType) else str(order.order_type)
+            
             tp_data = None
             if order.take_profit:
                 tp_data = {
@@ -221,7 +239,7 @@ class MongoClient:
             order_dict = {
                 "symbol": order.symbol,
                 "status": order.status.value,
-                "order_type": order.order_type.value,
+                "order_type": order_type_value,  # Use the converted value
                 "price": str(order.price),
                 "quantity": str(order.quantity),
                 "threshold": float(order.threshold) if order.threshold else None,
@@ -236,7 +254,7 @@ class MongoClient:
                 "cancelled_at": order.cancelled_at,
                 "take_profit": tp_data,
                 "stop_loss": sl_data,
-                "metadata": {  # Add metadata for better tracking
+                "metadata": {
                     "inserted_at": datetime.utcnow(),
                     "last_checked": datetime.utcnow(),
                     "check_count": 0,
@@ -452,10 +470,20 @@ class MongoClient:
     def _document_to_order(self, doc: dict) -> Optional[Order]:
         """Convert a MongoDB document to an Order object"""
         try:
+            # Handle order_type conversion
+            order_type_str = doc.get("order_type")
+            try:
+                # Try to convert to enum
+                order_type = OrderType(order_type_str)
+            except (ValueError, TypeError):
+                # Fallback to default if conversion fails
+                logger.warning(f"Invalid order_type '{order_type_str}', defaulting to 'spot'")
+                order_type = OrderType.SPOT
+
             return Order(
                 symbol=doc["symbol"],
                 status=OrderStatus(doc["status"]),
-                order_type=doc["order_type"],
+                order_type=order_type,  # Use the converted order_type
                 price=Decimal(str(doc["price"])),
                 quantity=Decimal(str(doc["quantity"])),
                 timeframe=TimeFrame(doc["timeframe"]),

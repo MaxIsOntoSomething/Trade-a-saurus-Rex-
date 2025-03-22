@@ -14,6 +14,8 @@ from ..types.constants import PRECISION, MIN_NOTIONAL, TIMEFRAME_INTERVALS, TRAD
 from ..utils.chart_generator import ChartGenerator
 from ..utils.yahoo_scrapooooor_sp500 import YahooSP500Scraper  # Import the new Yahoo scraper
 import time
+import math
+from decimal import ROUND_DOWN
 
 logger = logging.getLogger(__name__)
 
@@ -197,8 +199,6 @@ class BinanceClient:
                             if symbol not in self.removed_symbols
                         ]
                             
-                    logger.info(f"Loaded {len(self.trading_symbols)} trading symbols from database")
-                    
                 # Add any new symbols from config to database if they don't exist yet
                 for symbol in self.original_config_symbols:
                     if (symbol not in self.trading_symbols and 
@@ -208,6 +208,16 @@ class BinanceClient:
                 
                 # Reload trading symbols to ensure everything is in sync
                 self.trading_symbols = await self.mongo_client.get_trading_symbols()
+            
+            # Cache symbol information for lot size and precision
+            try:
+                exchange_info = await self.client.get_exchange_info()
+                self.symbol_info = {}
+                for symbol_data in exchange_info['symbols']:
+                    self.symbol_info[symbol_data['symbol']] = symbol_data
+                logger.info(f"Cached information for {len(self.symbol_info)} symbols")
+            except Exception as e:
+                logger.error(f"Failed to cache symbol information: {e}")
             
             # Rest of the method remains the same...
 
@@ -683,125 +693,177 @@ class BinanceClient:
                                   threshold: Optional[float] = None,
                                   timeframe: Optional[TimeFrame] = None,
                                   is_manual: bool = False) -> Order:
-        """Place a limit buy order with reserve balance check"""
-        # Check reserve balance first
-        if not is_manual and not await self.check_reserve_balance(amount):
-            raise ValueError("Order would violate reserve balance")
-
-        await self.rate_limiter.acquire()
-        
+        """Place a limit buy order with proper lot size handling"""
         try:
+            # Add debug logging
+            logger.debug(f"Creating order with order_type: {OrderType.SPOT}, class: {OrderType}")
+            
             # Get current price
-            ticker = await self.client.get_symbol_ticker(symbol=symbol)
-            price = Decimal(ticker['price'])
+            current_price = await self.get_current_price(symbol)
+            if not current_price:
+                logger.error(f"Failed to get current price for {symbol}")
+                return None
             
-            # Check if this would raise the average entry price when only_lower_entries is enabled
-            if not is_manual and self.config and 'trading' in self.config and self.config['trading'].get('only_lower_entries', False):
-                # Get existing position average entry price from MongoDB
-                current_avg_price = None
-                if self.mongo_client:
-                    position = await self.mongo_client.get_position_for_symbol(symbol)
-                    if position and 'avg_entry_price' in position:
-                        current_avg_price = Decimal(position['avg_entry_price'])
+            # Calculate raw quantity based on amount and price
+            raw_quantity = Decimal(str(amount)) / Decimal(str(current_price))
+            
+            # Get symbol info for lot size and precision
+            symbol_info = None
+            try:
+                exchange_info = await self.client.get_exchange_info()
+                for s in exchange_info['symbols']:
+                    if s['symbol'] == symbol:
+                        symbol_info = s
+                        break
+            except Exception as e:
+                logger.error(f"Error fetching symbol info: {e}")
+            
+            # Apply lot size restrictions if we have symbol info
+            if symbol_info:
+                for filter_data in symbol_info['filters']:
+                    if filter_data['filterType'] == 'LOT_SIZE':
+                        min_qty = Decimal(filter_data['minQty'])
+                        max_qty = Decimal(filter_data['maxQty'])
+                        step_size = Decimal(filter_data['stepSize'])
+                        
+                        # Calculate precision from step size
+                        precision = int(round(-math.log10(float(step_size))))
+                        
+                        # Adjust quantity to match step size
+                        adjusted_quantity = (raw_quantity // step_size) * step_size
+                        
+                        # Apply min/max constraints
+                        if adjusted_quantity < min_qty:
+                            adjusted_quantity = min_qty
+                            logger.warning(f"Adjusted {symbol} quantity to minimum: {min_qty}")
+                        elif adjusted_quantity > max_qty:
+                            adjusted_quantity = max_qty
+                            logger.warning(f"Adjusted {symbol} quantity to maximum: {max_qty}")
+                        
+                        # Round to appropriate precision
+                        adjusted_quantity = adjusted_quantity.quantize(
+                            Decimal('0.' + '0' * precision),
+                            rounding=ROUND_DOWN
+                        )
+                        
+                        # Use the adjusted quantity
+                        quantity = adjusted_quantity
+                        logger.info(f"Adjusted order quantity from {raw_quantity} to {quantity} based on LOT_SIZE filter")
+                        break
+            else:
+                # Fallback if we couldn't get symbol info
+                quantity = self._adjust_quantity_to_lot_size(symbol, raw_quantity)
+            
+            # Check reserve balance first
+            if not is_manual and not await self.check_reserve_balance(amount):
+                raise ValueError("Order would violate reserve balance")
+
+            await self.rate_limiter.acquire()
+            
+            try:
+                # Get current price
+                ticker = await self.client.get_symbol_ticker(symbol=symbol)
+                price = Decimal(ticker['price'])
                 
-                # If we already have a position and current price is higher than avg entry
-                if current_avg_price is not None and price > current_avg_price:
-                    logger.warning(f"Skipping order: Current price ${float(price):.2f} is higher than average entry price ${float(current_avg_price):.2f}")
-                    logger.warning(f"The 'only_lower_entries' protection is enabled")
-                    raise ValueError(f"Current price ${float(price):.2f} would increase average entry of ${float(current_avg_price):.2f}")
-            
-            # Original requested amount (for logging if adjustment needed)
-            original_amount = amount
-            
-            # Calculate quantity based on USDT amount
-            quantity = Decimal(str(amount)) / price
-            
-            # Get and apply precision
-            quantity_precision = self._get_quantity_precision(symbol)
-            price_precision = self._get_price_precision(symbol)
-            
-            # Round quantity to precision and adjust for lot size
-            quantity = Decimal(str(round(quantity, quantity_precision)))
-            quantity = self._adjust_quantity_to_lot_size(symbol, quantity)
-            price = Decimal(str(round(price, price_precision)))
-            
-            # Calculate order value after adjustments
-            order_value = price * quantity
-            
-            # Check minimum notional
-            min_notional = MIN_NOTIONAL.get(symbol, MIN_NOTIONAL['DEFAULT'])
-            if order_value < Decimal(str(min_notional)):
-                # Auto-increase quantity to meet minimum notional requirement
-                logger.warning(f"Order value ${float(order_value):.2f} below minimum notional ${min_notional}. Adjusting quantity...")
+                # Check if this would raise the average entry price when only_lower_entries is enabled
+                if not is_manual and self.config and 'trading' in self.config and self.config['trading'].get('only_lower_entries', False):
+                    # Get existing position average entry price from MongoDB
+                    current_avg_price = None
+                    if self.mongo_client:
+                        position = await self.mongo_client.get_position_for_symbol(symbol)
+                        if position and 'avg_entry_price' in position:
+                            current_avg_price = Decimal(position['avg_entry_price'])
+                    
+                    # If we already have a position and current price is higher than avg entry
+                    if current_avg_price is not None and price > current_avg_price:
+                        logger.warning(f"Skipping order: Current price ${float(price):.2f} is higher than average entry price ${float(current_avg_price):.2f}")
+                        logger.warning(f"The 'only_lower_entries' protection is enabled")
+                        raise ValueError(f"Current price ${float(price):.2f} would increase average entry of ${float(current_avg_price):.2f}")
                 
-                # Calculate required quantity to meet minimum notional
-                required_quantity = Decimal(str(min_notional)) / price
-                required_quantity = Decimal(str(round(required_quantity, quantity_precision)))
-                required_quantity = self._adjust_quantity_to_lot_size(symbol, required_quantity)
+                # Original requested amount (for logging if adjustment needed)
+                original_amount = amount
                 
-                # Update the quantity and log the adjustment
-                adjusted_amount = float(required_quantity * price)
-                logger.info(f"Adjusted order amount from ${original_amount:.2f} to ${adjusted_amount:.2f} to meet minimum notional")
-                quantity = required_quantity
+                # Calculate order value after adjustments
+                order_value = price * quantity
                 
-                # If this order would now violate reserve balance, check again
-                if not is_manual and adjusted_amount > original_amount and not await self.check_reserve_balance(adjusted_amount):
-                    raise ValueError(f"Adjusted order (${adjusted_amount:.2f}) would violate reserve balance")
-            
-            # Log order details before placement
-            logger.info(f"Placing order: {symbol} quantity={quantity} price=${price}")
-            
-            # Calculate fees
-            fees, fee_asset = await self.calculate_fees(symbol, price, quantity)
-            
-            # Only update triggered thresholds if it's not a manual trade
-            if not is_manual and threshold and symbol in self.triggered_thresholds and timeframe:
-                self.mark_threshold_triggered(symbol, timeframe.value, threshold)
-            
-            # Generate unique order ID
-            order_id = str(int(datetime.utcnow().timestamp() * 1000))
-            
-            if not is_manual:
-                # Place order on Binance
-                order_response = await self.client.create_order(
+                # Check minimum notional
+                min_notional = MIN_NOTIONAL.get(symbol, MIN_NOTIONAL['DEFAULT'])
+                if order_value < Decimal(str(min_notional)):
+                    # Auto-increase quantity to meet minimum notional requirement
+                    logger.warning(f"Order value ${float(order_value):.2f} below minimum notional ${min_notional}. Adjusting quantity...")
+                    
+                    # Calculate required quantity to meet minimum notional
+                    required_quantity = Decimal(str(min_notional)) / price
+                    required_quantity = Decimal(str(round(required_quantity, self._get_quantity_precision(symbol))))
+                    required_quantity = self._adjust_quantity_to_lot_size(symbol, required_quantity)
+                    
+                    # Update the quantity and log the adjustment
+                    adjusted_amount = float(required_quantity * price)
+                    logger.info(f"Adjusted order amount from ${original_amount:.2f} to ${adjusted_amount:.2f} to meet minimum notional")
+                    quantity = required_quantity
+                    
+                    # If this order would now violate reserve balance, check again
+                    if not is_manual and adjusted_amount > original_amount and not await self.check_reserve_balance(adjusted_amount):
+                        raise ValueError(f"Adjusted order (${adjusted_amount:.2f}) would violate reserve balance")
+                
+                # Log order details before placement
+                logger.info(f"Placing order: {symbol} quantity={quantity} price=${price}")
+                
+                # Calculate fees
+                fees, fee_asset = await self.calculate_fees(symbol, price, quantity)
+                
+                # Only update triggered thresholds if it's not a manual trade
+                if not is_manual and threshold and symbol in self.triggered_thresholds and timeframe:
+                    self.mark_threshold_triggered(symbol, timeframe.value, threshold)
+                
+                # Generate unique order ID
+                order_id = str(int(datetime.utcnow().timestamp() * 1000))
+                
+                if not is_manual:
+                    # Place order on Binance
+                    order_response = await self.client.create_order(
+                        symbol=symbol,
+                        side='BUY',
+                        type='LIMIT',
+                        timeInForce='GTC',
+                        quantity=float(quantity),
+                        price=float(price)
+                    )
+                    order_id = str(order_response['orderId'])
+                
+                # Create order object with all required fields
+                order = Order(
                     symbol=symbol,
-                    side='BUY',
-                    type='LIMIT',
-                    timeInForce='GTC',
-                    quantity=float(quantity),
-                    price=float(price)
+                    status=OrderStatus.PENDING if not is_manual else OrderStatus.FILLED,
+                    order_type=OrderType.SPOT,
+                    price=price,
+                    quantity=quantity,
+                    timeframe=timeframe or TimeFrame.DAILY,
+                    order_id=order_id,
+                    created_at=datetime.utcnow(),
+                    updated_at=datetime.utcnow(),
+                    filled_at=datetime.utcnow() if is_manual else None,
+                    fees=fees,
+                    fee_asset=fee_asset,
+                    threshold=threshold  # This is now handled by the Order class
                 )
-                order_id = str(order_response['orderId'])
-            
-            # Create order object with all required fields
-            order = Order(
-                symbol=symbol,
-                status=OrderStatus.PENDING if not is_manual else OrderStatus.FILLED,
-                order_type=OrderType.SPOT,
-                price=price,
-                quantity=quantity,
-                timeframe=timeframe or TimeFrame.DAILY,
-                order_id=order_id,
-                created_at=datetime.utcnow(),
-                updated_at=datetime.utcnow(),
-                filled_at=datetime.utcnow() if is_manual else None,
-                fees=fees,
-                fee_asset=fee_asset,
-                threshold=threshold  # This is now handled by the Order class
-            )
-            
-            # If the order is considered filled (manual orders), create TP/SL
-            if order.status == OrderStatus.FILLED:
-                await self.create_tp_sl_orders(order)
-            
-            return order
-            
-        except BinanceAPIException as e:
-            logger.error(f"Failed to place order: {e}")
-            raise
+                
+                # If the order is considered filled (manual orders), create TP/SL
+                if order.status == OrderStatus.FILLED:
+                    await self.create_tp_sl_orders(order)
+                
+                return order
+                
+            except BinanceAPIException as e:
+                logger.error(f"Failed to place order: {e}")
+                raise
+            except Exception as e:
+                logger.error(f"Error placing order: {str(e)}")
+                raise
+
         except Exception as e:
-            logger.error(f"Error placing order: {str(e)}")
-            raise
+            logger.error(f"Failed to place order: {e}")
+            return None
 
     async def cancel_order(self, symbol: str, order_id: str) -> bool:
         """Cancel an order with proper error handling"""
@@ -1077,31 +1139,39 @@ class BinanceClient:
             return 8  # Default safe value
 
     def _adjust_quantity_to_lot_size(self, symbol: str, quantity: Decimal) -> Decimal:
-        """Adjust quantity to valid lot size"""
+        """Adjust quantity to match symbol's lot size requirements"""
         try:
-            if symbol not in self.symbol_info:
-                return quantity  # Return unchanged if symbol info not available
-                
-            filters = self.symbol_info[symbol]['filters']
-            if 'LOT_SIZE' in filters:
-                lot_filter = filters['LOT_SIZE']
-                min_qty = Decimal(str(lot_filter['minQty']))
-                max_qty = Decimal(str(lot_filter['maxQty']))
-                step_size = Decimal(str(lot_filter['stepSize']))
-                
-                # Adjust to step size
-                if step_size != Decimal('0'):
-                    decimal_places = abs(step_size.as_tuple().exponent)
-                    quantity = (quantity // step_size) * step_size
-                    quantity = quantity.quantize(Decimal('0.' + '0' * decimal_places))
-                    
-                # Ensure within limits
-                quantity = max(min_qty, min(max_qty, quantity))
-                
-            return quantity
+            # Get symbol precision (existing code)
+            precision = self._get_quantity_precision(symbol)
+            
+            # Apply precision with rounding down to avoid exceeding order amount
+            adjusted_quantity = quantity.quantize(
+                Decimal('0.' + '0' * precision),
+                rounding=ROUND_DOWN
+            )
+            
+            # Add safety check for minimum notional value
+            min_notional = Decimal('10')  # Default minimum notional value
+            if symbol in MIN_NOTIONAL:
+                min_notional = Decimal(str(MIN_NOTIONAL[symbol]))
+            
+            # Ensure the order meets minimum notional value
+            current_price = Decimal(str(self.last_prices.get(symbol, 0)))
+            if current_price > 0 and adjusted_quantity * current_price < min_notional:
+                logger.warning(f"Order value too small for {symbol}. Adjusting to meet minimum notional.")
+                adjusted_quantity = (min_notional / current_price).quantize(
+                    Decimal('0.' + '0' * precision),
+                    rounding=ROUND_DOWN
+                )
+            
+            if adjusted_quantity != quantity:
+                logger.info(f"Adjusted {symbol} quantity from {quantity} to {adjusted_quantity}")
+            
+            return adjusted_quantity
+        
         except Exception as e:
-            logger.error(f"Error adjusting quantity for {symbol}: {e}")
-            return quantity
+            logger.error(f"Error adjusting quantity: {e}")
+            return quantity  # Return original quantity on error
 
     async def calculate_fees(self, symbol: str, price: Decimal, quantity: Decimal, order_type: str = "spot", leverage: int = 1) -> Tuple[Decimal, str]:
         """Calculate trading fees for an order based on order type and leverage"""
@@ -1499,5 +1569,21 @@ class BinanceClient:
     def _is_valid_symbol_format(self, symbol: str) -> bool:
         """Check if symbol format is valid according to Binance requirements"""
         return bool(self.valid_symbol_pattern.match(symbol))
+
+    def _get_lot_size_info(self, symbol: str) -> tuple:
+        """Get lot size filter information for a symbol"""
+        min_qty = Decimal('0.00000001')  # Default values
+        max_qty = Decimal('9999999.0')
+        step_size = Decimal('0.00000001')
+        
+        if hasattr(self, 'symbol_info') and symbol in self.symbol_info:
+            for filter_data in self.symbol_info[symbol]['filters']:
+                if filter_data['filterType'] == 'LOT_SIZE':
+                    min_qty = Decimal(filter_data['minQty'])
+                    max_qty = Decimal(filter_data['maxQty'])
+                    step_size = Decimal(filter_data['stepSize'])
+                    break
+        
+        return min_qty, max_qty, step_size
 
     # ...rest of existing code...
