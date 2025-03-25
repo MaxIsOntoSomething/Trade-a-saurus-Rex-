@@ -4,9 +4,11 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Dict, List, Optional, Union, Any
 
-# Import both drivers
+# Import drivers
 import motor.motor_asyncio
 import pymongo
+import pymongo.errors
+from pymongo.client_session import ClientSession
 
 from ..types.models import Order, OrderStatus, TimeFrame, OrderType, TradeDirection, TPSLStatus, TakeProfit, StopLoss  # Add TPSLStatus and related classes
 from ..types.constants import TAX_RATE, PRICE_PRECISION
@@ -18,17 +20,17 @@ logger = logging.getLogger(__name__)
 class MongoClient:
     def __init__(self, uri: str, database: str, driver: str = "motor"):
         """
-        Initialize MongoDB client with support for both async (Motor) and sync (PyMongo) drivers
+        Initialize MongoDB client with support for Motor, PyMongo async, or PyMongo sync
         
         Args:
             uri: MongoDB connection string
             database: Database name
-            driver: 'motor' for async or 'pymongo' for sync (default: motor)
+            driver: 'motor' for Motor async, 'pymongo_async' for PyMongo async, or 'pymongo' for PyMongo sync
         """
         self.uri = uri
         self.db_name = database
         self.driver = driver.lower()
-        self.is_async = self.driver == "motor"
+        self.is_async = self.driver in ["motor", "pymongo_async"]
         
         logger.info(f"Initializing MongoDB client with {self.driver} driver")
         
@@ -41,12 +43,16 @@ class MongoClient:
                     uri += "?readPreference=primaryPreferred"
                     
             # Initialize the appropriate client based on driver selection
-            if self.is_async:
+            if self.driver == "motor":
                 # Motor for async operations
                 self.client = motor.motor_asyncio.AsyncIOMotorClient(uri)
                 self.db = self.client[database]
+            elif self.driver == "pymongo_async":
+                # PyMongo async
+                self.client = pymongo.MongoClient(uri, asyncio=True)
+                self.db = self.client[database]
             else:
-                # PyMongo for sync operations
+                # PyMongo sync
                 self.client = pymongo.MongoClient(uri)
                 self.db = self.client[database]
             
@@ -337,7 +343,6 @@ class MongoClient:
     async def get_performance_stats(self) -> dict:
         """Get performance statistics for all filled orders"""
         try:
-            # Define aggregation pipeline
             pipeline = [
                 {"$match": {"status": OrderStatus.FILLED.value}},
                 {"$group": {
@@ -348,15 +353,8 @@ class MongoClient:
                 }}
             ]
             
-            if self.is_async:
-                # Async aggregation for Motor
-                cursor = self.orders.aggregate(pipeline)
-                result = await cursor.to_list(length=1)
-            else:
-                # Sync aggregation for PyMongo
-                result = list(self.orders.aggregate(pipeline))
+            result = await self._execute_aggregate(self.orders, pipeline)
             
-            # Process the result
             if result and len(result) > 0:
                 return result[0]
             return {"total_orders": 0, "total_volume": 0, "average_price": 0}
@@ -1254,14 +1252,10 @@ class MongoClient:
     async def get_trading_symbols(self) -> List[str]:
         """Get list of all active trading symbols"""
         try:
-            if self.is_async:
-                # Async query for Motor
-                cursor = self.trading_symbols.find({"active": True})
-                documents = await cursor.to_list(length=None)
-            else:
-                # Sync query for PyMongo
-                documents = list(self.trading_symbols.find({"active": True}))
-                
+            documents = await self._execute_find(
+                self.trading_symbols,
+                {"active": True}
+            )
             return [doc["symbol"] for doc in documents]
         except Exception as e:
             logger.error(f"Error getting trading symbols: {e}")
@@ -1303,3 +1297,39 @@ class MongoClient:
         except Exception as e:
             logger.error(f"Error getting removed symbols: {e}")
             return []
+
+    async def _execute_find(self, collection, query: dict, **kwargs):
+        """Execute find operation with proper driver handling"""
+        try:
+            if self.is_async:
+                cursor = collection.find(query, **kwargs)
+                return await cursor.to_list(None)
+            else:
+                return list(collection.find(query, **kwargs))
+        except Exception as e:
+            logger.error(f"Error executing find: {e}")
+            return []
+
+    async def _execute_aggregate(self, collection, pipeline: list, **kwargs):
+        """Execute aggregation with proper driver handling"""
+        try:
+            if self.is_async:
+                cursor = collection.aggregate(pipeline, **kwargs)
+                return await cursor.to_list(None)
+            else:
+                return list(collection.aggregate(pipeline, **kwargs))
+        except Exception as e:
+            logger.error(f"Error executing aggregate: {e}")
+            return []
+
+    async def _execute_update_one(self, collection, filter_dict: dict, update_dict: dict, **kwargs):
+        """Execute update_one with proper driver handling"""
+        try:
+            if self.is_async:
+                result = await collection.update_one(filter_dict, update_dict, **kwargs)
+            else:
+                result = collection.update_one(filter_dict, update_dict, **kwargs)
+            return result
+        except Exception as e:
+            logger.error(f"Error executing update_one: {e}")
+            return None
