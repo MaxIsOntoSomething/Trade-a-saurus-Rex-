@@ -306,12 +306,13 @@ class ChartGenerator:
             balance_df['net_worth'].plot(ax=ax, color='purple', linewidth=2.5, 
                                        label='Net Worth', linestyle='-')
             
-            # Add buy markers
+            # Initialize buy order variables
+            buy_timestamps = []
+            buy_values = []
+            annotations = []
+            
+            # Add buy markers if we have orders
             if buy_orders:
-                buy_timestamps = []
-                buy_values = []
-                annotations = []
-                
                 for order in buy_orders:
                     timestamp = order['timestamp']
                     if timestamp in balance_df.index:
@@ -324,18 +325,19 @@ class ChartGenerator:
                         amount = float(order.get('quantity', 0))
                         annotations.append(f"{symbol}: {amount:.4f}")
             
-            # Add small green dots for buy points
-            ax.scatter(buy_timestamps, buy_values, color='lime', 
-                       s=50, zorder=5, alpha=0.6, marker='o',
-                       label='Buy Orders')
-            
-            # Add subtle annotations
-            for i, (x, y, label) in enumerate(zip(buy_timestamps, buy_values, annotations)):
-                if i % 2 == 0:  # Annotate every other point to reduce clutter
-                    ax.annotate(label, (x, y), xytext=(5, 5),
-                               textcoords='offset points', fontsize=8,
-                               bbox=dict(facecolor='white', edgecolor='none', alpha=0.7),
-                               ha='left', va='bottom')
+            # Add small green dots for buy points if we have any
+            if buy_timestamps:
+                ax.scatter(buy_timestamps, buy_values, color='lime', 
+                          s=50, zorder=5, alpha=0.6, marker='o',
+                          label='Buy Orders')
+                
+                # Add subtle annotations
+                for i, (x, y, label) in enumerate(zip(buy_timestamps, buy_values, annotations)):
+                    if i % 2 == 0:  # Annotate every other point to reduce clutter
+                        ax.annotate(label, (x, y), xytext=(5, 5),
+                                  textcoords='offset points', fontsize=8,
+                                  bbox=dict(facecolor='white', edgecolor='none', alpha=0.7),
+                                  ha='left', va='bottom')
             
             # Customize plot
             ax.set_title('Portfolio Balance History', fontsize=14, pad=10)
