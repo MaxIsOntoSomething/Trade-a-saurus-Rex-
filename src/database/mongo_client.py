@@ -30,7 +30,7 @@ class MongoClient:
         """
         self.uri = uri
         self.db_name = database
-        self.driver = driver.lower()
+        self.driver = self._validate_driver(driver)
         self.is_async = self.driver in ["motor", "pymongo_async"]
         
         logger.info(f"Initializing MongoDB client with {self.driver} driver")
@@ -73,9 +73,19 @@ class MongoClient:
             logger.error(f"Failed to connect to MongoDB: {e}")
             raise
     
+    def _validate_driver(self, driver: str) -> str:
+        """Validate and normalize the driver selection"""
+        driver = driver.lower()
+        valid_drivers = ["motor", "pymongo_async", "pymongo"]
+        if driver not in valid_drivers:
+            logger.warning(f"Invalid driver '{driver}'. Falling back to 'motor'")
+            return "motor"
+        return driver
+
     async def init_indexes(self):
         """Create indexes for MongoDB collections"""
         try:
+            logger.info(f"Creating indexes using {self.driver} driver...")
             # Create indexes with the appropriate driver method
             if self.is_async:
                 # Async index creation for Motor

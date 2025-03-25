@@ -83,7 +83,7 @@ def load_config_from_env() -> dict:
         take_profit_setting = '5%'
         stop_loss_setting = '3%'
 
-    # Add MongoDB driver configuration with support for PyMongo async
+    # Add MongoDB driver configuration with proper validation
     mongodb_driver = os.getenv('MONGODB_DRIVER', 'motor').lower()
     if mongodb_driver not in ['motor', 'pymongo_async', 'pymongo']:
         logger.warning(f"[CONFIG] Invalid MongoDB driver '{mongodb_driver}'. Using 'motor' as default.")
