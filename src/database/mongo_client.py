@@ -900,7 +900,7 @@ class MongoClient:
             return None
 
     async def get_portfolio_performance(self, start_date: Optional[datetime] = None) -> Dict:
-        """Calculate portfolio performance (ROI) over time based on order history"""
+        """Calculate portfolio performance (ROI) over time based on order history and current prices"""
         try:
             # Get the start date (either provided or from first trade)
             if not start_date:
@@ -924,7 +924,7 @@ class MongoClient:
             orders = []
             async for doc in cursor:
                 orders.append({
-                    'date': doc['filled_at'].date(),  # Convert to date for easier comparison
+                    'date': doc['filled_at'].date(),
                     'symbol': doc['symbol'],
                     'price': Decimal(str(doc['price'])),
                     'quantity': Decimal(str(doc['quantity'])),
@@ -936,9 +936,20 @@ class MongoClient:
                 return {}
 
             # Initialize tracking variables
-            portfolio = {}  # {symbol: {quantity, avg_price}}
+            portfolio = {}  # {symbol: {quantity, avg_price, total_cost}}
             total_investment = Decimal('0')
             portfolio_value = Decimal('0')
+
+            # Get current prices for all symbols in portfolio
+            unique_symbols = set(order['symbol'] for order in orders)
+            current_prices = {}
+            for symbol in unique_symbols:
+                try:
+                    price = await self.binance_client.get_current_price(symbol)
+                    if price:
+                        current_prices[symbol] = Decimal(str(price))
+                except Exception as e:
+                    logger.error(f"Error getting current price for {symbol}: {e}")
 
             # Calculate daily ROI
             for date in date_range:
@@ -953,8 +964,8 @@ class MongoClient:
                     if symbol not in portfolio:
                         portfolio[symbol] = {
                             'quantity': Decimal('0'),
-                            'avg_price': Decimal('0'),
-                            'total_cost': Decimal('0')
+                            'total_cost': Decimal('0'),
+                            'avg_price': Decimal('0')
                         }
                     
                     # Update position
@@ -970,13 +981,14 @@ class MongoClient:
                     
                     total_investment += (order['price'] * order['quantity'])
 
-                # Calculate portfolio value for this day
+                # Calculate portfolio value for this day using current prices for held positions
                 if total_investment > 0:
                     day_portfolio_value = Decimal('0')
                     for symbol, position in portfolio.items():
                         if position['quantity'] > 0:
-                            # Use average price for valuation
-                            position_value = position['quantity'] * position['avg_price']
+                            # Use current price for valuation if available, otherwise use average price
+                            current_price = current_prices.get(symbol, position['avg_price'])
+                            position_value = position['quantity'] * current_price
                             day_portfolio_value += position_value
 
                     # Calculate ROI percentage
