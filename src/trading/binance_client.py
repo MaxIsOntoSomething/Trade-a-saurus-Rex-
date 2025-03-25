@@ -575,15 +575,15 @@ class BinanceClient:
             # Prepare reset information for notification
             reset_info = {
                 'timeframe': timeframe_str,
-                'timestamp': datetime.now(),
+                'timestamp': datetime.utcnow(),
                 'pairs': []
             }
             
+            # Get current trading pairs (excluding invalid ones)
+            valid_pairs = [p for p in self.config['trading']['pairs'] if p not in self.invalid_symbols]
+            
             # Gather information about reference prices for notification
-            for symbol in self.config['trading']['pairs']:
-                if symbol in self.invalid_symbols:
-                    continue
-                
+            for symbol in valid_pairs:
                 timeframe = TimeFrame(timeframe_str)
                 price = await self.get_reference_price(symbol, timeframe)
                 
@@ -593,6 +593,12 @@ class BinanceClient:
                         'reference_price': price,
                         'thresholds': self.config['trading']['thresholds'][timeframe_str]
                     })
+            
+            # Clear in-memory thresholds for this timeframe
+            for symbol in valid_pairs:
+                if symbol in self.triggered_thresholds:
+                    if timeframe_str in self.triggered_thresholds[symbol]:
+                        self.triggered_thresholds[symbol][timeframe_str] = set()
             
             # Log the reset
             logger.info(f"Reset {timeframe_str} thresholds for {len(reset_info['pairs'])} pairs")

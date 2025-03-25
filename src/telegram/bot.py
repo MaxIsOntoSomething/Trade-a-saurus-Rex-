@@ -14,6 +14,7 @@ from ..trading.binance_client import BinanceClient
 from ..database.mongo_client import MongoClient
 import io  # Add for handling bytes from chart
 from ..types.constants import NOTIFICATION_EMOJI
+from ..utils.chart_generator import ChartGenerator  # Add this import
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +64,7 @@ class TelegramBot:
         self.binance_client = binance_client
         self.mongo_client = mongo_client
         self.config = config
-        self.app = None
+        self.application = None
         self.is_paused = False
         self.running = False
         self._polling_task = None
@@ -94,10 +95,11 @@ Status: Ready to ROAR! 🦖
 """
         self.binance_client.set_telegram_bot(self)  # Add this line
         self.sent_roars = set()  # Add this to track sent roar notifications
+        self.chart_generator = ChartGenerator()  # Add this line
 
     async def initialize(self):
         """Initialize the Telegram bot"""
-        self.app = Application.builder().token(self.token).build()
+        self.application = Application.builder().token(self.token).build()
         
         # Add new command handlers
         add_trade_handler = ConversationHandler(
@@ -113,42 +115,42 @@ Status: Ready to ROAR! 🦖
             fallbacks=[CommandHandler("cancel", self.add_trade_cancel)],
         )
         
-        self.app.add_handler(add_trade_handler)
-        self.app.add_handler(CommandHandler("thresholds", self.show_thresholds))
-        self.app.add_handler(CommandHandler("menu", self.show_menu))
-        self.app.add_handler(CommandHandler("resetthresholds", self.reset_all_thresholds))  # Add new command
+        self.application.add_handler(add_trade_handler)
+        self.application.add_handler(CommandHandler("thresholds", self.show_thresholds))
+        self.application.add_handler(CommandHandler("menu", self.show_menu))
+        self.application.add_handler(CommandHandler("resetthresholds", self.reset_all_thresholds))  # Add new command
         
         # Add TP/SL command handlers
-        self.app.add_handler(CommandHandler("tp_sl", self.show_tp_sl))
-        self.app.add_handler(CommandHandler("set_tp", self.set_take_profit))
-        self.app.add_handler(CommandHandler("set_sl", self.set_stop_loss))
+        self.application.add_handler(CommandHandler("tp_sl", self.show_tp_sl))
+        self.application.add_handler(CommandHandler("set_tp", self.set_take_profit))
+        self.application.add_handler(CommandHandler("set_sl", self.set_stop_loss))
         
         # Add lower entries protection commands
-        self.app.add_handler(CommandHandler("lower_entries", self.show_lower_entries))
-        self.app.add_handler(CommandHandler("set_lower_entries", self.set_lower_entries))
+        self.application.add_handler(CommandHandler("lower_entries", self.show_lower_entries))
+        self.application.add_handler(CommandHandler("set_lower_entries", self.set_lower_entries))
         
         # Register command handlers
-        self.app.add_handler(CommandHandler("start", self.start_command))
-        self.app.add_handler(CommandHandler("power", self.toggle_trading))  # Change command name
-        self.app.add_handler(CommandHandler("balance", self.get_balance))
-        self.app.add_handler(CommandHandler("stats", self.get_stats))
-        self.app.add_handler(CommandHandler("history", self.get_order_history))
-        self.app.add_handler(CommandHandler("profits", self.show_profits))
+        self.application.add_handler(CommandHandler("start", self.start_command))
+        self.application.add_handler(CommandHandler("power", self.toggle_trading))  # Change command name
+        self.application.add_handler(CommandHandler("balance", self.get_balance))
+        self.application.add_handler(CommandHandler("stats", self.get_stats))
+        self.application.add_handler(CommandHandler("history", self.get_order_history))
+        self.application.add_handler(CommandHandler("profits", self.show_profits))
         
         # Add visualization command
-        self.app.add_handler(CommandHandler("viz", self.show_viz_menu))
-        self.app.add_handler(CallbackQueryHandler(self.handle_viz_selection, pattern="^(daily_volume|profit_distribution|order_types|hourly_activity|balance_chart|roi_comparison|sp500_vs_btc|portfolio_composition)$"))
+        self.application.add_handler(CommandHandler("viz", self.show_viz_menu))
+        self.application.add_handler(CallbackQueryHandler(self.handle_viz_selection, pattern="^(daily_volume|profit_distribution|order_types|hourly_activity|balance_chart|roi_comparison|sp500_vs_btc|portfolio_composition)$"))
         
         # Add symbol management commands
-        self.app.add_handler(CommandHandler("add_symbol", self.add_symbol_command))
-        self.app.add_handler(CommandHandler("remove_symbol", self.remove_symbol_command))
-        self.app.add_handler(CommandHandler("list_symbols", self.list_symbols_command))
+        self.application.add_handler(CommandHandler("add_symbol", self.add_symbol_command))
+        self.application.add_handler(CommandHandler("remove_symbol", self.remove_symbol_command))
+        self.application.add_handler(CommandHandler("list_symbols", self.list_symbols_command))
         
         # Add callback handler for symbol management
-        self.app.add_handler(CallbackQueryHandler(self.handle_symbol_callback, pattern="^remove_symbol:"))
+        self.application.add_handler(CallbackQueryHandler(self.handle_symbol_callback, pattern="^remove_symbol:"))
         
-        await self.app.initialize()
-        await self.app.start()
+        await self.application.initialize()
+        await self.application.start()
         await self.send_restored_thresholds_message()
 
     async def start(self):
@@ -159,7 +161,7 @@ Status: Ready to ROAR! 🦖
         for user_id in self.allowed_users:
             try:
                 # First send welcome message
-                await self.app.bot.send_message(
+                await self.application.bot.send_message(
                     chat_id=user_id, 
                     text=self.startup_message,
                     reply_markup=self.markup
@@ -180,7 +182,7 @@ Status: Ready to ROAR! 🦖
         # Start polling in the background
         while self.running:
             try:
-                updates = await self.app.bot.get_updates(
+                updates = await self.application.bot.get_updates(
                     offset=self._update_id,
                     timeout=30
                 )
@@ -188,7 +190,7 @@ Status: Ready to ROAR! 🦖
                 for update in updates:
                     if update.update_id >= self._update_id:
                         self._update_id = update.update_id + 1
-                        await self.app.process_update(update)
+                        await self.application.process_update(update)
                         
             except Exception as e:
                 logger.error(f"Polling error: {e}")
@@ -199,8 +201,8 @@ Status: Ready to ROAR! 🦖
     async def stop(self):
         """Stop the Telegram bot"""
         self.running = False
-        if self.app:
-            await self.app.stop()
+        if self.application:
+            await self.application.stop()
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle the /start command"""
@@ -419,7 +421,7 @@ Menu:
 
     async def send_order_notification(self, order: Order, status: Optional[OrderStatus] = None):
         """Send order notification to all allowed users"""
-        if not self.app:
+        if not self.application:
             logger.error("Telegram bot not initialized")
             return
 
@@ -466,7 +468,7 @@ Menu:
 
         for user_id in self.allowed_users:
             try:
-                await self.app.bot.send_message(chat_id=user_id, text=message)
+                await self.application.bot.send_message(chat_id=user_id, text=message)
             except Exception as e:
                 logger.error(f"Failed to send notification to {user_id}: {e}")
 
@@ -483,7 +485,7 @@ Menu:
         
         for user_id in self.allowed_users:
             try:
-                await self.app.bot.send_message(chat_id=user_id, text=message)
+                await self.application.bot.send_message(chat_id=user_id, text=message)
             except Exception as e:
                 logger.error(f"Failed to send balance update to {user_id}: {e}")
 
@@ -504,7 +506,7 @@ Menu:
                 # Send text-only notification as fallback
                 for user_id in self.allowed_users:
                     try:
-                        await self.app.bot.send_message(
+                        await self.application.bot.send_message(
                             chat_id=user_id,
                             text=self.binance_client.chart_generator.format_info_text(
                                 order,
@@ -518,7 +520,7 @@ Menu:
             # Attempt to send chart with caption
             for user_id in self.allowed_users:
                 try:
-                    await self.app.bot.send_photo(
+                    await self.application.bot.send_photo(
                         chat_id=user_id,
                         photo=chart_data,
                         caption=self.binance_client.chart_generator.format_info_text(
@@ -530,7 +532,7 @@ Menu:
                     logger.error(f"Failed to send chart to {user_id}: {e}")
                     # Try sending text-only notification as fallback
                     try:
-                        await self.app.bot.send_message(
+                        await self.application.bot.send_message(
                             chat_id=user_id,
                             text=self.binance_client.chart_generator.format_info_text(
                                 order,
@@ -601,7 +603,7 @@ Menu:
             for user_id in self.allowed_users:
                 try:
                     if (chart_data):
-                        await self.app.bot.send_photo(
+                        await self.application.bot.send_photo(
                             chat_id=user_id,
                             photo=chart_data,
                             caption=caption
@@ -609,7 +611,7 @@ Menu:
                     else:
                         # Append warning if chart generation failed
                         full_message = caption + "\n\n⚠️ (Chart generation failed - not enough historical data)"
-                        await self.app.bot.send_message(
+                        await self.application.bot.send_message(
                             chat_id=user_id,
                             text=full_message
                         )
@@ -617,7 +619,7 @@ Menu:
                     logger.error(f"Error sending ROAR to {user_id}: {e}")
                     try:
                         # Send plain text as fallback
-                        await self.app.bot.send_message(
+                        await self.application.bot.send_message(
                             chat_id=user_id,
                             text=caption + "\n\n⚠️ (Chart generation failed)"
                         )
@@ -640,7 +642,7 @@ Menu:
                         f"Amount: {float(order.quantity):.8f}\n"
                         f"Total: ${float(order.price * order.quantity):.2f}"
                     )
-                    await self.app.bot.send_message(chat_id=user_id, text=simple_message)
+                    await self.application.bot.send_message(chat_id=user_id, text=simple_message)
                 except Exception as e2:
                     logger.error(f"Completely failed to send notification: {e2}")
 
@@ -1326,7 +1328,7 @@ Menu:
             balance_data = await self.mongo_client.get_balance_history(days)
             
             if not balance_data or len(balance_data) < 2:
-                await self.app.bot.send_message(
+                await self.application.bot.send_message(
                     chat_id=chat_id,
                     text="Not enough balance history data to generate chart.",
                     reply_markup=self.markup
@@ -1345,7 +1347,7 @@ Menu:
             )
             
             if not chart_bytes:
-                await self.app.bot.send_message(
+                await self.application.bot.send_message(
                     chat_id=chat_id,
                     text="Failed to generate balance chart.",
                     reply_markup=self.markup
@@ -1356,7 +1358,7 @@ Menu:
             base_currency = self.config['trading'].get('base_currency', 'USDT')
             
             # Send chart to user
-            await self.app.bot.send_photo(
+            await self.application.bot.send_photo(
                 chat_id=chat_id,
                 photo=chart_bytes,
                 caption=f"📊 Account Balance History (30 days)\n"
@@ -1370,7 +1372,7 @@ Menu:
             
         except Exception as e:
             logger.error(f"Error generating balance chart: {e}", exc_info=True)
-            await self.app.bot.send_message(
+            await self.application.bot.send_message(
                 chat_id=chat_id,
                 text=f"❌ Error generating balance chart: {str(e)}",
                 reply_markup=self.markup
@@ -1432,64 +1434,57 @@ Menu:
         return "\n".join(response)
 
     async def _generate_roi_comparison(self, chat_id: int):
-        """Generate and send ROI comparison chart"""
+        """Generate ROI comparison chart"""
         try:
-            # Get historical performance data
-            days = 90  # Look at the last 90 days for comparison
-            allowed_symbols = set(self.config['trading']['pairs'])
-            
-            # Get portfolio performance data (returns a dict with dates and ROI percentages)
-            portfolio_data = await self.mongo_client.get_portfolio_performance(days, allowed_symbols)
-            
-            # Check if portfolio data is sufficient, generate simulated data if needed
-            if not portfolio_data or len(portfolio_data) < 5:  # Need at least 5 data points
-                logger.warning(f"Insufficient portfolio data ({len(portfolio_data) if portfolio_data else 0} points), using simulated data")
-                portfolio_data = await self._generate_simulated_portfolio_data(days)
-                
-                # Notify the user about simulation
-                await self.app.bot.send_message(
+            # Get first trade date
+            first_trade_date = await self.mongo_client.get_first_trade_date()
+            if not first_trade_date:
+                await self.application.bot.send_message(  # Use application.bot instead of bot
                     chat_id=chat_id,
-                    text="⚠️ Not enough real portfolio data available. Generating simulated performance chart for demonstration.",
-                    reply_markup=self.markup
-                )
-            
-            # Get benchmark data (BTC performance)
-            btc_performance = await self.binance_client.get_historical_benchmark("BTCUSDT", days)
-            
-            # Get S&P 500 performance if available (through binance client's API or mock data)
-            sp500_performance = await self.binance_client.get_historical_benchmark("SP500", days)
-            
-            # Generate chart using chart generator
-            chart_bytes = await self.binance_client.chart_generator.generate_roi_comparison_chart(
-                portfolio_data, btc_performance, sp500_performance
-            )
-            
-            if not chart_bytes:
-                await self.app.bot.send_message(
-                    chat_id=chat_id,
-                    text="Failed to generate ROI comparison chart.",
-                    reply_markup=self.markup
+                    text="No trade history found. Cannot generate ROI comparison."
                 )
                 return
-                
-            # Send chart to user
-            await self.app.bot.send_photo(
-                chat_id=chat_id,
-                photo=chart_bytes,
-                caption="📊 ROI Comparison (90 days)\n"
-                        "🟢 Green line: Portfolio Performance\n"
-                        "🟠 Orange line: Bitcoin Performance\n"
-                        "🔵 Blue line: S&P 500 Performance\n\n"
-                        "Values show percentage return relative to initial investment",
-                reply_markup=self.markup
+
+            # Get portfolio performance data
+            portfolio_data = await self.mongo_client.get_portfolio_performance(first_trade_date)
+            if not portfolio_data:
+                await self.application.bot.send_message(  # Use application.bot instead of bot
+                    chat_id=chat_id,
+                    text="Could not calculate portfolio performance. No completed trades found."
+                )
+                return
+
+            # Calculate days since first trade
+            days_since_first = (datetime.utcnow() - first_trade_date).days
+
+            # Get benchmark data
+            btc_performance = await self.binance_client.get_historical_benchmark("BTCUSDT", days_since_first)
+            sp500_performance = await self.binance_client.get_historical_benchmark("SP500", days_since_first)
+
+            # Generate chart
+            chart_bytes = await self.chart_generator.generate_roi_comparison_chart(
+                portfolio_data,
+                btc_performance,
+                sp500_performance
             )
-            
+
+            if chart_bytes:
+                await self.application.bot.send_photo(  # Use application.bot instead of bot
+                    chat_id=chat_id,
+                    photo=chart_bytes,
+                    caption="ROI Comparison: Portfolio vs BTC vs S&P 500"
+                )
+            else:
+                await self.application.bot.send_message(  # Use application.bot instead of bot
+                    chat_id=chat_id,
+                    text="Error generating ROI comparison chart."
+                )
+
         except Exception as e:
-            logger.error(f"Error generating ROI comparison chart: {e}", exc_info=True)
-            await self.app.bot.send_message(
+            logger.error(f"Error generating ROI comparison: {e}", exc_info=True)
+            await self.application.bot.send_message(  # Use application.bot instead of bot
                 chat_id=chat_id,
-                text=f"❌ Error generating ROI comparison chart: {str(e)}",
-                reply_markup=self.markup
+                text="Error generating ROI comparison chart."
             )
 
     async def _generate_simulated_portfolio_data(self, days: int) -> dict:
@@ -1518,37 +1513,42 @@ Menu:
         return result
 
     async def send_timeframe_reset_notification(self, reset_data: dict):
-        """Send notification when thresholds are reset"""
+        """Send notification about timeframe threshold reset"""
         try:
-            timeframe = reset_data.get('timeframe', 'unknown')
-            emoji = NOTIFICATION_EMOJI.get('RESET', '🔄')
+            timeframe = reset_data['timeframe']
+            timestamp = reset_data['timestamp']
+            pairs = reset_data['pairs']
             
-            message = f"{emoji} *{timeframe.capitalize()} Threshold Reset*\n\n"
-            message += f"New reference prices for {len(reset_data['pairs'])} pairs:\n\n"
+            # Create message header
+            message = [
+                f"🔄 {timeframe.upper()} Thresholds Reset",
+                f"Time: {timestamp.strftime('%Y-%m-%d %H:%M:%S UTC')}",
+                f"\nMonitoring {len(pairs)} pairs with new reference prices:"
+            ]
             
-            # Format information for each pair
-            for pair in reset_data['pairs']:
-                symbol = pair['symbol']
-                price = pair['reference_price']
-                thresholds = pair['thresholds']
+            # Add pair details
+            for pair_info in pairs:
+                symbol = pair_info['symbol']
+                ref_price = pair_info['reference_price']
+                thresholds = pair_info['thresholds']
                 
-                message += f"*{symbol}*: ${price:,.2f}\n"
-                message += f"Thresholds: {', '.join([f'{t}%' for t in thresholds])}\n\n"
+                message.append(f"\n{symbol}:")
+                message.append(f"  Reference: ${ref_price:,.2f}")
+                message.append(f"  Thresholds: {', '.join(f'{t}%' for t in thresholds)}")
             
-            message += f"_Reset completed at {reset_data['timestamp'].strftime('%Y-%m-%d %H:%M:%S')} UTC_"
-            
-            # Send to all allowed users
+            # Send message to all allowed users
             for user_id in self.allowed_users:
-                await self.send_message(
-                    chat_id=user_id,
-                    text=message,
-                    parse_mode='Markdown'
-                )
-            
-            logger.info(f"Sent {timeframe} threshold reset notification")
+                try:
+                    await self.send_message(
+                        chat_id=user_id,
+                        text="\n".join(message),
+                        parse_mode='HTML'
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to send reset notification to user {user_id}: {e}")
             
         except Exception as e:
-            logger.error(f"Error sending threshold reset notification: {e}")
+            logger.error(f"Error sending timeframe reset notification: {e}")
 
     async def send_threshold_notification(self, symbol: str, timeframe: TimeFrame, 
                                        threshold: float, current_price: float,
@@ -1595,7 +1595,7 @@ Menu:
         
         for user_id in self.allowed_users:
             try:
-                await self.app.bot.send_message(
+                await self.application.bot.send_message(
                     chat_id=user_id,
                     text=message,
                     reply_markup=self.markup
@@ -1621,7 +1621,7 @@ Menu:
         
         for user_id in self.allowed_users:
             try:
-                await self.app.bot.send_message(
+                await self.application.bot.send_message(
                     chat_id=user_id,
                     text=message,
                     reply_markup=self.markup
@@ -1647,7 +1647,7 @@ Menu:
         
         for user_id in self.allowed_users:
             try:
-                await self.app.bot.send_message(
+                await self.application.bot.send_message(
                     chat_id=user_id,
                     text=message,
                     reply_markup=self.markup
@@ -1687,7 +1687,7 @@ Menu:
             # Send to all authorized users
             for user_id in self.allowed_users:
                 try:
-                    await self.app.bot.send_message(
+                    await self.application.bot.send_message(
                         chat_id=user_id,
                         text="\n".join(message_parts),
                         reply_markup=self.markup
@@ -1803,8 +1803,8 @@ Menu:
     async def send_message(self, chat_id, text, **kwargs):
         """Helper method to send messages to users"""
         try:
-            if self.app and self.app.bot:
-                await self.app.bot.send_message(chat_id=chat_id, text=text, **kwargs)
+            if self.application and self.application.bot:
+                await self.application.bot.send_message(chat_id=chat_id, text=text, **kwargs)
                 return True
             else:
                 logger.error("Telegram bot not initialized")
@@ -1861,7 +1861,7 @@ Menu:
             # Send the message to all allowed users
             for user_id in self.allowed_users:
                 try:
-                    await self.app.bot.send_message(
+                    await self.application.bot.send_message(
                         chat_id=user_id, 
                         text=message, 
                         parse_mode="Markdown"
@@ -2108,7 +2108,7 @@ To change this setting:
         
         for user_id in self.allowed_users:
             try:
-                await self.app.bot.send_message(
+                await self.application.bot.send_message(
                     chat_id=user_id,
                     text=message,
                     reply_markup=self.markup
@@ -2146,7 +2146,7 @@ To change this setting:
         
         for user_id in self.allowed_users:
             try:
-                await self.app.bot.send_message(
+                await self.application.bot.send_message(
                     chat_id=user_id,
                     text=message,
                     reply_markup=self.markup
@@ -2165,7 +2165,7 @@ To change this setting:
         
         for user_id in self.allowed_users:
             try:
-                await self.app.bot.send_message(
+                await self.application.bot.send_message(
                     chat_id=user_id,
                     text=message,
                     reply_markup=self.markup
@@ -2185,7 +2185,7 @@ To change this setting:
         
         for user_id in self.allowed_users:
             try:
-                await self.app.bot.send_message(
+                await self.application.bot.send_message(
                     chat_id=user_id,
                     text=message,
                     reply_markup=self.markup
@@ -2205,7 +2205,7 @@ To change this setting:
             btc_data = await self.binance_client.get_historical_prices("BTCUSDT", days_since_start + 5)  # Add buffer days
             
             if not btc_data or len(btc_data) < 2:
-                await self.app.bot.send_message(
+                await self.application.bot.send_message(
                     chat_id=chat_id,
                     text="Not enough BTC price data for year-to-date comparison.",
                     reply_markup=self.markup
@@ -2232,7 +2232,7 @@ To change this setting:
             sp500_data = await self.binance_client.yahoo_scraper.get_sp500_data(days_since_start + 5)
             
             if not sp500_data or len(sp500_data) < 2:
-                await self.app.bot.send_message(
+                await self.application.bot.send_message(
                     chat_id=chat_id,
                     text="Failed to get S&P 500 data for year-to-date comparison.",
                     reply_markup=self.markup
@@ -2260,7 +2260,7 @@ To change this setting:
             chart_bytes = await self._create_ytd_comparison_chart(btc_ytd_prices, sp500_ytd, current_year)
             
             if not chart_bytes:
-                await self.app.bot.send_message(
+                await self.application.bot.send_message(
                     chat_id=chat_id,
                     text="Failed to generate comparison chart.",
                     reply_markup=self.markup
@@ -2272,7 +2272,7 @@ To change this setting:
             sp500_current = list(sp500_ytd.values())[-1] if sp500_ytd else 0
             
             # Send the chart
-            await self.app.bot.send_photo(
+            await self.application.bot.send_photo(
                 chat_id=chat_id,
                 photo=chart_bytes,
                 caption=f"📈 {current_year} Year-to-Date Performance Comparison\n\n"
@@ -2284,7 +2284,7 @@ To change this setting:
             
         except Exception as e:
             logger.error(f"Error generating S&P 500 vs BTC comparison: {e}", exc_info=True)
-            await self.app.bot.send_message(
+            await self.application.bot.send_message(
                 chat_id=chat_id,
                 text=f"❌ Error generating comparison chart: {str(e)}",
                 reply_markup=self.markup
@@ -2378,7 +2378,7 @@ To change this setting:
             positions = await self.mongo_client.get_position_stats(allowed_symbols)
             
             if not positions or len(positions) == 0:
-                await self.app.bot.send_message(
+                await self.application.bot.send_message(
                     chat_id=chat_id,
                     text="No portfolio data available for composition chart.",
                     reply_markup=self.markup
@@ -2422,7 +2422,7 @@ To change this setting:
             chart_bytes = await self._create_portfolio_composition_chart(asset_values, total_value, base_currency)
             
             if not chart_bytes:
-                await self.app.bot.send_message(
+                await self.application.bot.send_message(
                     chat_id=chat_id,
                     text="Failed to generate portfolio composition chart.",
                     reply_markup=self.markup
@@ -2438,7 +2438,7 @@ To change this setting:
             caption_lines.append(f"\nTotal Portfolio Value: ${total_value:.2f}")
             
             # Send chart to user
-            await self.app.bot.send_photo(
+            await self.application.bot.send_photo(
                 chat_id=chat_id,
                 photo=chart_bytes,
                 caption="\n".join(caption_lines),
@@ -2447,7 +2447,7 @@ To change this setting:
             
         except Exception as e:
             logger.error(f"Error generating portfolio composition chart: {e}", exc_info=True)
-            await self.app.bot.send_message(
+            await self.application.bot.send_message(
                 chat_id=chat_id,
                 text=f"❌ Error generating portfolio composition chart: {str(e)}",
                 reply_markup=self.markup

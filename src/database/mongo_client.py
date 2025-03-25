@@ -14,6 +14,7 @@ from ..types.models import Order, OrderStatus, TimeFrame, OrderType, TradeDirect
 from ..types.constants import TAX_RATE, PRICE_PRECISION
 from decimal import ROUND_DOWN, InvalidOperation
 import numpy as np
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -865,128 +866,116 @@ class MongoClient:
             logger.error(f"Error resetting all triggered thresholds: {e}", exc_info=True)
             return 0
 
-    async def get_portfolio_performance(self, days: int = 90, allowed_symbols: set = None) -> Dict:
-        """
-        Calculate portfolio performance (ROI) over time based on order history
-        Returns a dictionary with dates and corresponding ROI percentages
-        """
+    async def get_first_trade_date(self) -> Optional[datetime]:
+        """Get the date of the first trade"""
         try:
-            # Calculate the start date for our analysis
-            start_date = datetime.utcnow() - timedelta(days=days)
+            # Find the earliest filled order
+            pipeline = [
+                {"$match": {"status": "filled"}},
+                {"$sort": {"filled_at": 1}},
+                {"$limit": 1},
+                {"$project": {"filled_at": 1}}
+            ]
             
-            # Get all filled orders within the timeframe, optionally filtered by allowed symbols
-            query = {"status": "filled", "filled_at": {"$gte": start_date}}
+            result = await self._execute_aggregate(self.orders, pipeline)
+            if result and len(result) > 0:
+                first_date = result[0]['filled_at']
+                logger.info(f"Found first trade date: {first_date}")
+                return first_date
             
-            if allowed_symbols:
-                query["symbol"] = {"$in": list(allowed_symbols)}
-                
-            # Projection to get only the fields we need
-            projection = {
-                "symbol": 1,
-                "price": 1,
-                "quantity": 1,
-                "filled_at": 1,
-                "fees": 1,
-                "order_type": 1
-            }
-            
-            # Get orders sorted by fill date
-            cursor = self.orders.find(query, projection).sort("filled_at", 1)
-            
-            # Process orders into a timeline
-            orders = []
-            total_investment = Decimal('0')
-            async for doc in cursor:
-                price = Decimal(str(doc['price']))
-                quantity = Decimal(str(doc['quantity']))
-                value = price * quantity
-                fees = Decimal(str(doc.get('fees', 0)))
-                
-                # Calculate investment (value + fees)
-                investment = value + fees
-                total_investment += investment
-                
-                orders.append({
-                    'date': doc['filled_at'],
-                    'symbol': doc['symbol'],
-                    'value': value,
-                    'investment': investment
-                })
-            
-            # No orders found
-            if not orders:
-                return {}
-                
-            # Get the earliest investment date
-            start_investment_date = orders[0]['date']
-            
-            # Generate daily snapshots of portfolio value
-            result = {}
-            current_date = start_investment_date.replace(hour=0, minute=0, second=0, microsecond=0)
+            logger.info("No filled trades found in database")
+            return None
+        except Exception as e:
+            logger.error(f"Error getting first trade date: {e}")
+            return None
+
+    async def get_portfolio_performance(self, start_date: Optional[datetime] = None) -> Dict:
+        """Calculate portfolio performance (ROI) over time based on order history"""
+        try:
+            # Get the start date (either provided or from first trade)
+            if not start_date:
+                start_date = await self.get_first_trade_date()
+                if not start_date:
+                    logger.warning("No trade history found")
+                    return {}
+
+            # Create a date range from start_date to today
             end_date = datetime.utcnow()
-            
-            # Initialize portfolio tracking
+            date_range = pd.date_range(start=start_date.date(), end=end_date.date(), freq='D')
+            result = {}
+
+            # Get all filled orders since start date
+            cursor = self.orders.find({
+                "status": "filled",
+                "filled_at": {"$gte": start_date}
+            }).sort("filled_at", 1)
+
+            # Process orders and calculate daily ROI
+            orders = []
+            async for doc in cursor:
+                orders.append({
+                    'date': doc['filled_at'].date(),  # Convert to date for easier comparison
+                    'symbol': doc['symbol'],
+                    'price': Decimal(str(doc['price'])),
+                    'quantity': Decimal(str(doc['quantity'])),
+                    'fees': Decimal(str(doc.get('fees', 0)))
+                })
+
+            if not orders:
+                logger.warning("No filled orders found for ROI calculation")
+                return {}
+
+            # Initialize tracking variables
             portfolio = {}  # {symbol: {quantity, avg_price}}
-            cumulative_investment = Decimal('0')
-            
-            # Process each day
-            while current_date <= end_date:
-                date_str = current_date.strftime('%Y-%m-%d')
+            total_investment = Decimal('0')
+            portfolio_value = Decimal('0')
+
+            # Calculate daily ROI
+            for date in date_range:
+                date_str = date.strftime('%Y-%m-%d')
                 
-                # Add orders for this day
-                day_orders = [order for order in orders if order['date'].date() == current_date.date()]
+                # Process orders for this day
+                day_orders = [order for order in orders if order['date'] == date.date()]
                 
+                # Update portfolio with day's orders
                 for order in day_orders:
                     symbol = order['symbol']
                     if symbol not in portfolio:
-                        portfolio[symbol] = {'quantity': Decimal('0'), 'avg_price': Decimal('0')}
+                        portfolio[symbol] = {
+                            'quantity': Decimal('0'),
+                            'avg_price': Decimal('0'),
+                            'total_cost': Decimal('0')
+                        }
                     
-                    # Add to portfolio
-                    portfolio[symbol]['quantity'] += order['value'] / order['investment']
-                    portfolio[symbol]['avg_price'] = order['investment'] / portfolio[symbol]['quantity']
+                    # Update position
+                    prev_quantity = portfolio[symbol]['quantity']
+                    new_quantity = prev_quantity + order['quantity']
+                    new_cost = portfolio[symbol]['total_cost'] + (order['price'] * order['quantity'])
                     
-                    # Track cumulative investment
-                    cumulative_investment += order['investment']
-                
+                    portfolio[symbol].update({
+                        'quantity': new_quantity,
+                        'total_cost': new_cost,
+                        'avg_price': new_cost / new_quantity if new_quantity > 0 else Decimal('0')
+                    })
+                    
+                    total_investment += (order['price'] * order['quantity'])
+
                 # Calculate portfolio value for this day
-                if allowed_symbols:
-                    portfolio_symbols = [s for s in portfolio.keys() if s in allowed_symbols]
-                else:
-                    portfolio_symbols = list(portfolio.keys())
-                    
-                # Skip days with no investment yet
-                if cumulative_investment <= 0:
-                    current_date += timedelta(days=1)
-                    continue
-                    
-                # Calculate portfolio ROI percentage
-                if portfolio_symbols:
-                    # For simplicity, we'll get current prices for all symbols
-                    # In a real implementation, you might want to get historical prices for the exact day
-                    portfolio_value = Decimal('0')
-                    
-                    # For demo purposes, we'll simulate value fluctuation
-                    # Get a multiplier based on date (pseudo-random but consistent for same date)
-                    date_seed = int(current_date.timestamp() / 86400)  # Days since epoch
-                    np.random.seed(date_seed)
-                    
-                    # Generate a random multiplier for each symbol
-                    for symbol in portfolio_symbols:
-                        position = portfolio[symbol]
-                        # Simulate price movement: random walk with slight upward bias
-                        multiplier = 1.0 + (np.random.normal(0.0005, 0.02) * (date_seed % 10))
-                        position_value = position['quantity'] * position['avg_price'] * Decimal(str(multiplier))
-                        portfolio_value += position_value
-                    
-                    # Calculate ROI
-                    roi_percentage = ((portfolio_value - cumulative_investment) / cumulative_investment) * 100
+                if total_investment > 0:
+                    day_portfolio_value = Decimal('0')
+                    for symbol, position in portfolio.items():
+                        if position['quantity'] > 0:
+                            # Use average price for valuation
+                            position_value = position['quantity'] * position['avg_price']
+                            day_portfolio_value += position_value
+
+                    # Calculate ROI percentage
+                    roi_percentage = ((day_portfolio_value - total_investment) / total_investment) * 100
                     result[date_str] = float(roi_percentage)
-                
-                # Move to next day
-                current_date += timedelta(days=1)
-            
+
+            logger.info(f"Generated ROI data from {start_date.date()} to {end_date.date()} with {len(result)} data points")
             return result
-            
+
         except Exception as e:
             logger.error(f"Error calculating portfolio performance: {e}", exc_info=True)
             return {}
