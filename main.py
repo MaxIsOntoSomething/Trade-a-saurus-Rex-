@@ -90,6 +90,10 @@ def load_config_from_env() -> dict:
         mongodb_driver = 'motor'
     logger.info(f"[CONFIG] Using MongoDB driver: {mongodb_driver}")
 
+    # Add MongoDB load config setting
+    mongodb_load_config = os.getenv('MONGODB_LOAD_CONFIG', 'true').lower() == 'true'
+    logger.info(f"[CONFIG] Load config from MongoDB: {mongodb_load_config}")
+
     # Rest of the config loading with spot_testnet/mainnet API keys
     config = {
         'binance': {
@@ -110,16 +114,17 @@ def load_config_from_env() -> dict:
         'mongodb': {
             'uri': os.getenv('MONGODB_URI', 'mongodb://localhost:27017'),
             'database': os.getenv('MONGODB_DATABASE', 'tradeasaurus'),
-            'driver': mongodb_driver  # Add driver configuration
+            'driver': mongodb_driver,
+            'load_db_config': mongodb_load_config
         },
         'trading': {
             'base_currency': os.getenv('TRADING_BASE_CURRENCY', 'USDT'),
             'order_amount': float(os.getenv('TRADING_ORDER_AMOUNT', '100')),
             'cancel_after_hours': int(os.getenv('TRADING_CANCEL_HOURS', '8')),
             'pairs': os.getenv('TRADING_PAIRS', 'BTCUSDT,ETHUSDT').split(','),
-            'reserve_balance': reserve_balance,  # Use parsed reserve balance
-            'take_profit': take_profit_setting,  # Add explicit take profit setting
-            'stop_loss': stop_loss_setting,      # Add explicit stop loss setting
+            'reserve_balance': reserve_balance,
+            'take_profit': take_profit_setting,
+            'stop_loss': stop_loss_setting,
             'only_lower_entries': os.getenv('TRADING_ONLY_LOWER_ENTRIES', 'true').lower() == 'true',
             'thresholds': {
                 'daily': [float(x) for x in os.getenv('TRADING_THRESHOLDS_DAILY', '1,2,5').split(',') if x],
@@ -135,7 +140,7 @@ def load_config_from_env() -> dict:
     
     return config
 
-def load_and_merge_config() -> dict:
+async def load_and_merge_config() -> dict:
     """Load and merge configuration from appropriate sources"""
     try:
         in_docker = os.getenv('RUNNING_IN_DOCKER', '').lower() == 'true'
@@ -154,7 +159,26 @@ def load_and_merge_config() -> dict:
         
         if not validate_config(config):
             raise ValueError("Invalid configuration")
+
+        # Initialize MongoDB client early to check for stored config
+        mongo_client = MongoClient(
+            uri=config['mongodb']['uri'],
+            database=config['mongodb']['database'],
+            driver=config['mongodb'].get('driver', 'motor')
+        )
+        
+        # Load config from database if enabled
+        if config['mongodb'].get('load_db_config', True):
+            logger.info("Attempting to load trading configuration from database...")
+            db_config = await mongo_client.load_trading_config()
             
+            if db_config:
+                logger.info("Found stored configuration in database, merging...")
+                config['trading'].update(db_config)
+            else:
+                logger.info("No stored configuration found, saving current config to database...")
+                await mongo_client.save_trading_config(config)
+        
         # Log final configuration
         config_logger.log_config(
             f"Active Configuration:\n"
@@ -310,7 +334,7 @@ async def main():
     
     try:
         # Load configuration from appropriate source
-        config = load_and_merge_config()
+        config = await load_and_merge_config()
         
         # Debug log the configuration
         logger.info("=" * 50)

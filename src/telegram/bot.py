@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 import logging
 from decimal import Decimal, InvalidOperation  # Add InvalidOperation for exception handling
 from typing import List, Optional, Dict  # Add Dict import
-from ..types.models import Order, OrderStatus, TimeFrame, OrderType, TradeDirection  # Update imports
+from ..types.models import Order, OrderStatus, TimeFrame, OrderType, TradeDirection, TPSLStatus  # Update imports
 from ..trading.binance_client import BinanceClient
 from ..database.mongo_client import MongoClient
 import io  # Add for handling bytes from chart
@@ -1874,137 +1874,274 @@ Menu:
             logger.error(f"Failed to send startup threshold message: {e}")
 
     async def show_tp_sl(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show current TP/SL settings"""
+        """Show current take profit and stop loss settings"""
         if not self._is_authorized(update.effective_user.id):
-            await update.message.reply_text("⛔ Unauthorized access")
+            await self.send_message(update.effective_chat.id, "You are not authorized to use this command.")
             return
-            
+
         try:
-            # Get current TP/SL settings from binance client
-            tp_percentage = self.binance_client.default_tp_percentage
-            sl_percentage = self.binance_client.default_sl_percentage
+            # Get current TP/SL settings
+            tp_setting = self.binance_client.default_tp_percentage
+            sl_setting = self.binance_client.default_sl_percentage
             
-            # Get all orders with active TP/SL
-            orders_with_tp_sl = await self.mongo_client.get_orders_with_active_tp_sl()
+            # Build and send the message
+            message = (
+                f"📊 *Current Settings*\n\n"
+                f"Take Profit: {tp_setting}%\n"
+                f"Stop Loss: {sl_setting}%\n\n"
+                f"You can change these settings globally with:\n"
+                f"`/set_tp <percentage>` - Example: `/set_tp 3`\n"
+                f"`/set_sl <percentage>` - Example: `/set_sl 3`"
+            )
             
-            message = f"""
-📊 Take Profit & Stop Loss Settings:
-
-Current Default Settings:
-📈 Take Profit: {tp_percentage}%
-📉 Stop Loss: {sl_percentage}%
-
-To change settings:
-/set_tp <percentage> - Example: /set_tp 5
-/set_sl <percentage> - Example: /set_sl 3
-
-"""
-            # Add information about active TP/SL orders if any exist
-            if orders_with_tp_sl:
-                message += f"\nActive TP/SL Orders ({len(orders_with_tp_sl)}):\n"
-                for order in orders_with_tp_sl[:5]:  # Show only first 5 to avoid message too long
-                    entry_price = float(order.price)
-                    tp_price = float(order.take_profit.price) if order.take_profit else 0
-                    sl_price = float(order.stop_loss.price) if order.stop_loss else 0
-                    
-                    message += f"\n{order.symbol}: Entry=${entry_price:.2f}"
-                    if order.take_profit:
-                        message += f" | TP=${tp_price:.2f} (+{order.take_profit.percentage}%)"
-                    if order.stop_loss:
-                        message += f" | SL=${sl_price:.2f} (-{order.stop_loss.percentage}%)"
-                
-                if len(orders_with_tp_sl) > 5:
-                    message += f"\n\n...and {len(orders_with_tp_sl) - 5} more orders"
-            
-            await update.message.reply_text(message)
+            await self.send_message(
+                update.effective_chat.id,
+                message,
+                parse_mode='Markdown'
+            )
             
         except Exception as e:
-            logger.error(f"Error showing TP/SL settings: {e}", exc_info=True)
-            await update.message.reply_text(f"❌ Error getting TP/SL settings: {str(e)}")
+            logger.error(f"Error showing TP/SL settings: {e}")
+            await self.send_message(
+                update.effective_chat.id,
+                "An error occurred while retrieving the settings."
+            )
 
     async def set_take_profit(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Set take profit percentage"""
+        """Set the global take profit percentage for all symbols"""
         if not self._is_authorized(update.effective_user.id):
-            await update.message.reply_text("⛔ Unauthorized access")
+            await self.send_message(update.effective_chat.id, "You are not authorized to use this command.")
             return
-            
+
         try:
-            # Check if argument is provided
-            if not context.args or len(context.args) < 1:
-                await update.message.reply_text(
-                    "❌ Please provide a percentage value.\nExample: /set_tp 5"
+            # Get message parts, expecting format: /set_tp <percentage>
+            message_parts = update.message.text.split()
+            
+            # Check that we have enough parts (command + percentage)
+            if len(message_parts) != 2:
+                await self.send_message(
+                    update.effective_chat.id,
+                    "Please provide a percentage value.\n"
+                    "Example: `/set_tp 3` to set a 3% take profit level for all symbols."
                 )
                 return
+                
+            # Parse and validate the percentage
+            percentage_str = message_parts[1].strip().replace('%', '')
             
-            # Get percentage from args and validate
-            try:
-                tp_percentage = float(context.args[0])
-                if tp_percentage < 0:
-                    await update.message.reply_text("❌ Take profit percentage must be positive")
-                    return
-            except ValueError:
-                await update.message.reply_text("❌ Invalid percentage format. Must be a number.")
+            percentage = float(percentage_str)
+            if percentage <= 0 or percentage > 100:
+                await self.send_message(
+                    update.effective_chat.id,
+                    "Take profit percentage must be between 0 and 100."
+                )
                 return
-            
-            # Update binance client
-            old_tp = self.binance_client.default_tp_percentage
-            self.binance_client.default_tp_percentage = tp_percentage
-            
-            # Update config if available
-            if 'trading' in self.config:
-                self.config['trading']['take_profit'] = f"{tp_percentage}%"
-            
-            # Send confirmation
-            await update.message.reply_text(
-                f"✅ Take profit updated from {old_tp}% to {tp_percentage}%\n"
-                f"This will apply to new trades only."
+                
+        except ValueError:
+            await self.send_message(
+                update.effective_chat.id,
+                "Invalid percentage format. Please provide a number."
             )
-            
+            return
         except Exception as e:
-            logger.error(f"Error setting take profit: {e}", exc_info=True)
-            await update.message.reply_text(f"❌ Error setting take profit: {str(e)}")
+            logger.error(f"Error parsing take profit percentage: {e}")
+            await self.send_message(
+                update.effective_chat.id,
+                "An error occurred while parsing the take profit percentage."
+            )
+            return
+
+        try:
+            # Format the percentage for config storage
+            tp_setting = f"{percentage}%"
+            
+            # Update the setting in both config and database
+            self.config['trading']['take_profit'] = tp_setting
+            old_tp = self.binance_client.default_tp_percentage
+            self.binance_client.default_tp_percentage = percentage
+            
+            # Also update in MongoDB
+            success = False
+            if self.mongo_client:
+                success = await self.mongo_client.update_trading_setting('take_profit', tp_setting)
+            
+            # Create a list to store details of updated orders
+            orders_updated = []
+            
+            # Update existing orders with active TP settings
+            active_orders = await self.mongo_client.get_orders_with_active_tp_sl()
+            for order in active_orders:
+                if order.status == OrderStatus.FILLED and order.take_profit and order.take_profit.status == TPSLStatus.PENDING:
+                    # Calculate new TP price based on entry price
+                    entry_price = order.price
+                    old_tp_price = order.take_profit.price
+                    new_tp_price = Decimal(str(float(entry_price) * (1 + percentage / 100)))
+                    
+                    # Update the order's TP in the database
+                    order.take_profit.price = new_tp_price
+                    order.take_profit.percentage = percentage
+                    await self.mongo_client.insert_order(order)
+                    
+                    # Add to list of updated orders with more details
+                    orders_updated.append({
+                        'order_id': order.order_id[:8] + '...',  # Truncate for readability
+                        'symbol': order.symbol,
+                        'entry_price': float(entry_price),
+                        'old_tp_price': float(old_tp_price),
+                        'new_tp_price': float(new_tp_price),
+                        'change_percent': percentage - order.take_profit.percentage
+                    })
+            
+            # Create message about the update
+            if len(orders_updated) > 0:
+                # Create a detailed message about which orders were updated
+                update_info = f"\n\n📊 *Updated {len(orders_updated)} Existing Orders:*"
+                for order in orders_updated:
+                    change_direction = "⬆️" if order['change_percent'] > 0 else "⬇️"
+                    update_info += f"\n- {order['symbol']} (ID: {order['order_id']}): ${order['old_tp_price']:.2f} → ${order['new_tp_price']:.2f} {change_direction}"
+                
+                message = (
+                    f"✅ Take profit set to {percentage}% for all symbols.\n"
+                    f"*Changed from:* {old_tp}% → {percentage}%{update_info}"
+                )
+                await self.send_message(
+                    update.effective_chat.id,
+                    message,
+                    parse_mode='Markdown'
+                )
+            else:
+                await self.send_message(
+                    update.effective_chat.id,
+                    f"✅ Take profit set to {percentage}% for all symbols.\n"
+                    f"*Changed from:* {old_tp}% → {percentage}%\n\n"
+                    f"*No existing orders* needed to be updated.",
+                    parse_mode='Markdown'
+                )
+                
+        except Exception as e:
+            logger.error(f"Error setting take profit: {e}")
+            await self.send_message(
+                update.effective_chat.id,
+                "An error occurred while setting the take profit."
+            )
 
     async def set_stop_loss(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Set stop loss percentage"""
+        """Set the global stop loss percentage for all symbols"""
         if not self._is_authorized(update.effective_user.id):
-            await update.message.reply_text("⛔ Unauthorized access")
+            await self.send_message(update.effective_chat.id, "You are not authorized to use this command.")
             return
-            
+
         try:
-            # Check if argument is provided
-            if not context.args or len(context.args) < 1:
-                await update.message.reply_text(
-                    "❌ Please provide a percentage value.\nExample: /set_sl 3"
+            # Get message parts, expecting format: /set_sl <percentage>
+            message_parts = update.message.text.split()
+            
+            # Check that we have enough parts (command + percentage)
+            if len(message_parts) != 2:
+                await self.send_message(
+                    update.effective_chat.id,
+                    "Please provide a percentage value.\n"
+                    "Example: `/set_sl 3` to set a 3% stop loss level for all symbols."
                 )
                 return
+                
+            # Parse and validate the percentage
+            percentage_str = message_parts[1].strip().replace('%', '')
             
-            # Get percentage from args and validate
-            try:
-                sl_percentage = float(context.args[0])
-                if sl_percentage < 0:
-                    await update.message.reply_text("❌ Stop loss percentage must be positive")
-                    return
-            except ValueError:
-                await update.message.reply_text("❌ Invalid percentage format. Must be a number.")
+            percentage = float(percentage_str)
+            if percentage <= 0 or percentage > 100:
+                await self.send_message(
+                    update.effective_chat.id,
+                    "Stop loss percentage must be between 0 and 100."
+                )
                 return
-            
-            # Update binance client
-            old_sl = self.binance_client.default_sl_percentage
-            self.binance_client.default_sl_percentage = sl_percentage
-            
-            # Update config if available
-            if 'trading' in self.config:
-                self.config['trading']['stop_loss'] = f"{sl_percentage}%"
-            
-            # Send confirmation
-            await update.message.reply_text(
-                f"✅ Stop loss updated from {old_sl}% to {sl_percentage}%\n"
-                f"This will apply to new trades only."
+                
+        except ValueError:
+            await self.send_message(
+                update.effective_chat.id,
+                "Invalid percentage format. Please provide a number."
             )
-            
+            return
         except Exception as e:
-            logger.error(f"Error setting stop loss: {e}", exc_info=True)
-            await update.message.reply_text(f"❌ Error setting stop loss: {str(e)}")
+            logger.error(f"Error parsing stop loss percentage: {e}")
+            await self.send_message(
+                update.effective_chat.id,
+                "An error occurred while parsing the stop loss percentage."
+            )
+            return
+
+        try:
+            # Format the percentage for config storage
+            sl_setting = f"{percentage}%"
+            
+            # Update the setting in both config and database
+            self.config['trading']['stop_loss'] = sl_setting
+            old_sl = self.binance_client.default_sl_percentage
+            self.binance_client.default_sl_percentage = percentage
+            
+            # Also update in MongoDB
+            success = False
+            if self.mongo_client:
+                success = await self.mongo_client.update_trading_setting('stop_loss', sl_setting)
+            
+            # Create a list to store details of updated orders
+            orders_updated = []
+            
+            # Update existing orders with active SL settings
+            active_orders = await self.mongo_client.get_orders_with_active_tp_sl()
+            for order in active_orders:
+                if order.status == OrderStatus.FILLED and order.stop_loss and order.stop_loss.status == TPSLStatus.PENDING:
+                    # Calculate new SL price based on entry price
+                    entry_price = order.price
+                    old_sl_price = order.stop_loss.price
+                    new_sl_price = Decimal(str(float(entry_price) * (1 - percentage / 100)))
+                    
+                    # Update the order's SL in the database
+                    order.stop_loss.price = new_sl_price
+                    order.stop_loss.percentage = percentage
+                    await self.mongo_client.insert_order(order)
+                    
+                    # Add to list of updated orders with more details
+                    orders_updated.append({
+                        'order_id': order.order_id[:8] + '...',  # Truncate for readability
+                        'symbol': order.symbol,
+                        'entry_price': float(entry_price),
+                        'old_sl_price': float(old_sl_price),
+                        'new_sl_price': float(new_sl_price),
+                        'change_percent': percentage - order.stop_loss.percentage
+                    })
+            
+            # Create message about the update
+            if len(orders_updated) > 0:
+                # Create a detailed message about which orders were updated
+                update_info = f"\n\n📊 *Updated {len(orders_updated)} Existing Orders:*"
+                for order in orders_updated:
+                    change_direction = "⬆️" if order['change_percent'] > 0 else "⬇️"
+                    update_info += f"\n- {order['symbol']} (ID: {order['order_id']}): ${order['old_sl_price']:.2f} → ${order['new_sl_price']:.2f} {change_direction}"
+                
+                message = (
+                    f"✅ Stop loss set to {percentage}% for all symbols.\n"
+                    f"*Changed from:* {old_sl}% → {percentage}%{update_info}"
+                )
+                await self.send_message(
+                    update.effective_chat.id,
+                    message,
+                    parse_mode='Markdown'
+                )
+            else:
+                await self.send_message(
+                    update.effective_chat.id,
+                    f"✅ Stop loss set to {percentage}% for all symbols.\n"
+                    f"*Changed from:* {old_sl}% → {percentage}%\n\n"
+                    f"*No existing orders* needed to be updated.",
+                    parse_mode='Markdown'
+                )
+                
+        except Exception as e:
+            logger.error(f"Error setting stop loss: {e}")
+            await self.send_message(
+                update.effective_chat.id,
+                "An error occurred while setting the stop loss."
+            )
 
     async def show_lower_entries(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show current lower entries protection status"""
@@ -2060,19 +2197,23 @@ To change this setting:
             # Get previous setting
             old_setting = self.config['trading'].get('only_lower_entries', False)
             
-            # Update config
-            self.config['trading']['only_lower_entries'] = new_setting
-            
-            # Send confirmation
-            status = "ENABLED ✅" if new_setting else "DISABLED ❌"
-            old_status = "enabled" if old_setting else "disabled"
-            new_status = "enabled" if new_setting else "disabled"
-            
-            await update.message.reply_text(
-                f"🛡️ Lower Entries Protection: {status}\n\n"
-                f"Protection has been changed from {old_status} to {new_status}.\n\n"
-                f"This setting affects all future trades."
-            )
+            # Update setting in database
+            if await self.mongo_client.update_trading_setting('only_lower_entries', new_setting):
+                # Update config
+                self.config['trading']['only_lower_entries'] = new_setting
+                
+                # Send confirmation
+                status = "ENABLED ✅" if new_setting else "DISABLED ❌"
+                old_status = "enabled" if old_setting else "disabled"
+                new_status = "enabled" if new_setting else "disabled"
+                
+                await update.message.reply_text(
+                    f"🛡️ Lower Entries Protection: {status}\n\n"
+                    f"Protection has been changed from {old_status} to {new_status}.\n\n"
+                    f"This setting affects all future trades."
+                )
+            else:
+                await update.message.reply_text("Failed to update lower entries protection setting in database")
             
         except Exception as e:
             logger.error(f"Error setting lower entries protection: {e}", exc_info=True)

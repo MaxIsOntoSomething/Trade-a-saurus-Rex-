@@ -66,6 +66,7 @@ class MongoClient:
             self.invalid_symbols = self.db.invalid_symbols
             self.trading_symbols = self.db.trading_symbols
             self.removed_symbols = self.db.removed_symbols
+            self.trading_config = self.db.trading_config  # New collection for trading config
             
             logger.info(f"Successfully connected to MongoDB ({self.driver}) at {uri}")
             
@@ -100,6 +101,7 @@ class MongoClient:
                 await self.invalid_symbols.create_index([("symbol", 1)], unique=True)
                 await self.trading_symbols.create_index([("symbol", 1)], unique=True)
                 await self.removed_symbols.create_index([("symbol", 1)], unique=True)
+                await self.trading_config.create_index([("key", 1)], unique=True)  # New index for config
             else:
                 # Sync index creation for PyMongo
                 self.orders.create_index([("order_id", 1)], unique=True)
@@ -113,7 +115,8 @@ class MongoClient:
                 self.invalid_symbols.create_index([("symbol", 1)], unique=True)
                 self.trading_symbols.create_index([("symbol", 1)], unique=True)
                 self.removed_symbols.create_index([("symbol", 1)], unique=True)
-                
+                self.trading_config.create_index([("key", 1)], unique=True)  # New index for config
+            
             logger.info("MongoDB indexes created successfully")
         except Exception as e:
             logger.error(f"Failed to create MongoDB indexes: {e}")
@@ -1344,3 +1347,93 @@ class MongoClient:
         except Exception as e:
             logger.error(f"Error executing update_one: {e}")
             return None
+            
+    async def save_trading_config(self, config: dict) -> bool:
+        """Save trading configuration to database"""
+        try:
+            # We only save the trading section of the config
+            if 'trading' not in config:
+                logger.error("No trading section in config")
+                return False
+                
+            # Extract trading settings
+            trading_config = config['trading']
+            
+            # Save each setting as a separate document for easier updates
+            for key, value in trading_config.items():
+                # Skip complex settings like thresholds and pairs which are managed separately
+                if key in ['thresholds', 'pairs']:
+                    continue
+                    
+                # Format for storage
+                update_data = {
+                    "$set": {
+                        "key": key,
+                        "value": value,
+                        "updated_at": datetime.utcnow()
+                    },
+                    "$setOnInsert": {
+                        "created_at": datetime.utcnow()
+                    }
+                }
+                
+                # Save to database
+                await self.trading_config.update_one(
+                    {"key": key},
+                    update_data,
+                    upsert=True
+                )
+                
+            logger.info(f"Saved trading configuration to database")
+            return True
+        except Exception as e:
+            logger.error(f"Error saving trading config: {e}")
+            return False
+            
+    async def load_trading_config(self) -> Optional[dict]:
+        """Load trading configuration from database"""
+        try:
+            # Get all config entries
+            cursor = self.trading_config.find({})
+            config = {}
+            
+            async for doc in cursor:
+                key = doc["key"]
+                value = doc["value"]
+                config[key] = value
+                
+            if config:
+                logger.info(f"Loaded trading configuration from database with {len(config)} settings")
+                return config
+            else:
+                logger.info("No trading configuration found in database")
+                return None
+        except Exception as e:
+            logger.error(f"Error loading trading config: {e}")
+            return None
+            
+    async def update_trading_setting(self, setting: str, value: Any) -> bool:
+        """Update a specific trading setting"""
+        try:
+            update_data = {
+                "$set": {
+                    "key": setting,
+                    "value": value,
+                    "updated_at": datetime.utcnow()
+                },
+                "$setOnInsert": {
+                    "created_at": datetime.utcnow()
+                }
+            }
+            
+            result = await self.trading_config.update_one(
+                {"key": setting},
+                update_data,
+                upsert=True
+            )
+            
+            logger.info(f"Updated trading setting '{setting}' to '{value}'")
+            return True
+        except Exception as e:
+            logger.error(f"Error updating trading setting: {e}")
+            return False
