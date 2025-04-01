@@ -8,7 +8,7 @@ from typing import Dict, List, Optional, Tuple
 import aiohttp
 import json
 import re  # Add import for regex support
-from ..types.models import Order, OrderStatus, TimeFrame, OrderType, TradeDirection, TakeProfit, StopLoss, TPSLStatus  # Add TP/SL imports
+from ..types.models import Order, OrderStatus, TimeFrame, OrderType, TradeDirection, TakeProfit, StopLoss, TPSLStatus, PartialTakeProfit, TrailingStopLoss  # Add TP/SL imports
 from ..utils.rate_limiter import RateLimiter
 from ..types.constants import PRECISION, MIN_NOTIONAL, TIMEFRAME_INTERVALS, TRADING_FEES, ORDER_TYPE_FEES
 from ..utils.chart_generator import ChartGenerator
@@ -76,6 +76,11 @@ class BinanceClient:
         self.default_tp_percentage = 0
         self.default_sl_percentage = 0
         
+        # Add trailing stop loss tracking
+        self.trailing_sl_enabled = False
+        self.trailing_sl_activation = 0.0
+        self.trailing_sl_callback = 0.0
+        
         if config and 'trading' in config:
             # Parse TP/SL settings from config
             tp_setting = config['trading'].get('take_profit', '0%')
@@ -108,6 +113,21 @@ class BinanceClient:
             except (ValueError, AttributeError) as e:
                 logger.warning(f"[INIT] Invalid Stop Loss setting: '{sl_setting}', using 0% (Error: {e})")
                 self.default_sl_percentage = 0
+                
+            # Get trailing stop loss settings
+            if 'trailing_stop_loss' in config['trading']:
+                trailing_sl_config = config['trading']['trailing_stop_loss']
+                self.trailing_sl_enabled = trailing_sl_config.get('enabled', False)
+                self.trailing_sl_activation = float(trailing_sl_config.get('activation_percentage', 1.0))
+                self.trailing_sl_callback = float(trailing_sl_config.get('callback_rate', 0.5))
+                
+                logger.info(f"[INIT] Trailing Stop Loss: {'Enabled' if self.trailing_sl_enabled else 'Disabled'}")
+                if self.trailing_sl_enabled:
+                    logger.info(f"[INIT] Trailing SL Activation: {self.trailing_sl_activation}%, Callback: {self.trailing_sl_callback}%")
+                    # If trailing stop loss is enabled, disable regular stop loss
+                    if self.default_sl_percentage > 0:
+                        logger.info(f"[INIT] Regular stop loss ({self.default_sl_percentage}%) disabled due to trailing stop loss being enabled")
+                        self.default_sl_percentage = 0
         
         # Add tracking of invalid symbols
         self.invalid_symbols = set()
@@ -1355,8 +1375,11 @@ class BinanceClient:
         sl_order_id = None
         
         # Skip if no TP/SL is configured
-        if self.default_tp_percentage <= 0 and self.default_sl_percentage <= 0:
-            logger.info(f"No TP/SL configured, skipping for {order.symbol}")
+        if (self.default_tp_percentage <= 0 and 
+            self.default_sl_percentage <= 0 and 
+            not self.config['trading']['partial_take_profits']['enabled'] and
+            not self.trailing_sl_enabled):
+            logger.info(f"No TP/SL, partial TP, or trailing SL configured, skipping for {order.symbol}")
             return None, None
             
         if not order.filled_at:
@@ -1366,25 +1389,61 @@ class BinanceClient:
         try:
             # Calculate TP/SL prices based on entry price and direction
             is_long = not order.direction or order.direction == TradeDirection.LONG
-            
-            # For spot orders or long futures, TP is above entry, SL is below
-            # For short futures, TP is below entry, SL is above
-            tp_multiplier = 1 + (self.default_tp_percentage / 100) if is_long else 1 - (self.default_tp_percentage / 100)
-            sl_multiplier = 1 - (self.default_sl_percentage / 100) if is_long else 1 + (self.default_sl_percentage / 100)
-            
-            # Calculate TP/SL prices
-            tp_price = order.price * Decimal(str(tp_multiplier))
-            sl_price = order.price * Decimal(str(sl_multiplier))
-            
-            # Round prices to appropriate precision
             price_precision = self._get_price_precision(order.symbol)
-            tp_price = Decimal(str(round(tp_price, price_precision)))
-            sl_price = Decimal(str(round(sl_price, price_precision)))
             
-            logger.info(f"Calculated TP/SL for {order.symbol}: Entry={float(order.price)}, TP={float(tp_price)} ({self.default_tp_percentage}%), SL={float(sl_price)} ({self.default_sl_percentage}%)")
+            # Priority logic:
+            # 1. Partial TP overrides regular TP
+            # 2. Trailing SL overrides regular SL
             
-            # Create TP object if applicable
-            if self.default_tp_percentage > 0:
+            # Check for partial take profits first
+            if self.config['trading']['partial_take_profits']['enabled'] and self.config['trading']['partial_take_profits']['levels']:
+                logger.info(f"Setting up partial take profits for {order.symbol} (overriding regular TP)")
+                
+                # Sort levels by profit percentage (ascending)
+                sorted_levels = sorted(
+                    self.config['trading']['partial_take_profits']['levels'], 
+                    key=lambda x: x['profit_percentage']
+                )
+                
+                # Create partial TP objects
+                for level_config in sorted_levels:
+                    level = level_config['level']
+                    profit_percentage = level_config['profit_percentage']
+                    position_percentage = level_config['position_percentage']
+                    
+                    # Calculate TP price
+                    tp_multiplier = 1 + (profit_percentage / 100) if is_long else 1 - (profit_percentage / 100)
+                    tp_price = order.price * Decimal(str(tp_multiplier))
+                    tp_price = Decimal(str(round(tp_price, price_precision)))
+                    
+                    # Create PartialTakeProfit object
+                    partial_tp = PartialTakeProfit(
+                        level=level,
+                        price=tp_price,
+                        profit_percentage=profit_percentage,
+                        position_percentage=position_percentage,
+                        status=TPSLStatus.PENDING
+                    )
+                    
+                    # Add to order's partial take profits
+                    order.partial_take_profits.append(partial_tp)
+                    
+                    logger.info(f"Added partial TP level {level} for {order.symbol}: {profit_percentage}% profit, "
+                                f"{position_percentage}% of position, price=${float(tp_price)}")
+            
+            # Regular TP (only if partial TP is not enabled)
+            elif self.default_tp_percentage > 0:
+                # For spot orders or long futures, TP is above entry, SL is below
+                # For short futures, TP is below entry, SL is above
+                tp_multiplier = 1 + (self.default_tp_percentage / 100) if is_long else 1 - (self.default_tp_percentage / 100)
+                
+                # Calculate TP price
+                tp_price = order.price * Decimal(str(tp_multiplier))
+                tp_price = Decimal(str(round(tp_price, price_precision)))
+                
+                logger.info(f"Regular take profit for {order.symbol}: Entry=${float(order.price)}, TP=${float(tp_price)} ({self.default_tp_percentage}%)")
+                
+                # Create TP object
                 order.take_profit = TakeProfit(
                     price=tp_price,
                     percentage=self.default_tp_percentage,
@@ -1398,8 +1457,47 @@ class BinanceClient:
                     # tp_order_id = "tp_" + order.order_id  # In a real implementation, this would be the actual order ID
                     # order.take_profit.order_id = tp_order_id
             
-            # Create SL object if applicable
-            if self.default_sl_percentage > 0:
+            # Handle Trailing Stop Loss (overrides regular stop loss)
+            if self.trailing_sl_enabled:
+                logger.info(f"Setting up trailing stop loss for {order.symbol} (overriding regular SL)")
+                
+                # Calculate activation price (entry price + activation percentage)
+                activation_multiplier = 1 + (self.trailing_sl_activation / 100) if is_long else 1 - (self.trailing_sl_activation / 100)
+                activation_price = order.price * Decimal(str(activation_multiplier))
+                activation_price = Decimal(str(round(activation_price, price_precision)))
+                
+                # Initial stop loss is same as regular SL or calculated from callback
+                initial_sl_multiplier = 1 - (self.trailing_sl_callback / 100) if is_long else 1 + (self.trailing_sl_callback / 100)
+                initial_stop_price = order.price * Decimal(str(initial_sl_multiplier))
+                initial_stop_price = Decimal(str(round(initial_stop_price, price_precision)))
+                
+                # Create TrailingStopLoss object
+                order.trailing_stop_loss = TrailingStopLoss(
+                    activation_percentage=self.trailing_sl_activation,
+                    callback_rate=self.trailing_sl_callback,
+                    initial_price=order.price,
+                    activation_price=activation_price,
+                    current_stop_price=initial_stop_price,
+                    highest_price=order.price,  # Initially set to entry price
+                    status=TPSLStatus.PENDING
+                )
+                
+                logger.info(f"Trailing SL for {order.symbol}: Entry=${float(order.price)}, "
+                           f"Activation=${float(activation_price)} (+{self.trailing_sl_activation}%), "
+                           f"Initial SL=${float(initial_stop_price)}, "
+                           f"Callback={self.trailing_sl_callback}%")
+            
+            # Regular SL (only if trailing SL is not enabled)
+            elif self.default_sl_percentage > 0:
+                sl_multiplier = 1 - (self.default_sl_percentage / 100) if is_long else 1 + (self.default_sl_percentage / 100)
+                
+                # Calculate SL price
+                sl_price = order.price * Decimal(str(sl_multiplier))
+                sl_price = Decimal(str(round(sl_price, price_precision)))
+                
+                logger.info(f"Regular stop loss for {order.symbol}: Entry=${float(order.price)}, SL=${float(sl_price)} ({self.default_sl_percentage}%)")
+                
+                # Create SL object
                 order.stop_loss = StopLoss(
                     price=sl_price,
                     percentage=self.default_sl_percentage,
@@ -1419,19 +1517,21 @@ class BinanceClient:
             logger.error(f"Error creating TP/SL orders for {order.symbol}: {e}")
             return None, None
 
-    # Add method to check TP/SL triggers
     async def check_tp_sl_triggers(self, order: Order) -> Dict[str, bool]:
-        """Check if take profit or stop loss levels have been triggered"""
-        result = {'tp_triggered': False, 'sl_triggered': False}
+        """Check if take profit, stop loss, or partial take profit levels have been triggered"""
+        result = {'tp_triggered': False, 'sl_triggered': False, 'partial_tp_triggered': [], 'trailing_sl_updated': False}
         
         if not order or order.status != OrderStatus.FILLED:
             return result
             
-        # Skip if already triggered
-        if (order.take_profit and order.take_profit.status == TPSLStatus.TRIGGERED) and \
-           (order.stop_loss and order.stop_loss.status == TPSLStatus.TRIGGERED):
-            return result
-            
+        # Skip if main TP/SL already triggered
+        if ((order.take_profit and order.take_profit.status == TPSLStatus.TRIGGERED) and 
+            (order.stop_loss and order.stop_loss.status == TPSLStatus.TRIGGERED) and
+            (order.trailing_stop_loss and order.trailing_stop_loss.status == TPSLStatus.TRIGGERED)):
+            # Still check partial TPs if they exist
+            if not order.partial_take_profits:
+                return result
+                
         try:
             # Get current price
             current_price = await self.get_current_price(order.symbol)
@@ -1449,20 +1549,94 @@ class BinanceClient:
                 tp_triggered = (current_price_dec >= order.take_profit.price) if is_long else (current_price_dec <= order.take_profit.price)
                 
                 if tp_triggered:
-                    logger.info(f"🎯 TP triggered for {order.symbol}: Target={float(order.take_profit.price)}, Current={current_price}")
+                    logger.info(f"🎯 TP triggered for {order.symbol}: Target=${float(order.take_profit.price)}, Current=${current_price}")
                     order.take_profit.status = TPSLStatus.TRIGGERED
                     order.take_profit.triggered_at = datetime.utcnow()
                     result['tp_triggered'] = True
             
-            # Check stop loss
+            # Check regular stop loss
             if order.stop_loss and order.stop_loss.status == TPSLStatus.PENDING:
                 sl_triggered = (current_price_dec <= order.stop_loss.price) if is_long else (current_price_dec >= order.stop_loss.price)
                 
                 if sl_triggered:
-                    logger.info(f"⛔ SL triggered for {order.symbol}: Target={float(order.stop_loss.price)}, Current={current_price}")
+                    logger.info(f"⛔ SL triggered for {order.symbol}: Target=${float(order.stop_loss.price)}, Current=${current_price}")
                     order.stop_loss.status = TPSLStatus.TRIGGERED
                     order.stop_loss.triggered_at = datetime.utcnow()
                     result['sl_triggered'] = True
+            
+            # Check trailing stop loss
+            if order.trailing_stop_loss and order.trailing_stop_loss.status == TPSLStatus.PENDING:
+                # Get current stop price
+                current_stop_price = order.trailing_stop_loss.current_stop_price
+                
+                # Check if trailing stop loss is triggered
+                sl_triggered = (current_price_dec <= current_stop_price) if is_long else (current_price_dec >= current_stop_price)
+                
+                if sl_triggered:
+                    logger.info(f"⛔ Trailing SL triggered for {order.symbol}: Stop=${float(current_stop_price)}, Current=${current_price}")
+                    order.trailing_stop_loss.status = TPSLStatus.TRIGGERED
+                    order.trailing_stop_loss.triggered_at = datetime.utcnow()
+                    result['sl_triggered'] = True
+                else:
+                    # If not triggered, check if trailing stop loss needs to be updated
+                    # First check if activation price has been reached
+                    activation_price = order.trailing_stop_loss.activation_price
+                    activation_reached = (current_price_dec >= activation_price) if is_long else (current_price_dec <= activation_price)
+                    
+                    if activation_reached:
+                        # If not already activated, mark as activated
+                        if not order.trailing_stop_loss.activated_at:
+                            order.trailing_stop_loss.activated_at = datetime.utcnow()
+                            logger.info(f"Trailing SL activated for {order.symbol}: Price=${current_price} reached activation (${float(activation_price)})")
+                        
+                        # Update highest price seen if needed
+                        price_precision = self._get_price_precision(order.symbol)
+                        highest_price = order.trailing_stop_loss.highest_price
+                        
+                        # Check if current price is better than highest price
+                        if (is_long and current_price_dec > highest_price) or (not is_long and current_price_dec < highest_price):
+                            # Update highest price
+                            order.trailing_stop_loss.highest_price = current_price_dec
+                            
+                            # Calculate new stop loss price based on callback rate
+                            callback_rate = order.trailing_stop_loss.callback_rate
+                            callback_multiplier = 1 - (callback_rate / 100) if is_long else 1 + (callback_rate / 100)
+                            new_stop_price = current_price_dec * Decimal(str(callback_multiplier))
+                            new_stop_price = Decimal(str(round(new_stop_price, price_precision)))
+                            
+                            # Only update if new stop loss is better than current
+                            if (is_long and new_stop_price > current_stop_price) or (not is_long and new_stop_price < current_stop_price):
+                                old_stop_price = current_stop_price
+                                order.trailing_stop_loss.current_stop_price = new_stop_price
+                                result['trailing_sl_updated'] = True
+                                
+                                logger.info(f"Updated trailing SL for {order.symbol}: ${float(old_stop_price)} → ${float(new_stop_price)}, "
+                                           f"Current=${current_price}, Callback={callback_rate}%")
+            
+            # Check partial take profits (only if SL not triggered)
+            if not result['sl_triggered'] and order.partial_take_profits:
+                # Sort by price (descending for long, ascending for short) to check highest/lowest targets first
+                sorted_tps = sorted(
+                    order.partial_take_profits,
+                    key=lambda x: float(x.price),
+                    reverse=is_long
+                )
+                
+                # Only check pending partial TPs
+                pending_tps = [tp for tp in sorted_tps if tp.status == TPSLStatus.PENDING]
+                
+                for partial_tp in pending_tps:
+                    # Check if price has reached the partial TP level
+                    tp_triggered = (current_price_dec >= partial_tp.price) if is_long else (current_price_dec <= partial_tp.price)
+                    
+                    if tp_triggered:
+                        logger.info(f"🎯 Partial TP level {partial_tp.level} triggered for {order.symbol}: "
+                                   f"Target=${float(partial_tp.price)}, Current=${current_price}, "
+                                   f"{partial_tp.position_percentage}% of position")
+                        
+                        partial_tp.status = TPSLStatus.TRIGGERED
+                        partial_tp.triggered_at = datetime.utcnow()
+                        result['partial_tp_triggered'].append(partial_tp.level)
                     
             return result
             

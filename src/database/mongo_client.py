@@ -10,7 +10,7 @@ import pymongo
 import pymongo.errors
 from pymongo.client_session import ClientSession
 
-from ..types.models import Order, OrderStatus, TimeFrame, OrderType, TradeDirection, TPSLStatus, TakeProfit, StopLoss  # Add TPSLStatus and related classes
+from ..types.models import Order, OrderStatus, TimeFrame, OrderType, TradeDirection, TPSLStatus, TakeProfit, StopLoss, PartialTakeProfit  # Add TPSLStatus and related classes
 from ..types.constants import TAX_RATE, PRICE_PRECISION
 from decimal import ROUND_DOWN, InvalidOperation
 import numpy as np
@@ -492,7 +492,8 @@ class MongoClient:
                 logger.warning(f"Invalid order_type '{order_type_str}', defaulting to 'spot'")
                 order_type = OrderType.SPOT
 
-            return Order(
+            # Create the base Order object
+            order = Order(
                 symbol=doc["symbol"],
                 status=OrderStatus(doc["status"]),
                 order_type=order_type,  # Use the converted order_type
@@ -503,7 +504,7 @@ class MongoClient:
                 created_at=doc["created_at"],
                 updated_at=doc["updated_at"],
                 leverage=doc.get("leverage"),
-                direction=doc.get("direction"),
+                direction=TradeDirection(doc["direction"]) if doc.get("direction") else None,
                 filled_at=doc.get("filled_at"),
                 cancelled_at=doc.get("cancelled_at"),
                 fees=Decimal(str(doc.get("fees", 0))),
@@ -511,6 +512,44 @@ class MongoClient:
                 threshold=doc.get("threshold"),
                 is_manual=doc.get("is_manual", False)
             )
+
+            # Process take profit if exists
+            if "take_profit" in doc and doc["take_profit"]:
+                tp_data = doc["take_profit"]
+                order.take_profit = TakeProfit(
+                    price=Decimal(str(tp_data["price"])),
+                    percentage=float(tp_data["percentage"]),
+                    status=TPSLStatus(tp_data["status"]),
+                    triggered_at=tp_data.get("triggered_at"),
+                    order_id=tp_data.get("order_id")
+                )
+
+            # Process stop loss if exists
+            if "stop_loss" in doc and doc["stop_loss"]:
+                sl_data = doc["stop_loss"]
+                order.stop_loss = StopLoss(
+                    price=Decimal(str(sl_data["price"])),
+                    percentage=float(sl_data["percentage"]),
+                    status=TPSLStatus(sl_data["status"]),
+                    triggered_at=sl_data.get("triggered_at"),
+                    order_id=sl_data.get("order_id")
+                )
+
+            # Process partial take profits if exist
+            if "partial_take_profits" in doc and doc["partial_take_profits"]:
+                for tp_data in doc["partial_take_profits"]:
+                    partial_tp = PartialTakeProfit(
+                        level=int(tp_data["level"]),
+                        price=Decimal(str(tp_data["price"])),
+                        profit_percentage=float(tp_data["profit_percentage"]),
+                        position_percentage=float(tp_data["position_percentage"]),
+                        status=TPSLStatus(tp_data["status"]),
+                        triggered_at=tp_data.get("triggered_at"),
+                        order_id=tp_data.get("order_id")
+                    )
+                    order.partial_take_profits.append(partial_tp)
+
+            return order
         except Exception as e:
             logger.error(f"Error converting document to Order: {e}")
             return None
@@ -1047,7 +1086,8 @@ class MongoClient:
     async def update_tp_sl_status(self, order_id: str, tp_status: Optional[TPSLStatus] = None, 
                                 sl_status: Optional[TPSLStatus] = None,
                                 tp_triggered_at: Optional[datetime] = None,
-                                sl_triggered_at: Optional[datetime] = None) -> bool:
+                                sl_triggered_at: Optional[datetime] = None,
+                                partial_tp_updates: Optional[List[Dict]] = None) -> bool:
         """Update TP/SL status for an order"""
         try:
             update_dict = {"updated_at": datetime.utcnow()}
@@ -1062,6 +1102,28 @@ class MongoClient:
             if sl_triggered_at:
                 update_dict["stop_loss.triggered_at"] = sl_triggered_at
             
+            # Handle partial take profit updates
+            if partial_tp_updates:
+                for update in partial_tp_updates:
+                    level = update.get('level')
+                    status = update.get('status')
+                    triggered_at = update.get('triggered_at')
+                    
+                    if level is not None and status:
+                        # Find the index of the partial TP with this level
+                        # We need to use positional $ operator which requires a separate query
+                        partial_tp_query = {"order_id": order_id, f"partial_take_profits.level": level}
+                        partial_tp_update = {f"partial_take_profits.$.status": status.value}
+                        
+                        if triggered_at:
+                            partial_tp_update[f"partial_take_profits.$.triggered_at"] = triggered_at
+                        
+                        await self.orders.update_one(
+                            partial_tp_query,
+                            {"$set": partial_tp_update}
+                        )
+            
+            # Update regular TP/SL
             result = await self.orders.update_one(
                 {"order_id": order_id},
                 {"$set": update_dict}
@@ -1074,14 +1136,15 @@ class MongoClient:
             return False
 
     async def get_orders_with_active_tp_sl(self) -> List[Order]:
-        """Get all orders with active (pending) TP/SL settings"""
+        """Get all orders with active (pending) TP/SL or partial TP settings"""
         try:
-            # Find orders that are filled and have either pending TP or SL
+            # Find orders that are filled and have either pending TP, SL, or partial TP
             query = {
                 "status": OrderStatus.FILLED.value,
                 "$or": [
                     {"take_profit.status": TPSLStatus.PENDING.value},
-                    {"stop_loss.status": TPSLStatus.PENDING.value}
+                    {"stop_loss.status": TPSLStatus.PENDING.value},
+                    {"partial_take_profits": {"$elemMatch": {"status": TPSLStatus.PENDING.value}}}
                 ]
             }
             
@@ -1096,7 +1159,7 @@ class MongoClient:
                 except Exception as e:
                     logger.error(f"Error processing order with TP/SL: {e}")
             
-            logger.info(f"Found {len(orders)} orders with active TP/SL")
+            logger.info(f"Found {len(orders)} orders with active TP/SL/partial TP")
             return orders
             
         except Exception as e:
@@ -1437,3 +1500,20 @@ class MongoClient:
         except Exception as e:
             logger.error(f"Error updating trading setting: {e}")
             return False
+
+    async def get_active_orders(self) -> List[Order]:
+        """Get all orders with FILLED status for TP/SL monitoring"""
+        try:
+            cursor = self.orders_collection.find({"status": OrderStatus.FILLED.value})
+            documents = await cursor.to_list(length=100)  # Limit to 100 active orders
+            
+            orders = []
+            for doc in documents:
+                order = self._document_to_order(doc)
+                if order:
+                    orders.append(order)
+                    
+            return orders
+        except Exception as e:
+            logger.error(f"Error retrieving active orders: {e}")
+            return []

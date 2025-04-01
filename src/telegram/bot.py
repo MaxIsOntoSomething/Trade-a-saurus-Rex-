@@ -1,5 +1,6 @@
 import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application, CommandHandler, ContextTypes, 
     ConversationHandler, CallbackQueryHandler, MessageHandler,
@@ -9,7 +10,7 @@ from datetime import datetime, timedelta
 import logging
 from decimal import Decimal, InvalidOperation  # Add InvalidOperation for exception handling
 from typing import List, Optional, Dict  # Add Dict import
-from ..types.models import Order, OrderStatus, TimeFrame, OrderType, TradeDirection, TPSLStatus  # Update imports
+from ..types.models import Order, OrderStatus, TimeFrame, OrderType, TradeDirection, TPSLStatus, PartialTakeProfit  # Update imports
 from ..trading.binance_client import BinanceClient
 from ..database.mongo_client import MongoClient
 import io  # Add for handling bytes from chart
@@ -59,30 +60,27 @@ class TelegramBot:
     def __init__(self, token: str, allowed_users: List[int], 
                  binance_client: BinanceClient, mongo_client: MongoClient,
                  config: dict):  # Add config parameter
+        logger.info("Initializing Telegram bot...")
         self.token = token
         self.allowed_users = allowed_users
         self.binance_client = binance_client
         self.mongo_client = mongo_client
         self.config = config
-        self.application = None
         self.is_paused = False
-        self.running = False
-        self._polling_task = None
-        self._update_id = 0
-        self.temp_trade_data = {}
+        self.application = None
+        self.order_data = {}  # Store order data during creation
+        
+        # Create default keyboard markup for reply messages
+        self.markup = ReplyKeyboardMarkup(
+            [[KeyboardButton("/menu"), KeyboardButton("/help")]],
+            resize_keyboard=True
+        )
         
         # Set base currency and reserve balance in binance client immediately
         if 'trading' in self.config:
             self.binance_client.base_currency = self.config['trading'].get('base_currency', 'USDT')
             self.binance_client.reserve_balance = float(self.config['trading'].get('reserve_balance', 0))
             
-        self.keyboard = [
-            [KeyboardButton("/balance"), KeyboardButton("/stats"), KeyboardButton("/profits")],
-            [KeyboardButton("/power"), KeyboardButton("/add"), KeyboardButton("/thresholds")],  # Changed /trading to /power
-            [KeyboardButton("/tp_sl"), KeyboardButton("/history"), KeyboardButton("/viz")],
-            [KeyboardButton("/lower_entries"), KeyboardButton("/menu")]
-        ]
-        self.markup = ReplyKeyboardMarkup(self.keyboard, resize_keyboard=True)
         self.startup_message = f"""
 {DINO_ASCII}
 
@@ -98,143 +96,114 @@ Status: Ready to ROAR! 🦖
         self.chart_generator = ChartGenerator()  # Add this line
 
     async def initialize(self):
-        """Initialize the Telegram bot"""
-        self.application = Application.builder().token(self.token).build()
-        
-        # Add new command handlers
-        add_trade_handler = ConversationHandler(
-            entry_points=[CommandHandler("add", self.add_trade_start)],
-            states={
-                SYMBOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_trade_symbol)],
-                ORDER_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_trade_order_type)],
-                LEVERAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_trade_leverage)],
-                DIRECTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_trade_direction)],
-                AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_trade_amount)],
-                PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_trade_final)]
-            },
-            fallbacks=[CommandHandler("cancel", self.add_trade_cancel)],
-        )
-        
-        self.application.add_handler(add_trade_handler)
-        self.application.add_handler(CommandHandler("thresholds", self.show_thresholds))
-        self.application.add_handler(CommandHandler("menu", self.show_menu))
-        self.application.add_handler(CommandHandler("resetthresholds", self.reset_all_thresholds))  # Add new command
-        
-        # Add TP/SL command handlers
-        self.application.add_handler(CommandHandler("tp_sl", self.show_tp_sl))
-        self.application.add_handler(CommandHandler("set_tp", self.set_take_profit))
-        self.application.add_handler(CommandHandler("set_sl", self.set_stop_loss))
-        
-        # Add lower entries protection commands
-        self.application.add_handler(CommandHandler("lower_entries", self.show_lower_entries))
-        self.application.add_handler(CommandHandler("set_lower_entries", self.set_lower_entries))
-        
-        # Register command handlers
-        self.application.add_handler(CommandHandler("start", self.start_command))
-        self.application.add_handler(CommandHandler("power", self.toggle_trading))  # Change command name
-        self.application.add_handler(CommandHandler("balance", self.get_balance))
-        self.application.add_handler(CommandHandler("stats", self.get_stats))
-        self.application.add_handler(CommandHandler("history", self.get_order_history))
-        self.application.add_handler(CommandHandler("profits", self.show_profits))
-        
-        # Add visualization command
-        self.application.add_handler(CommandHandler("viz", self.show_viz_menu))
-        self.application.add_handler(CallbackQueryHandler(self.handle_viz_selection, pattern="^(daily_volume|profit_distribution|order_types|hourly_activity|balance_chart|roi_comparison|sp500_vs_btc|portfolio_composition)$"))
-        
-        # Add symbol management commands
-        self.application.add_handler(CommandHandler("add_symbol", self.add_symbol_command))
-        self.application.add_handler(CommandHandler("remove_symbol", self.remove_symbol_command))
-        self.application.add_handler(CommandHandler("list_symbols", self.list_symbols_command))
-        
-        # Add callback handler for symbol management
-        self.application.add_handler(CallbackQueryHandler(self.handle_symbol_callback, pattern="^remove_symbol:"))
-        
-        await self.application.initialize()
-        await self.application.start()
-        await self.send_restored_thresholds_message()
+        """Initialize the bot by creating the application and registering handlers"""
+        try:
+            # Create application with token
+            self.application = Application.builder().token(self.token).build()
+            
+            # Save the bot instance for direct access
+            self.bot = self.application.bot
+            
+            # Register command handlers
+            await self.register_commands()
+            
+            logger.info("Telegram bot initialized successfully")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to initialize Telegram bot: {e}")
+            return False
 
     async def start(self):
-        """Start the bot and begin polling"""
-        self.running = True
-        
-        # Send startup message to all authorized users
-        for user_id in self.allowed_users:
-            try:
-                # First send welcome message
-                await self.application.bot.send_message(
-                    chat_id=user_id, 
-                    text=self.startup_message,
-                    reply_markup=self.markup
-                )
+        """Start the bot application"""
+        try:
+            # Make sure we're initialized
+            if not self.application:
+                await self.initialize()
                 
-                # Then check for restored thresholds
-                if self.binance_client and hasattr(self.binance_client, 'restored_threshold_info'):
-                    restored_info = self.binance_client.restored_threshold_info
-                    if restored_info:
-                        logger.info(f"Sending threshold restoration notification: {restored_info}")
-                        await self.send_threshold_restoration_notification(restored_info)
-                    else:
-                        logger.info("No restored thresholds to notify about")
-                
-            except Exception as e:
-                logger.error(f"Failed to send startup message to {user_id}: {e}")
-        
-        # Start polling in the background
-        while self.running:
-            try:
-                updates = await self.application.bot.get_updates(
-                    offset=self._update_id,
-                    timeout=30
-                )
-                
-                for update in updates:
-                    if update.update_id >= self._update_id:
-                        self._update_id = update.update_id + 1
-                        await self.application.process_update(update)
-                        
-            except Exception as e:
-                logger.error(f"Polling error: {e}")
-                await asyncio.sleep(1)
-                
-            await asyncio.sleep(0.1)
+            # Initialize the application
+            await self.application.initialize()
+            
+            # Start receiving updates
+            await self.application.start()
+            
+            # Start polling
+            await self.application.updater.start_polling()
+            
+            logger.info("Telegram bot is now running!")
+            
+            # Send startup notification to all allowed users
+            for user_id in self.allowed_users:
+                try:
+                    await self.bot.send_message(
+                        chat_id=user_id,
+                        text=f"🦖 Trade-a-saurus Rex is now online!\nEnvironment: {'TESTNET' if self.config['binance']['use_testnet'] else 'MAINNET'}",
+                        reply_markup=self.markup
+                    )
+                except Exception as e:
+                    logger.error(f"Could not send startup message to user {user_id}: {e}")
+                    
+            return True
+        except Exception as e:
+            logger.error(f"Failed to start Telegram bot: {e}")
+            return False
 
     async def stop(self):
-        """Stop the Telegram bot"""
-        self.running = False
-        if self.application:
-            await self.application.stop()
+        """Stop the bot application"""
+        try:
+            if self.application:
+                # Stop polling
+                if hasattr(self.application, 'updater') and self.application.updater:
+                    await self.application.updater.stop()
+                
+                # Stop the application
+                await self.application.stop()
+                
+                # Shutdown the application
+                await self.application.shutdown()
+                
+                logger.info("Telegram bot has been stopped")
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Error stopping Telegram bot: {e}")
+            return False
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle the /start command"""
-        if not self._is_authorized(update.effective_user.id):
-            await update.message.reply_text("⛔ Unauthorized access")
-            return
+        try:
+            # Check authorization
+            if not await self.is_user_authorized(update):
+                return
+                
+            # Get environment name for customization
+            env_name = "TESTNET" if self.config['binance']['use_testnet'] else "MAINNET"
             
-        welcome_message = """
-🦖 Trade-a-saurus Rex is ready!
+            # Send welcome message with dinosaur ASCII art
+            welcome_message = f"""
+{DINO_ASCII}
+Welcome to Trade-a-saurus Rex! 🦖
 
-Available commands:
+🚀 Ready to hunt for crypto trading opportunities!
+🔍 Environment: {env_name}
+💰 Base Currency: {self.config['trading']['base_currency']}
 
-Trading Controls:
-/power - Toggle trading on/off  # Updated command name here
-
-Trading Information:
-/balance - Check current balance
-/stats - View trading statistics
-/profits - View portfolio profits
-/history - View recent order history
-/thresholds - Show threshold status
-
-Trading Actions:
-/add - Add a manual trade
-
-Menu:
-/menu - Show all commands
+Type /menu to see available commands.
+Type /help for detailed command information.
 """
-        await update.message.reply_text(
-            welcome_message,
-            reply_markup=self.markup
-        )
+            
+            # Send message and show menu keyboard
+            await update.message.reply_text(
+                welcome_message,
+                reply_markup=self.markup,
+                parse_mode=ParseMode.HTML
+            )
+            
+            # Show menu immediately after welcome
+            await self.show_menu(update, context)
+            
+        except Exception as e:
+            logger.error(f"Error in start command: {e}")
+            await update.message.reply_text("Error starting bot. Please try again.")
 
     def _is_authorized(self, user_id: int) -> bool:
         """Check if user is authorized"""
@@ -647,47 +616,88 @@ Menu:
                     logger.error(f"Completely failed to send notification: {e2}")
 
     async def show_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show available commands"""
-        if not self._is_authorized(update.effective_user.id):
-            await update.message.reply_text("You're not authorized to use this bot.")
-            return
-
-        menu_text = "🦖 Trade-a-saurus Rex Commands:\n\n"
-        
-        menu_text += "Trading Controls:\n"
-        menu_text += "/start - Start the bot and show welcome message\n"
-        menu_text += "/power - Toggle trading on/off\n\n"
-        
-        menu_text += "Trading Information:\n"
-        menu_text += "/balance - Check current balance\n"
-        menu_text += "/stats - View trading statistics\n"
-        menu_text += "/history - View recent order history\n"
-        menu_text += "/thresholds - Show threshold status and resets\n"
-        menu_text += "/viz - Show data visualizations 📊\n\n"
-        
-        menu_text += "Trading Actions:\n"
-        menu_text += "/add - Add a manual trade (interactive)\n"
-        menu_text += "/resetthresholds - Reset all thresholds across timeframes\n\n"
-        
-        menu_text += "Take Profit & Stop Loss:\n"
-        menu_text += "/tp_sl - View current TP/SL settings\n"
-        menu_text += "/set_tp - Set take profit percentage (example: /set_tp 5)\n"
-        menu_text += "/set_sl - Set stop loss percentage (example: /set_sl 3)\n\n"
-        
-        menu_text += "Entry Protection:\n"
-        menu_text += "/lower_entries - View lower entries protection status\n"
-        menu_text += "/set_lower_entries - Toggle protection on/off (example: /set_lower_entries on)\n\n"
-        
-        # Add new section for Symbol Management
-        menu_text += "Symbol Management:\n"
-        menu_text += "/add_symbol - Add a new trading symbol (example: /add_symbol BTCUSDT)\n"
-        menu_text += "/remove_symbol - Remove a trading symbol\n"
-        menu_text += "/list_symbols - List all configured trading symbols\n\n"
-        
-        menu_text += "Menu:\n"
-        menu_text += "/menu - Show this command list"
-        
-        await update.message.reply_text(menu_text)
+        """Show main menu keyboard"""
+        try:
+            if not await self.is_user_authorized(update):
+                return
+                
+            base_currency = self.config['trading'].get('base_currency', 'USDT')
+            
+            # Create main command sections
+            keyboard = [
+                # Price check buttons
+                [
+                    KeyboardButton(f"/price BTC{base_currency}"), 
+                    KeyboardButton(f"/price ETH{base_currency}"), 
+                    KeyboardButton(f"/price BNB{base_currency}")
+                ],
+                # Info commands
+                [
+                    KeyboardButton("/balance"), 
+                    KeyboardButton("/status"), 
+                    KeyboardButton("/orders")
+                ],
+                # Trading commands
+                [
+                    KeyboardButton("/symbols"), 
+                    KeyboardButton("/help")
+                ],
+                # Control commands
+                [
+                    KeyboardButton("/pausebot"), 
+                    KeyboardButton("/resumebot")
+                ]
+            ]
+            
+            # Get current trading settings status
+            trading_config = self.config.get('trading', {})
+            partial_tp_enabled = trading_config.get('partial_take_profit', {}).get('enabled', False)
+            trailing_sl_enabled = trading_config.get('trailing_stop_loss', {}).get('enabled', False)
+            lower_entries_enabled = trading_config.get('only_lower_entries', False)
+            
+            # Create status indicators
+            partial_tp_status = "✅" if partial_tp_enabled else "❌"
+            trailing_sl_status = "✅" if trailing_sl_enabled else "❌"
+            lower_entries_status = "✅" if lower_entries_enabled else "❌"
+            
+            # Add feature status row
+            keyboard.append([
+                KeyboardButton(f"Partial TP: {partial_tp_status}"),
+                KeyboardButton(f"Trailing SL: {trailing_sl_status}"),
+                KeyboardButton(f"Lower Entries: {lower_entries_status}")
+            ])
+            
+            # Add TP/SL management commands
+            keyboard.append([
+                KeyboardButton("/showpartialtps"),
+                KeyboardButton("/showtrailingsl")
+            ])
+            
+            # Add enable/disable buttons
+            keyboard.append([
+                KeyboardButton("/enablepartialtps"),
+                KeyboardButton("/enabletrailingsl"),
+                KeyboardButton("/enablelowerentries")
+            ])
+            
+            keyboard.append([
+                KeyboardButton("/disablepartialtps"),
+                KeyboardButton("/disabletrailingsl"),
+                KeyboardButton("/disablelowerentries")
+            ])
+            
+            # Create reply markup
+            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+            
+            # Send menu message
+            await update.message.reply_text(
+                "Trade-a-saurus Rex Menu:",
+                reply_markup=reply_markup
+            )
+            
+        except Exception as e:
+            logger.error(f"Error showing menu: {e}")
+            await update.message.reply_text("Error showing menu")
 
     async def show_thresholds(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show detailed threshold information"""
@@ -782,22 +792,29 @@ Menu:
             await update.message.reply_text(f"❌ Error getting thresholds: {str(e)}")
 
     async def add_trade_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Start the manual trade addition process"""
-        if not self._is_authorized(update.effective_user.id):
-            await update.message.reply_text("⛔ Unauthorized access")
-            return ConversationHandler.END
-            
-        self.temp_trade_data[update.effective_user.id] = {}
-        
-        pairs = self.config['trading']['pairs']
-        keyboard = [[KeyboardButton(pair)] for pair in pairs]
-        markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True)
-        
-        await update.message.reply_text(
-            "What trading pair did you trade?",
-            reply_markup=markup
-        )
-        return SYMBOL
+        """Handle add trade command - initialize the workflow"""
+        try:
+            if not await self.is_user_authorized(update):
+                return
+
+            # Initialize order data
+            user_id = update.effective_user.id
+            self.order_data[user_id] = {"step": "order_type"}
+
+            # Create order type selection keyboard
+            keyboard = [
+                [KeyboardButton("Spot"), KeyboardButton("Futures")],
+                [KeyboardButton("Cancel")]
+            ]
+            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+
+            await update.message.reply_text(
+                "Select order type:",
+                reply_markup=reply_markup
+            )
+        except Exception as e:
+            logger.error(f"Error starting trade workflow: {e}")
+            await update.message.reply_text("Error starting trade workflow. Try again.")
 
     async def add_trade_order_type(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle order type input (SPOT/FUTURES)"""
@@ -2257,43 +2274,105 @@ To change this setting:
             except Exception as e:
                 logger.error(f"Failed to send TP notification to {user_id}: {e}")
 
-    async def send_sl_notification(self, order: Order):
-        """Send notification when Stop Loss level is triggered"""
-        if not order.stop_loss or not order.stop_loss.triggered_at:
-            return
+    async def send_sl_notification(self, order, sl, trailing=False):
+        """Send notification when stop loss is triggered"""
+        try:
+            if not self.chat_id:
+                logger.error("No chat ID available for notifications")
+                return
             
-        # Get base currency from config
-        base_currency = self.config['trading'].get('base_currency', 'USDT')
-        
-        # Extract base asset (remove base currency suffix)
-        base_asset = order.symbol.replace(base_currency, '')
-        
-        # Calculate loss
-        entry_price = float(order.price)
-        sl_price = float(order.stop_loss.price)
-        quantity = float(order.quantity)
-        loss_amount = (sl_price - entry_price) * quantity
-        loss_percentage = -order.stop_loss.percentage  # Make negative for display purposes
-        
-        message = (
-            f"⛔ Stop Loss Triggered!\n\n"
-            f"Symbol: {order.symbol}\n"
-            f"Entry Price: ${entry_price:.2f}\n"
-            f"SL Price: ${sl_price:.2f}\n"
-            f"Quantity: {quantity:.8f} {base_asset}\n"
-            f"Loss: ${loss_amount:.2f} ({loss_percentage:.2f}%)\n"
-            f"Triggered at: {order.stop_loss.triggered_at.strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-        
-        for user_id in self.allowed_users:
-            try:
-                await self.application.bot.send_message(
-                    chat_id=user_id,
-                    text=message,
-                    reply_markup=self.markup
+            # Get current price
+            current_price = await self.binance_client.get_current_price(order.symbol)
+            
+            # Calculate profit/loss
+            entry_price = float(order.entry_price) if order.entry_price else 0
+            stop_price = float(sl.price) if hasattr(sl, 'price') else float(sl.current_stop_price)
+            
+            is_long = order.direction == TradeDirection.LONG or order.direction is None
+            profit_percentage = ((stop_price / entry_price) - 1) * 100 if is_long else ((entry_price / stop_price) - 1) * 100
+            
+            # Get position size
+            position_size = float(order.position_size) if order.position_size else 0
+            quote_size = position_size * entry_price
+            profit_amount = (position_size * stop_price) - quote_size if is_long else quote_size - (position_size * stop_price)
+            
+            # Create message
+            sl_type = "Trailing Stop Loss" if trailing else "Stop Loss"
+            emoji = "⛔" if profit_percentage < 0 else "🔴"
+            message = (
+                f"{emoji} <b>{sl_type} TRIGGERED</b> {emoji}\n\n"
+                f"<b>Symbol:</b> {order.symbol}\n"
+                f"<b>Direction:</b> {'LONG' if is_long else 'SHORT'}\n"
+                f"<b>Entry Price:</b> ${entry_price:.4f}\n"
+                f"<b>Stop Price:</b> ${stop_price:.4f}\n"
+                f"<b>Current Price:</b> ${current_price:.4f}\n"
+                f"<b>P/L:</b> {profit_percentage:.2f}% ({profit_amount:.4f} USD)\n"
+            )
+            
+            # Add trailing stop loss specific info
+            if trailing and hasattr(sl, 'activation_percentage') and hasattr(sl, 'callback_rate'):
+                message += (
+                    f"<b>Trailing Settings:</b>\n"
+                    f"• Activation: {sl.activation_percentage}%\n"
+                    f"• Callback: {sl.callback_rate}%\n"
                 )
-            except Exception as e:
-                logger.error(f"Failed to send SL notification to {user_id}: {e}")
+            
+            # Send message
+            await self.bot.send_message(
+                chat_id=self.chat_id,
+                text=message,
+                parse_mode=ParseMode.HTML
+            )
+            
+        except Exception as e:
+            logger.error(f"Error sending SL notification: {e}")
+    
+    async def send_trailing_sl_update_notification(self, order, trailing_sl):
+        """Send notification when trailing stop loss is updated"""
+        try:
+            if not self.chat_id:
+                logger.error("No chat ID available for notifications")
+                return
+            
+            # Get current price
+            current_price = await self.binance_client.get_current_price(order.symbol)
+            
+            # Get trailing stop loss info
+            stop_price = float(trailing_sl.current_stop_price)
+            highest_price = float(trailing_sl.highest_price)
+            entry_price = float(order.entry_price) if order.entry_price else 0
+            
+            is_long = order.direction == TradeDirection.LONG or order.direction is None
+            
+            # Calculate current lock-in profit/loss
+            profit_percentage = ((stop_price / entry_price) - 1) * 100 if is_long else ((entry_price / stop_price) - 1) * 100
+            position_size = float(order.position_size) if order.position_size else 0
+            quote_size = position_size * entry_price
+            profit_amount = (position_size * stop_price) - quote_size if is_long else quote_size - (position_size * stop_price)
+            
+            # Create message
+            emoji = "🔒"
+            message = (
+                f"{emoji} <b>Trailing Stop Updated</b> {emoji}\n\n"
+                f"<b>Symbol:</b> {order.symbol}\n"
+                f"<b>Direction:</b> {'LONG' if is_long else 'SHORT'}\n"
+                f"<b>Entry Price:</b> ${entry_price:.4f}\n"
+                f"<b>New Stop Price:</b> ${stop_price:.4f}\n"
+                f"<b>{'Highest' if is_long else 'Lowest'} Price:</b> ${highest_price:.4f}\n"
+                f"<b>Current Price:</b> ${current_price:.4f}\n"
+                f"<b>Locked P/L:</b> {profit_percentage:.2f}% ({profit_amount:.4f} USD)\n"
+                f"<b>Callback Rate:</b> {trailing_sl.callback_rate}%\n"
+            )
+            
+            # Send message
+            await self.bot.send_message(
+                chat_id=self.chat_id,
+                text=message,
+                parse_mode=ParseMode.HTML
+            )
+            
+        except Exception as e:
+            logger.error(f"Error sending trailing SL update notification: {e}")
 
     async def send_api_rate_limit_alert(self, service_name: str, feature: str):
         """Send alert when an external API rate limit is reached"""
@@ -2977,3 +3056,538 @@ To change this setting:
             logging.error(f"Error clearing thresholds for {symbol}: {e}")
             return False
 
+    async def send_partial_tp_notification(self, order: Order, partial_tp: PartialTakeProfit):
+        """Send notification when a partial take profit level is triggered"""
+        if not self.chat_id:
+            logger.warning("Cannot send partial TP notification: No chat ID available")
+            return
+            
+        try:
+            emoji = "🎯"
+            current_price = await self.binance_client.get_current_price(order.symbol)
+            
+            # Calculate profit details
+            entry_price = float(order.price)
+            tp_price = float(partial_tp.price)
+            position_percentage = partial_tp.position_percentage
+            profit_percentage = partial_tp.profit_percentage
+            
+            # Calculate the amount being sold at this level
+            original_quantity = float(order.quantity)
+            sell_quantity = original_quantity * (position_percentage / 100)
+            
+            # Calculate profit in currency
+            profit_per_unit = tp_price - entry_price
+            total_profit = profit_per_unit * sell_quantity
+            
+            message = (
+                f"{emoji} *Partial Take Profit Triggered - Level {partial_tp.level}* {emoji}\n\n"
+                f"Symbol: `{order.symbol}`\n"
+                f"Entry Price: `${entry_price:.4f}`\n"
+                f"TP Price: `${tp_price:.4f}` (+{profit_percentage:.2f}%)\n"
+                f"Current Price: `${current_price:.4f}`\n\n"
+                f"Position: {position_percentage:.0f}% of holdings "
+                f"({sell_quantity:.6f} {order.symbol.replace(self.binance_client.base_currency, '')})\n"
+                f"Profit: `${total_profit:.2f}` (+{profit_percentage:.2f}%)\n\n"
+                f"🦖 *RAWR!* Successfully locked in partial profits!"
+            )
+            
+            await self.send_message(self.chat_id, message, parse_mode="Markdown")
+            
+        except Exception as e:
+            logger.error(f"Error sending partial TP notification: {e}", exc_info=True)
+            
+    async def show_partial_tp(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show current partial take profit settings"""
+        if not self._is_authorized(update.effective_user.id):
+            await update.message.reply_text("⛔ Unauthorized access")
+            return
+            
+        try:
+            # Get current partial TP configuration
+            partial_tp_config = self.config['trading']['partial_take_profits']
+            enabled = partial_tp_config.get('enabled', False)
+            
+            # Get the levels
+            levels = []
+            if 'levels' in partial_tp_config:
+                for level_num, level in enumerate(partial_tp_config['levels'], 1):
+                    levels.append({
+                        'level': level_num,
+                        'position_percentage': level.get('position_percentage', 0),
+                        'profit_percentage': level.get('profit_percentage', 0)
+                    })
+            
+            # Create status message
+            message = f"🎯 *Partial Take Profit Settings*\n\n"
+            message += f"Status: {'✅ Enabled' if enabled else '❌ Disabled'}\n\n"
+            
+            if levels:
+                message += "*Configured Levels:*\n"
+                for level in levels:
+                    message += f"- Level {level['level']}: {level['position_percentage']}% of position at +{level['profit_percentage']}% profit\n"
+            else:
+                message += "*No levels configured*\n"
+                
+            # Add command examples
+            message += "\n*Available Commands:*\n"
+            message += "`/partial_tp_enable` - Enable partial take profits\n"
+            message += "`/partial_tp_disable` - Disable partial take profits\n"
+            message += "`/set_partial_tp <level> <position_percentage> <profit_percentage>` - Set a partial TP level\n"
+            message += "Example: `/set_partial_tp 1 25 1.5` sets level 1 to sell 25% of position at +1.5% profit"
+            
+            await update.message.reply_text(message, parse_mode="Markdown")
+            
+        except Exception as e:
+            logger.error(f"Error showing partial TP settings: {e}", exc_info=True)
+            await update.message.reply_text(f"❌ Error: {str(e)}")
+            
+    async def partial_tp_enable(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Enable partial take profits"""
+        if not self._is_authorized(update.effective_user.id):
+            await update.message.reply_text("⛔ Unauthorized access")
+            return
+            
+        try:
+            # Update the config
+            self.config['trading']['partial_take_profits']['enabled'] = True
+            
+            # Save to database
+            await self.mongo_client.update_trading_setting('partial_take_profits.enabled', True)
+            
+            # Get the number of configured levels
+            levels = self.config['trading']['partial_take_profits'].get('levels', [])
+            
+            # Send confirmation
+            await update.message.reply_text(
+                f"✅ Partial take profits have been enabled.\n"
+                f"Currently {len(levels)} levels are configured.\n"
+                f"Use `/show_partial_tp` to see current settings."
+            )
+            
+        except Exception as e:
+            logger.error(f"Error enabling partial take profits: {e}", exc_info=True)
+            await update.message.reply_text(f"❌ Error: {str(e)}")
+            
+    async def partial_tp_disable(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Disable partial take profits"""
+        if not self._is_authorized(update.effective_user.id):
+            await update.message.reply_text("⛔ Unauthorized access")
+            return
+            
+        try:
+            # Update the config
+            self.config['trading']['partial_take_profits']['enabled'] = False
+            
+            # Save to database
+            await self.mongo_client.update_trading_setting('partial_take_profits.enabled', False)
+            
+            # Send confirmation
+            await update.message.reply_text(
+                f"❌ Partial take profits have been disabled.\n"
+                f"Configured levels are preserved but will not be triggered.\n"
+                f"Use `/partial_tp_enable` to re-enable."
+            )
+            
+        except Exception as e:
+            logger.error(f"Error disabling partial take profits: {e}", exc_info=True)
+            await update.message.reply_text(f"❌ Error: {str(e)}")
+            
+    async def set_partial_tp(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Set a partial take profit level"""
+        if not self._is_authorized(update.effective_user.id):
+            await update.message.reply_text("⛔ Unauthorized access")
+            return
+            
+        try:
+            # Get message parts, expecting format: /set_partial_tp <level> <position_percentage> <profit_percentage>
+            message_parts = update.message.text.split()
+            
+            # Check that we have enough parts
+            if len(message_parts) != 4:
+                await update.message.reply_text(
+                    "Please provide level, position percentage, and profit percentage.\n"
+                    "Example: `/set_partial_tp 1 25 1.5` to sell 25% of position at +1.5% profit."
+                )
+                return
+                
+            # Parse parameters
+            try:
+                level = int(message_parts[1])
+                position_percentage = float(message_parts[2])
+                profit_percentage = float(message_parts[3])
+            except ValueError:
+                await update.message.reply_text(
+                    "Invalid parameters. Please provide numeric values for level, position percentage, and profit percentage."
+                )
+                return
+                
+            # Validate parameters
+            if level < 1 or level > 10:
+                await update.message.reply_text("Level must be between 1 and 10.")
+                return
+                
+            if position_percentage <= 0 or position_percentage > 100:
+                await update.message.reply_text("Position percentage must be between 0 and 100.")
+                return
+                
+            if profit_percentage <= 0:
+                await update.message.reply_text("Profit percentage must be greater than 0.")
+                return
+                
+            # Get current levels
+            if 'levels' not in self.config['trading']['partial_take_profits']:
+                self.config['trading']['partial_take_profits']['levels'] = []
+                
+            levels = self.config['trading']['partial_take_profits']['levels']
+            
+            # Check for level index
+            level_index = level - 1  # Convert to 0-based index
+            
+            # Update or add the level
+            level_data = {
+                'position_percentage': position_percentage,
+                'profit_percentage': profit_percentage
+            }
+            
+            if level_index < len(levels):
+                # Update existing level
+                levels[level_index] = level_data
+            else:
+                # Add new level, fill gaps with empty levels if needed
+                while len(levels) < level_index:
+                    levels.append({'position_percentage': 0, 'profit_percentage': 0})
+                levels.append(level_data)
+                
+            # Update config
+            self.config['trading']['partial_take_profits']['levels'] = levels
+            
+            # Save to database
+            await self.mongo_client.update_trading_setting('partial_take_profits.levels', levels)
+            
+            # Check total position percentage
+            total_percentage = sum(level.get('position_percentage', 0) for level in levels)
+            warning = ""
+            if total_percentage > 100:
+                warning = "\n⚠️ Warning: Total position percentage exceeds 100%!"
+            
+            # Send confirmation
+            await update.message.reply_text(
+                f"✅ Partial take profit level {level} has been set:\n"
+                f"- Sell {position_percentage}% of position at +{profit_percentage}% profit.{warning}\n\n"
+                f"Use `/show_partial_tp` to see all settings."
+            )
+            
+        except Exception as e:
+            logger.error(f"Error setting partial take profit level: {e}", exc_info=True)
+            await update.message.reply_text(f"❌ Error: {str(e)}")
+
+    async def show_trailing_sl(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Display trailing stop loss settings"""
+        try:
+            # Check if user is authorized
+            if not await self.is_user_authorized(update):
+                return
+                
+            # Get trailing stop loss config
+            trading_config = self.config.get('trading', {})
+            trailing_sl_config = trading_config.get('trailing_stop_loss', {})
+            
+            is_enabled = trailing_sl_config.get('enabled', False)
+            activation_percentage = trailing_sl_config.get('activation_percentage', 0)
+            callback_rate = trailing_sl_config.get('callback_rate', 0)
+            
+            status = "✅ ENABLED" if is_enabled else "❌ DISABLED"
+            
+            message = (
+                f"<b>Trailing Stop Loss Settings</b>\n\n"
+                f"<b>Status:</b> {status}\n"
+                f"<b>Activation:</b> {activation_percentage}%\n"
+                f"<b>Callback Rate:</b> {callback_rate}%\n\n"
+                f"<i>Commands:</i>\n"
+                f"/enabletrailingsl - Enable trailing stop loss\n"
+                f"/disabletrailingsl - Disable trailing stop loss\n"
+                f"/settrailingsl [activation] [callback] - Set trailing stop loss parameters\n"
+                f"  Example: /settrailingsl 3 1.5 - Sets activation at 3% profit and callback at 1.5%"
+            )
+            
+            await update.message.reply_text(
+                text=message,
+                parse_mode=ParseMode.HTML,
+                reply_markup=self.markup
+            )
+            
+        except Exception as e:
+            logger.error(f"Error in show_trailing_sl: {e}")
+            await update.message.reply_text(
+                "Error fetching trailing stop loss settings. Please try again.",
+                reply_markup=self.markup
+            )
+            
+    async def trailing_sl_enable(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Enable trailing stop loss"""
+        try:
+            # Check if user is authorized
+            if not await self.is_user_authorized(update):
+                return
+                
+            # Get current settings
+            trading_config = self.config.get('trading', {})
+            trailing_sl_config = trading_config.get('trailing_stop_loss', {})
+            
+            # Check if already enabled
+            if trailing_sl_config.get('enabled', False):
+                await update.message.reply_text(
+                    "Trailing stop loss is already enabled.",
+                    reply_markup=self.markup
+                )
+                return
+                
+            # Enable trailing stop loss
+            trailing_sl_config['enabled'] = True
+            
+            # Update config
+            if 'trailing_stop_loss' not in trading_config:
+                trading_config['trailing_stop_loss'] = trailing_sl_config
+                
+            # Save to database
+            success = await self.mongo_client.update_trading_setting('trailing_stop_loss', trailing_sl_config)
+            
+            if success:
+                await update.message.reply_text(
+                    f"✅ Trailing stop loss enabled\n"
+                    f"Activation: {trailing_sl_config.get('activation_percentage', 0)}%\n"
+                    f"Callback Rate: {trailing_sl_config.get('callback_rate', 0)}%",
+                    reply_markup=self.markup
+                )
+            else:
+                await update.message.reply_text(
+                    "Failed to enable trailing stop loss. Database update error.",
+                    reply_markup=self.markup
+                )
+                
+        except Exception as e:
+            logger.error(f"Error enabling trailing stop loss: {e}")
+            await update.message.reply_text(
+                "Error enabling trailing stop loss. Please try again.",
+                reply_markup=self.markup
+            )
+            
+    async def trailing_sl_disable(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Disable trailing stop loss"""
+        try:
+            # Check if user is authorized
+            if not await self.is_user_authorized(update):
+                return
+                
+            # Get current settings
+            trading_config = self.config.get('trading', {})
+            trailing_sl_config = trading_config.get('trailing_stop_loss', {})
+            
+            # Check if already disabled
+            if not trailing_sl_config.get('enabled', False):
+                await update.message.reply_text(
+                    "Trailing stop loss is already disabled.",
+                    reply_markup=self.markup
+                )
+                return
+                
+            # Disable trailing stop loss
+            trailing_sl_config['enabled'] = False
+            
+            # Update config
+            if 'trailing_stop_loss' not in trading_config:
+                trading_config['trailing_stop_loss'] = trailing_sl_config
+                
+            # Save to database
+            success = await self.mongo_client.update_trading_setting('trailing_stop_loss', trailing_sl_config)
+            
+            if success:
+                await update.message.reply_text(
+                    "❌ Trailing stop loss disabled",
+                    reply_markup=self.markup
+                )
+            else:
+                await update.message.reply_text(
+                    "Failed to disable trailing stop loss. Database update error.",
+                    reply_markup=self.markup
+                )
+                
+        except Exception as e:
+            logger.error(f"Error disabling trailing stop loss: {e}")
+            await update.message.reply_text(
+                "Error disabling trailing stop loss. Please try again.",
+                reply_markup=self.markup
+            )
+            
+    async def set_trailing_sl(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Set trailing stop loss parameters: activation percentage and callback rate"""
+        try:
+            # Check if user is authorized
+            if not await self.is_user_authorized(update):
+                return
+                
+            # Get arguments
+            args = context.args
+            if len(args) < 2:
+                await update.message.reply_text(
+                    "Please provide both activation percentage and callback rate.\n"
+                    "Example: /settrailingsl 3 1.5",
+                    reply_markup=self.markup
+                )
+                return
+                
+            try:
+                activation_percentage = float(args[0])
+                callback_rate = float(args[1])
+                
+                # Validate values
+                if activation_percentage <= 0:
+                    await update.message.reply_text(
+                        "Activation percentage must be greater than 0.",
+                        reply_markup=self.markup
+                    )
+                    return
+                    
+                if callback_rate <= 0:
+                    await update.message.reply_text(
+                        "Callback rate must be greater than 0.",
+                        reply_markup=self.markup
+                    )
+                    return
+                    
+            except ValueError:
+                await update.message.reply_text(
+                    "Invalid values. Please provide valid numbers for activation percentage and callback rate.",
+                    reply_markup=self.markup
+                )
+                return
+                
+            # Get current settings
+            trading_config = self.config.get('trading', {})
+            if 'trailing_stop_loss' not in trading_config:
+                trading_config['trailing_stop_loss'] = {
+                    'enabled': False,
+                    'activation_percentage': 0,
+                    'callback_rate': 0
+                }
+                
+            # Update settings
+            trailing_sl_config = trading_config['trailing_stop_loss']
+            trailing_sl_config['activation_percentage'] = activation_percentage
+            trailing_sl_config['callback_rate'] = callback_rate
+            
+            # Save to database
+            success = await self.mongo_client.update_trading_setting('trailing_stop_loss', trailing_sl_config)
+            
+            if success:
+                status = "✅ ENABLED" if trailing_sl_config.get('enabled', False) else "❌ DISABLED"
+                await update.message.reply_text(
+                    f"Trailing stop loss settings updated:\n"
+                    f"Status: {status}\n"
+                    f"Activation: {activation_percentage}%\n"
+                    f"Callback Rate: {callback_rate}%",
+                    reply_markup=self.markup
+                )
+            else:
+                await update.message.reply_text(
+                    "Failed to update trailing stop loss settings. Database update error.",
+                    reply_markup=self.markup
+                )
+                
+        except Exception as e:
+            logger.error(f"Error setting trailing stop loss parameters: {e}")
+            await update.message.reply_text(
+                "Error setting trailing stop loss parameters. Please try again.",
+                reply_markup=self.markup
+            )
+
+    async def register_commands(self):
+        """Register command handlers"""
+        self.application.add_handler(CommandHandler("start", self.start_command))
+        self.application.add_handler(CommandHandler("menu", self.show_menu))
+        self.application.add_handler(CommandHandler("help", self.help_command))
+        self.application.add_handler(CommandHandler("status", self.status_command))
+        self.application.add_handler(CommandHandler("balance", self.balance_command))
+        self.application.add_handler(CommandHandler("orders", self.orders_command))
+        self.application.add_handler(CommandHandler("symbols", self.symbols_command))
+
+    async def is_user_authorized(self, update: Update) -> bool:
+        """Check if user is authorized to use the bot"""
+        user_id = update.effective_user.id
+        if not self._is_authorized(user_id):
+            await update.message.reply_text("You're not authorized to use this bot.")
+            return False
+        return True
+
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Send help message"""
+        try:
+            if not await self.is_user_authorized(update):
+                return
+                
+            help_text = """
+<b>Trade-a-saurus Rex Bot Help</b>
+
+<b>🔍 Information Commands:</b>
+/menu - Show main menu
+/help - Show this help message
+/status - Check bot status
+/balance - Check account balance
+/orders - List active orders
+/symbols - List configured symbols
+/price [symbol] - Get current price for symbol
+
+<b>📊 Trading Commands:</b>
+/buy [symbol] [amount] - Create buy order
+/sell [symbol] [amount] - Create sell order
+/buylimit [symbol] [price] [amount] - Place limit buy order
+/selllimit [symbol] [price] [amount] - Place limit sell order
+/marketbuy [symbol] [amount] - Place market buy order
+/marketsell [symbol] [amount] - Place market sell order
+/cancel [orderid] - Cancel order
+
+<b>⚙️ Configuration Commands:</b>
+/pausebot - Pause trading
+/resumebot - Resume trading
+/setdefault [symbol] [amount] - Set default order amount
+/settakeproft [percentage] - Set default take profit %
+/setstoploss [percentage] - Set default stop loss %
+/setleverage [value] - Set futures leverage
+/setmargin [type] - Set margin type (ISOLATED/CROSS)
+/setmode [mode] - Set trading mode (spot/futures)
+/setheartbeat [minutes] - Set heartbeat interval
+/enabletrading - Enable trading
+/disabletrading - Disable trading
+/enableaddorders - Enable adding new orders
+/disableaddorders - Disable adding new orders
+
+<b>📉 Lower Entries Protection:</b>
+/enablelowerentries - Enable only lower entries protection
+/disablelowerentries - Disable only lower entries protection
+/setlowerentries [on/off] - Set lower entries protection
+
+<b>📈 Partial Take Profit Commands:</b>
+/showpartialtps - Show partial TP settings
+/enablepartialtps - Enable partial take profits
+/disablepartialtps - Disable partial take profits
+/setpartialtps [level] [percentage] [position%] - Set partial TP level
+  Example: /setpartialtps 1 2.5 25 - Level 1, +2.5% from entry, 25% of position
+
+<b>🛑 Trailing Stop Loss Commands:</b>
+/showtrailingsl - Show trailing SL settings
+/enabletrailingsl - Enable trailing stop loss
+/disabletrailingsl - Disable trailing stop loss
+/settrailingsl [activation] [callback] - Set trailing SL parameters
+  Example: /settrailingsl 3 1.5 - Activate at +3% profit, 1.5% callback
+"""
+            
+            await update.message.reply_text(
+                text=help_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=self.markup
+            )
+            
+        except Exception as e:
+            logger.error(f"Error sending help: {e}")
+            await update.message.reply_text("Error sending help message")

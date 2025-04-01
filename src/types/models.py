@@ -1,8 +1,8 @@
 from enum import Enum
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
-from typing import Optional
+from typing import Optional, List, Dict
 
 class TimeFrame(Enum):
     DAILY = "daily"
@@ -29,6 +29,16 @@ class TPSLStatus(Enum):
     EXPIRED = "expired"
 
 @dataclass
+class PartialTakeProfit:
+    level: int  # 1, 2, or 3
+    price: Decimal
+    profit_percentage: float  # The profit percentage target for this level
+    position_percentage: float  # The percentage of the position to sell at this level
+    status: TPSLStatus = TPSLStatus.PENDING
+    triggered_at: Optional[datetime] = None
+    order_id: Optional[str] = None
+
+@dataclass
 class TakeProfit:
     price: Decimal
     percentage: float
@@ -43,6 +53,19 @@ class StopLoss:
     status: TPSLStatus = TPSLStatus.PENDING
     triggered_at: Optional[datetime] = None
     order_id: Optional[str] = None
+
+@dataclass
+class TrailingStopLoss:
+    activation_percentage: float  # Profit % to activate trailing
+    callback_rate: float  # How much to trail behind peak price (%)
+    initial_price: Decimal  # Entry price for the order
+    activation_price: Decimal  # Price at which trailing becomes active
+    current_stop_price: Decimal  # Current stop loss price (updates as price rises)
+    highest_price: Decimal  # Tracks the highest price seen once activated
+    status: TPSLStatus = TPSLStatus.PENDING
+    triggered_at: Optional[datetime] = None
+    order_id: Optional[str] = None
+    activated_at: Optional[datetime] = None  # When trailing became active
 
 @dataclass
 class Order:
@@ -65,3 +88,5 @@ class Order:
     is_manual: bool = False
     take_profit: Optional[TakeProfit] = None
     stop_loss: Optional[StopLoss] = None
+    partial_take_profits: List[PartialTakeProfit] = field(default_factory=list)  # List to store partial take profits
+    trailing_stop_loss: Optional[TrailingStopLoss] = None  # Trailing stop loss

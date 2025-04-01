@@ -82,6 +82,72 @@ def load_config_from_env() -> dict:
         logger.error(f"[CONFIG] Error accessing TP/SL settings: {e}")
         take_profit_setting = '5%'
         stop_loss_setting = '3%'
+    
+    # Parse partial take profit settings
+    partial_tp_enabled = os.getenv('TRADING_PARTIAL_TP_ENABLED', 'false').lower() == 'true'
+    partial_tp_levels = []
+    
+    try:
+        # Load the partial take profit levels if enabled
+        if partial_tp_enabled:
+            logger.info("[CONFIG] Partial take profits are enabled, loading levels...")
+            
+            # Process each level (up to 3)
+            for level in range(1, 4):
+                level_env = os.getenv(f'TRADING_PARTIAL_TP_LEVEL{level}')
+                if not level_env:
+                    continue
+                
+                # Parse the profit percentage and position percentage
+                parts = level_env.split(',')
+                if len(parts) != 2:
+                    logger.warning(f"[CONFIG] Invalid format for TRADING_PARTIAL_TP_LEVEL{level}: {level_env}")
+                    continue
+                
+                try:
+                    profit_percentage = float(parts[0])
+                    position_percentage = float(parts[1])
+                    
+                    partial_tp_levels.append({
+                        "level": level,
+                        "profit_percentage": profit_percentage,
+                        "position_percentage": position_percentage
+                    })
+                    
+                    logger.info(f"[CONFIG] Loaded partial TP level {level}: {profit_percentage}% profit, {position_percentage}% of position")
+                    
+                except ValueError as e:
+                    logger.warning(f"[CONFIG] Error parsing TRADING_PARTIAL_TP_LEVEL{level}: {e}")
+        else:
+            logger.info("[CONFIG] Partial take profits are disabled")
+    except Exception as e:
+        logger.error(f"[CONFIG] Error loading partial take profit settings: {e}")
+        partial_tp_enabled = False
+        partial_tp_levels = []
+
+    # Parse trailing stop loss settings
+    try:
+        trailing_sl_enabled = os.getenv('TRADING_TRAILING_SL_ENABLED', 'false').lower() == 'true'
+        
+        # Get activation percentage and callback rate
+        trailing_sl_activation = 0.0
+        trailing_sl_callback = 0.0
+        
+        if trailing_sl_enabled:
+            try:
+                trailing_sl_activation = float(os.getenv('TRADING_TRAILING_SL_ACTIVATION', '1.0'))
+                trailing_sl_callback = float(os.getenv('TRADING_TRAILING_SL_CALLBACK', '0.5'))
+                logger.info(f"[CONFIG] Trailing stop loss enabled with activation: {trailing_sl_activation}%, callback: {trailing_sl_callback}%")
+            except ValueError as e:
+                logger.warning(f"[CONFIG] Error parsing trailing stop loss parameters: {e}")
+                trailing_sl_enabled = False
+        else:
+            logger.info("[CONFIG] Trailing stop loss is disabled")
+    except Exception as e:
+        logger.error(f"[CONFIG] Error loading trailing stop loss settings: {e}")
+        trailing_sl_enabled = False
+        trailing_sl_activation = 0.0
+        trailing_sl_callback = 0.0
 
     # Add MongoDB driver configuration with proper validation
     mongodb_driver = os.getenv('MONGODB_DRIVER', 'motor').lower()
@@ -126,6 +192,15 @@ def load_config_from_env() -> dict:
             'take_profit': take_profit_setting,
             'stop_loss': stop_loss_setting,
             'only_lower_entries': os.getenv('TRADING_ONLY_LOWER_ENTRIES', 'true').lower() == 'true',
+            'partial_take_profits': {
+                'enabled': partial_tp_enabled,
+                'levels': partial_tp_levels
+            },
+            'trailing_stop_loss': {
+                'enabled': trailing_sl_enabled,
+                'activation_percentage': trailing_sl_activation,
+                'callback_rate': trailing_sl_callback
+            },
             'thresholds': {
                 'daily': [float(x) for x in os.getenv('TRADING_THRESHOLDS_DAILY', '1,2,5').split(',') if x],
                 'weekly': [float(x) for x in os.getenv('TRADING_THRESHOLDS_WEEKLY', '5,10,15').split(',') if x],
