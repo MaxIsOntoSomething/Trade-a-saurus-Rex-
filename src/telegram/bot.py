@@ -3327,17 +3327,69 @@ To change this setting:
             return
             
         try:
+            # Send initial status message
+            status_message = await update.message.reply_text(
+                "⏳ Disabling partial take profits and restoring standard take profit settings..."
+            )
+            
             # Update the config
             self.config['trading']['partial_take_profits']['enabled'] = False
             
             # Save to database
             await self.mongo_client.update_trading_setting('partial_take_profits.enabled', False)
             
+            # Get active orders to adjust their TP settings
+            active_orders = await self.mongo_client.get_active_orders()
+            orders_adjusted = 0
+            
+            if active_orders:
+                await status_message.edit_text(
+                    f"⏳ Disabling partial take profits and adjusting {len(active_orders)} active orders..."
+                )
+                
+                # Process each active order to restore standard TP
+                for order in active_orders:
+                    if order.partial_take_profits:
+                        try:
+                            # Check if order has a standard take profit already
+                            if not order.take_profit:
+                                # Create a new take profit using the default percentage
+                                tp_price = Decimal(order.price) * (1 + self.binance_client.default_tp_percentage / 100)
+                                take_profit = TakeProfit(
+                                    price=tp_price,
+                                    percentage=self.binance_client.default_tp_percentage,
+                                    status=TPSLStatus.PENDING
+                                )
+                                order.take_profit = take_profit
+                            
+                            # Update partial take profits status to canceled
+                            for ptp in order.partial_take_profits:
+                                if ptp.status == TPSLStatus.PENDING:
+                                    ptp.status = TPSLStatus.CANCELLED
+                            
+                            # Update order in database
+                            await self.mongo_client.insert_order(order)
+                            
+                            # Cancel partial TP orders on the exchange
+                            for ptp in order.partial_take_profits:
+                                if ptp.order_id:
+                                    await self.binance_client.cancel_order(order.symbol, ptp.order_id)
+                            
+                            orders_adjusted += 1
+                            
+                        except Exception as e:
+                            logging.error(f"Error adjusting order {order.order_id}: {e}")
+            
+            # Update status message
+            await status_message.edit_text(
+                f"✅ Partial take profits disabled. Adjusted {orders_adjusted} orders."
+            )
+            
             # Send confirmation
             await update.message.reply_text(
                 f"❌ Partial take profits have been disabled.\n"
-                f"Configured levels are preserved but will not be triggered.\n"
-                f"Use `/partial_tp_enable` to re-enable."
+                f"{orders_adjusted} active orders were adjusted to use standard take profit.\n"
+                f"Use `/set_partial_tp` to configure and enable partial take profits again."
             )
             
         except Exception as e:
@@ -3386,17 +3438,30 @@ To change this setting:
                 await update.message.reply_text("Profit percentage must be greater than 0.")
                 return
                 
+            # First message - send processing status
+            status_message = await update.message.reply_text(
+                f"⏳ Processing Partial Take Profit Level {level}..."
+            )
+                
             # Get current levels
             if 'levels' not in self.config['trading']['partial_take_profits']:
                 self.config['trading']['partial_take_profits']['levels'] = []
                 
             levels = self.config['trading']['partial_take_profits']['levels']
             
+            # Second message - confirmation of parameters
+            await update.message.reply_text(
+                f"Setting Partial TP Level {level}:\n"
+                f"• Position: {position_percentage}% of total position\n"
+                f"• Profit target: +{profit_percentage}%"
+            )
+            
             # Check for level index
             level_index = level - 1  # Convert to 0-based index
             
             # Update or add the level
             level_data = {
+                'level': level,
                 'position_percentage': position_percentage,
                 'profit_percentage': profit_percentage
             }
@@ -3407,14 +3472,19 @@ To change this setting:
             else:
                 # Add new level, fill gaps with empty levels if needed
                 while len(levels) < level_index:
-                    levels.append({'position_percentage': 0, 'profit_percentage': 0})
+                    levels.append({'level': len(levels)+1, 'position_percentage': 0, 'profit_percentage': 0})
                 levels.append(level_data)
                 
-            # Update config
+            # Check if this is enabling partial TP for the first time
+            was_enabled = self.config['trading']['partial_take_profits'].get('enabled', False)
+            
+            # Update config and make sure partial TP is enabled
             self.config['trading']['partial_take_profits']['levels'] = levels
+            self.config['trading']['partial_take_profits']['enabled'] = True
             
             # Save to database
             await self.mongo_client.update_trading_setting('partial_take_profits.levels', levels)
+            await self.mongo_client.update_trading_setting('partial_take_profits.enabled', True)
             
             # Check total position percentage
             total_percentage = sum(level.get('position_percentage', 0) for level in levels)
@@ -3422,11 +3492,78 @@ To change this setting:
             if total_percentage > 100:
                 warning = "\n⚠️ Warning: Total position percentage exceeds 100%!"
             
+            # If this is enabling partial TP for the first time, adjust existing orders
+            orders_adjusted = 0
+            if not was_enabled:
+                # Get active orders
+                active_orders = await self.mongo_client.get_active_orders()
+                if active_orders:
+                    await status_message.edit_text(
+                        f"⏳ Setting up partial take profit level {level} and adjusting {len(active_orders)} active orders..."
+                    )
+                    
+                    # Process each active order to add partial TPs
+                    for order in active_orders:
+                        try:
+                            # Skip orders that already have partial take profits set up
+                            if order.partial_take_profits and any(ptp.status == TPSLStatus.PENDING for ptp in order.partial_take_profits):
+                                continue
+                                
+                            # Cancel any existing take profit order
+                            if order.take_profit and order.take_profit.order_id:
+                                await self.binance_client.cancel_order(order.symbol, order.take_profit.order_id)
+                                order.take_profit.status = TPSLStatus.CANCELLED
+                            
+                            # Set up partial take profits for this order
+                            partial_tps = []
+                            for i, level_config in enumerate(levels):
+                                if level_config.get('position_percentage', 0) > 0:
+                                    # Calculate price for this level
+                                    tp_price = Decimal(order.price) * (1 + level_config.get('profit_percentage', 0) / 100)
+                                    
+                                    # Create the partial take profit object
+                                    ptp = PartialTakeProfit(
+                                        level=i+1,
+                                        price=tp_price,
+                                        profit_percentage=level_config.get('profit_percentage', 0),
+                                        position_percentage=level_config.get('position_percentage', 0),
+                                        status=TPSLStatus.PENDING
+                                    )
+                                    partial_tps.append(ptp)
+                            
+                            # Set the partial take profits on the order
+                            order.partial_take_profits = partial_tps
+                            
+                            # Update order in database
+                            await self.mongo_client.insert_order(order)
+                            
+                            orders_adjusted += 1
+                            
+                        except Exception as e:
+                            logging.error(f"Error adjusting order {order.order_id}: {e}")
+            
+            # Wait a bit to simulate processing
+            await asyncio.sleep(0.5)
+            
+            # Update status message
+            await status_message.edit_text(
+                f"✅ Partial Take Profit Level {level} configured successfully!" +
+                (f" Adjusted {orders_adjusted} active orders." if orders_adjusted > 0 else "")
+            )
+            
+            # Final message - send confirmation with all settings
+            all_levels = "\n".join([
+                f"• Level {i+1}: Sell {l.get('position_percentage')}% at +{l.get('profit_percentage')}% profit"
+                for i, l in enumerate(levels) if l.get('position_percentage', 0) > 0
+            ])
+            
             # Send confirmation
             await update.message.reply_text(
-                f"✅ Partial take profit level {level} has been set:\n"
-                f"- Sell {position_percentage}% of position at +{profit_percentage}% profit.{warning}\n\n"
-                f"Use `/show_partial_tp` to see all settings."
+                f"🎯 Partial Take Profit Settings:\n\n"
+                f"{all_levels}\n"
+                f"Status: ✅ Enabled{warning}" +
+                (f"\n\n{orders_adjusted} active orders were adjusted to use partial take profits." if orders_adjusted > 0 else "") +
+                f"\n\nUse `/partial_tp_disable` to disable partial take profits while preserving your settings."
             )
             
         except Exception as e:
@@ -3827,9 +3964,20 @@ To change this setting:
             
             # Get feature statuses
             trading_config = self.config.get('trading', {})
-            partial_tp_enabled = trading_config.get('partial_take_profit', {}).get('enabled', False)
+            partial_tp_config = trading_config.get('partial_take_profit', {})
+            partial_tp_enabled = partial_tp_config.get('enabled', False)
             trailing_sl_enabled = trading_config.get('trailing_stop_loss', {}).get('enabled', False)
             lower_entries_enabled = trading_config.get('only_lower_entries', False)
+            
+            # Create partial TP details if enabled
+            partial_tp_details = ""
+            if partial_tp_enabled and 'levels' in partial_tp_config:
+                levels = partial_tp_config.get('levels', [])
+                if levels:
+                    partial_tp_details = "\n<b>Partial TP Levels:</b>"
+                    for i, level in enumerate(levels, 1):
+                        if i <= len(levels) and 'profit_percentage' in level and 'position_percentage' in level:
+                            partial_tp_details += f"\n• Level {i}: {level['position_percentage']}% at +{level['profit_percentage']}% profit"
             
             # Create status message
             status_message = f"""
@@ -3841,7 +3989,7 @@ To change this setting:
 <b>Reserve Balance:</b> ${self.binance_client.reserve_balance:.2f}
 
 <b>Features:</b>
-• Partial TP: {"✅ Enabled" if partial_tp_enabled else "❌ Disabled"}
+• Partial TP: {"✅ Enabled" if partial_tp_enabled else "❌ Disabled"}{partial_tp_details}
 • Trailing SL: {"✅ Enabled" if trailing_sl_enabled else "❌ Disabled"}
 • Lower Entries Protection: {"✅ Enabled" if lower_entries_enabled else "❌ Disabled"}
 
@@ -3849,7 +3997,7 @@ To change this setting:
 • Take Profit: {self.binance_client.default_tp_percentage}%
 • Stop Loss: {self.binance_client.default_sl_percentage}%
 
-<b>API Connection:</b> {await self._check_api_status()}
+<b>API Connection:</b> {"✅ Connected" if self.binance_client and self.binance_client.client else "❌ Disconnected"}
 <b>Database Connection:</b> {await self._check_db_status()}
 """
             
@@ -3866,10 +4014,12 @@ To change this setting:
     async def _check_api_status(self) -> str:
         """Check Binance API connection status"""
         try:
-            result = await self.binance_client.check_connection()
-            return "✅ Connected" if result.get("success", False) else "❌ Disconnected"
+            if self.binance_client and self.binance_client.client:
+                await self.binance_client.client.ping()
+                return "✅ Connected"
+            return "❌ Disconnected"
         except Exception:
-            return "❌ Error"
+            return "❌ Disconnected"
             
     async def _check_db_status(self) -> str:
         """Check MongoDB connection status"""
