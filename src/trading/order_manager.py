@@ -4,7 +4,7 @@ import time  # Add this import
 import os
 import platform
 from datetime import datetime, timedelta
-from typing import Dict, List
+from typing import Dict, List, Optional, Union, Any
 from decimal import Decimal  # Add the missing Decimal import
 from ..types.models import Order, OrderStatus, TimeFrame, TPSLStatus, OrderType
 from ..trading.binance_client import BinanceClient
@@ -434,6 +434,7 @@ class OrderManager:
                 trailing_sl_updated = triggers.get('trailing_sl_updated', False)
                 
                 updates = {}
+                database_updated = False
                 
                 # Update order if take profit triggered
                 if tp_triggered and order.take_profit:
@@ -448,71 +449,71 @@ class OrderManager:
                         logger.error(f"Error sending TP notification: {e}")
                 
                 # Update order if stop loss triggered
-                if sl_triggered and (order.stop_loss or order.trailing_stop_loss):
-                    # Check which stop loss was triggered
-                    if order.stop_loss and order.stop_loss.status == TPSLStatus.TRIGGERED:
-                        updates['stop_loss.status'] = TPSLStatus.TRIGGERED
-                        updates['stop_loss.triggered_at'] = order.stop_loss.triggered_at
-                        
-                        # Send notification
-                        try:
-                            if self.telegram_bot:
-                                await self.telegram_bot.send_sl_notification(order, order.stop_loss)
-                        except Exception as e:
-                            logger.error(f"Error sending SL notification: {e}")
+                if sl_triggered and order.stop_loss:
+                    updates['stop_loss.status'] = TPSLStatus.TRIGGERED
+                    updates['stop_loss.triggered_at'] = order.stop_loss.triggered_at
                     
-                    if order.trailing_stop_loss and order.trailing_stop_loss.status == TPSLStatus.TRIGGERED:
-                        updates['trailing_stop_loss.status'] = TPSLStatus.TRIGGERED
-                        updates['trailing_stop_loss.triggered_at'] = order.trailing_stop_loss.triggered_at
-                        
-                        # Send notification
-                        try:
-                            if self.telegram_bot:
-                                await self.telegram_bot.send_sl_notification(order, order.trailing_stop_loss, trailing=True)
-                        except Exception as e:
-                            logger.error(f"Error sending trailing SL notification: {e}")
+                    # Send notification
+                    try:
+                        if self.telegram_bot:
+                            await self.telegram_bot.send_sl_notification(order, order.stop_loss)
+                    except Exception as e:
+                        logger.error(f"Error sending SL notification: {e}")
                 
-                # Update order if partial take profits triggered
-                for level in partial_tp_triggered:
-                    # Find the triggered partial TP
-                    for pt in order.partial_take_profits:
-                        if pt.level == level and pt.status == TPSLStatus.TRIGGERED:
-                            updates[f'partial_take_profits.{level-1}.status'] = TPSLStatus.TRIGGERED
-                            updates[f'partial_take_profits.{level-1}.triggered_at'] = pt.triggered_at
-                            
-                            # Send notification
-                            try:
-                                if self.telegram_bot:
-                                    await self.telegram_bot.send_partial_tp_notification(order, pt)
-                            except Exception as e:
-                                logger.error(f"Error sending partial TP notification: {e}")
+                # Apply updates to take profit or stop loss if needed
+                if updates:
+                    try:
+                        for field, value in updates.items():
+                            await self.mongo_client.update_order_field(order.order_id, field, value)
+                        database_updated = True
+                    except Exception as e:
+                        logger.error(f"Error updating order {order.order_id} fields: {e}")
+                
+                # Handle partial take profits triggered
+                if partial_tp_triggered:
+                    # Update the partial take profits objects in memory
+                    for level in partial_tp_triggered:
+                        for pt in order.partial_take_profits:
+                            if pt.level == level and pt.status != TPSLStatus.TRIGGERED:
+                                pt.status = TPSLStatus.TRIGGERED
+                                pt.triggered_at = datetime.utcnow()
+                                
+                                # Send notification
+                                try:
+                                    if self.telegram_bot:
+                                        await self.telegram_bot.send_partial_tp_notification(order, pt)
+                                except Exception as e:
+                                    logger.error(f"Error sending partial TP notification: {e}")
+                    
+                    # Update partial take profits in the database
+                    try:
+                        await self.mongo_client.update_partial_take_profits(order.order_id, order.partial_take_profits)
+                        database_updated = True
+                    except Exception as e:
+                        logger.error(f"Error updating partial take profits for order {order.order_id}: {e}")
                 
                 # Update trailing stop loss if moved
                 if trailing_sl_updated and order.trailing_stop_loss:
-                    updates['trailing_stop_loss.current_stop_price'] = order.trailing_stop_loss.current_stop_price
-                    updates['trailing_stop_loss.highest_price'] = order.trailing_stop_loss.highest_price
-                    
-                    # Add activated_at if it was just activated
-                    if order.trailing_stop_loss.activated_at and 'trailing_stop_loss.activated_at' not in updates:
-                        updates['trailing_stop_loss.activated_at'] = order.trailing_stop_loss.activated_at
-                    
-                    # Send trailing stop loss update notification
                     try:
+                        await self.mongo_client.update_trailing_stop_loss(order.order_id, order.trailing_stop_loss)
+                        database_updated = True
+                        
+                        # Send trailing stop loss update notification
                         if self.telegram_bot:
                             await self.telegram_bot.send_trailing_sl_update_notification(order, order.trailing_stop_loss)
                     except Exception as e:
-                        logger.error(f"Error sending trailing SL update notification: {e}")
+                        logger.error(f"Error updating trailing stop loss for order {order.order_id}: {e}")
                 
-                # Apply updates if any
-                if updates:
+                # If no other updates were done but we still have changes, update the whole order
+                if not database_updated and (tp_triggered or sl_triggered or partial_tp_triggered or trailing_sl_updated):
                     try:
-                        await self.mongo_client.update_tp_sl_status(order.order_id, updates)
+                        await self.mongo_client.insert_order(order)
                     except Exception as e:
-                        logger.error(f"Error updating TP/SL status: {e}")
-        
+                        logger.error(f"Error updating order {order.order_id}: {e}")
+                        
         except Exception as e:
-            logger.error(f"Error in monitor_tp_sl: {e}")
-            # Continue to the next iteration, don't break the loop
+            logger.error(f"Error monitoring TP/SL: {e}")
+            return None
 
     async def start_monitor_tp_sl(self):
         """Start the TP/SL monitoring loop"""
