@@ -1,21 +1,32 @@
+import logging
 import asyncio
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+import io
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, ForceReply, CallbackQuery
 from telegram.constants import ParseMode
 from telegram.ext import (
-    Application, CommandHandler, ContextTypes, 
-    ConversationHandler, CallbackQueryHandler, MessageHandler,
-    filters
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+    ContextTypes
 )
 from datetime import datetime, timedelta
-import logging
-from decimal import Decimal, InvalidOperation  # Add InvalidOperation for exception handling
-from typing import List, Optional, Dict  # Add Dict import
-from ..types.models import Order, OrderStatus, TimeFrame, OrderType, TradeDirection, TPSLStatus, PartialTakeProfit  # Update imports
+from decimal import Decimal, InvalidOperation
+from typing import List, Optional, Dict
+import re
+import time
+import uuid
+
+from ..types.models import Order, OrderStatus, TimeFrame, OrderType, TradeDirection, TPSLStatus, PartialTakeProfit
 from ..trading.binance_client import BinanceClient
 from ..database.mongo_client import MongoClient
-import io  # Add for handling bytes from chart
 from ..types.constants import NOTIFICATION_EMOJI
-from ..utils.chart_generator import ChartGenerator  # Add this import
+from ..utils.chart_generator import ChartGenerator
+import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
+import matplotlib.dates as mdates
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -194,8 +205,7 @@ Type /help for detailed command information.
             # Send message and show menu keyboard
             await update.message.reply_text(
                 welcome_message,
-                reply_markup=self.markup,
-                parse_mode=ParseMode.HTML
+                reply_markup=self.markup
             )
             
             # Show menu immediately after welcome
@@ -338,6 +348,11 @@ Type /help for detailed command information.
             logging.error(f"Error getting balance: {e}")
             await update.message.reply_text(f"❌ Error: {str(e)}")
 
+    # Alias for get_balance to fix the registration error
+    async def balance_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Alias for get_balance - used for command registration"""
+        return await self.get_balance(update, context)
+
     async def get_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Get trading statistics"""
         if not self._is_authorized(update.effective_user.id):
@@ -373,19 +388,87 @@ Type /help for detailed command information.
             return
             
         try:
+            # Get base currency from config
+            base_currency = self.config['trading'].get('base_currency', 'USDT')
+            
             # Get last 5 orders
             cursor = self.mongo_client.orders.find().sort("created_at", -1).limit(5)
             orders = []
             async for doc in cursor:
-                orders.append(
-                    f"{doc['symbol']} - {doc['status']}\n"
-                    f"Price: {doc['price']} Amount: {doc['quantity']}\n"
-                    f"Created: {doc['created_at'].strftime('%Y-%m-%d %H:%M:%S')}"
-                )
+                # Extract base asset
+                symbol = doc['symbol']
+                base_asset = symbol.replace(base_currency, '')
+                
+                # Calculate total value
+                price = float(doc['price'])
+                quantity = float(doc['quantity'])
+                total_value = price * quantity
+                
+                # Start building order details
+                order_details = [
+                    f"🔹 {symbol} - {doc['status'].upper()}",
+                    f"Price: ${price:.4f} | Amount: {quantity:.6f} {base_asset}",
+                    f"Total Value: ${total_value:.2f} {base_currency}",
+                    f"Type: {doc.get('order_type', 'UNKNOWN')} | Created: {doc['created_at'].strftime('%Y-%m-%d %H:%M:%S')}"
+                ]
+                
+                # Add TP/SL info if available
+                if 'take_profit' in doc and doc['take_profit']:
+                    tp = doc['take_profit']
+                    order_details.append(f"Take Profit: ${float(tp['price']):.4f} (+{tp['percentage']:.2f}%)")
+                
+                if 'stop_loss' in doc and doc['stop_loss']:
+                    sl = doc['stop_loss']
+                    order_details.append(f"Stop Loss: ${float(sl['price']):.4f} (-{sl['percentage']:.2f}%)")
+                
+                # Add partial take profits info if available
+                if 'partial_take_profits' in doc and doc['partial_take_profits'] and len(doc['partial_take_profits']) > 0:
+                    ptp_details = ["Partial Take Profits:"]
+                    for ptp in doc['partial_take_profits']:
+                        ptp_status = ptp.get('status', 'PENDING')
+                        triggered_info = ""
+                        if ptp_status == 'TRIGGERED' and 'triggered_at' in ptp:
+                            triggered_info = f" ✅ Triggered: {ptp['triggered_at'].strftime('%Y-%m-%d %H:%M:%S')}"
+                        
+                        # Calculate exact amount to be sold at this level
+                        ptp_quantity = quantity * (ptp['position_percentage'] / 100)
+                        ptp_value = ptp_quantity * float(ptp['price'])
+                        
+                        ptp_details.append(
+                            f"  Level {ptp['level']}: ${float(ptp['price']):.4f} "
+                            f"(+{ptp['profit_percentage']:.2f}%) - Sell {ptp['position_percentage']}% "
+                            f"({ptp_quantity:.6f} {base_asset} = ${ptp_value:.2f}){triggered_info}"
+                        )
+                    order_details.append("\n".join(ptp_details))
+                
+                # Add trailing stop loss info if available
+                if 'trailing_stop_loss' in doc and doc['trailing_stop_loss']:
+                    tsl = doc['trailing_stop_loss']
+                    tsl_status = tsl.get('status', 'PENDING')
+                    tsl_details = [
+                        f"Trailing Stop Loss: Activation at +{tsl['activation_percentage']}%, "
+                        f"Callback {tsl['callback_rate']}%"
+                    ]
+                    
+                    if 'current_stop_price' in tsl:
+                        tsl_details.append(f"Current Stop: ${float(tsl['current_stop_price']):.4f}")
+                    
+                    if tsl_status == 'TRIGGERED' and 'triggered_at' in tsl:
+                        tsl_details.append(f"Triggered: {tsl['triggered_at'].strftime('%Y-%m-%d %H:%M:%S')}")
+                    
+                    order_details.append(" | ".join(tsl_details))
+                
+                orders.append("\n".join(order_details))
                 
             message = "📜 Recent Orders:\n\n" + "\n\n".join(orders)
+            
+            # Handle message length - Telegram has 4096 character limit
+            if len(message) > 4000:
+                message = message[:3950] + "...\n(Message truncated due to length)"
+                
             await update.message.reply_text(message)
         except Exception as e:
+            logger.error(f"Error in get_order_history: {e}", exc_info=True)
             await update.message.reply_text(f"❌ Error getting history: {str(e)}")
 
     async def send_order_notification(self, order: Order, status: Optional[OrderStatus] = None):
@@ -553,6 +636,29 @@ Type /help for detailed command information.
             if order.stop_loss:
                 caption += f"Stop Loss: ${float(order.stop_loss.price):.2f} (-{order.stop_loss.percentage:.2f}%)\n"
                 
+            # Add Partial Take Profit information if configured
+            if order.partial_take_profits and len(order.partial_take_profits) > 0:
+                caption += f"\nPartial Take Profits:\n"
+                for ptp in order.partial_take_profits:
+                    # Calculate exact amount to be sold at this level
+                    ptp_quantity = float(order.quantity) * (ptp.position_percentage / 100)
+                    ptp_value = ptp_quantity * float(ptp.price)
+                    
+                    caption += (
+                        f"• Level {ptp.level}: ${float(ptp.price):.4f} (+{ptp.profit_percentage:.2f}%)\n"
+                        f"  Sell: {ptp_quantity:.6f} {base_asset} (${ptp_value:.2f} {base_currency})\n"
+                    )
+                
+            # Add Trailing Stop Loss information if configured
+            if order.trailing_stop_loss:
+                tsl = order.trailing_stop_loss
+                caption += (
+                    f"\nTrailing Stop Loss:\n"
+                    f"• Activation: +{tsl.activation_percentage:.2f}% (${float(tsl.activation_price):.4f})\n"
+                    f"• Callback Rate: {tsl.callback_rate:.2f}%\n"
+                    f"• Initial Stop: ${float(tsl.current_stop_price):.4f}\n"
+                )
+                
             caption += (
                 f"Threshold: {order.threshold if order.threshold else 'Manual'}\n"
                 f"Timeframe: {self._get_timeframe_value(order.timeframe)}\n\n"
@@ -625,27 +731,57 @@ Type /help for detailed command information.
             
             # Create main command sections
             keyboard = [
-                # Price check buttons
-                [
-                    KeyboardButton(f"/price BTC{base_currency}"), 
-                    KeyboardButton(f"/price ETH{base_currency}"), 
-                    KeyboardButton(f"/price BNB{base_currency}")
-                ],
                 # Info commands
                 [
                     KeyboardButton("/balance"), 
-                    KeyboardButton("/status"), 
-                    KeyboardButton("/orders")
+                    KeyboardButton("/stats"), 
+                    KeyboardButton("/profits")
                 ],
                 # Trading commands
                 [
-                    KeyboardButton("/symbols"), 
-                    KeyboardButton("/help")
+                    KeyboardButton("/orders"),
+                    KeyboardButton("/history"),
+                    KeyboardButton("/thresholds")
                 ],
-                # Control commands
+                # Trading symbols
                 [
-                    KeyboardButton("/pausebot"), 
-                    KeyboardButton("/resumebot")
+                    KeyboardButton("/symbols"),
+                    KeyboardButton("/add"),
+                    KeyboardButton("/resetthresholds")
+                ],
+                # Visualizations
+                [
+                    KeyboardButton("/viz"),
+                    KeyboardButton("/status"),
+                    KeyboardButton("/power")
+                ],
+                # TP/SL management
+                [
+                    KeyboardButton("/tp_sl"),
+                    KeyboardButton("/set_tp"),
+                    KeyboardButton("/set_sl")
+                ],
+                # Partial TP management
+                [
+                    KeyboardButton("/set_partial_tp"),
+                    KeyboardButton("/partial_tp_disable"),
+                    KeyboardButton("/set_lower_entries")
+                ],
+                # Trailing SL management
+                [
+                    KeyboardButton("/show_trailing_sl"),
+                    KeyboardButton("/trailing_sl_enable"),
+                    KeyboardButton("/trailing_sl_disable")
+                ],
+                # Financial commands
+                [
+                    KeyboardButton("/deposit"),
+                    KeyboardButton("/withdraw"),
+                    KeyboardButton("/transactions")
+                ],
+                # Help
+                [
+                    KeyboardButton("/help")
                 ]
             ]
             
@@ -667,31 +803,23 @@ Type /help for detailed command information.
                 KeyboardButton(f"Lower Entries: {lower_entries_status}")
             ])
             
-            # Add TP/SL management commands
-            keyboard.append([
-                KeyboardButton("/showpartialtps"),
-                KeyboardButton("/showtrailingsl")
-            ])
-            
-            # Add enable/disable buttons
-            keyboard.append([
-                KeyboardButton("/enablepartialtps"),
-                KeyboardButton("/enabletrailingsl"),
-                KeyboardButton("/enablelowerentries")
-            ])
-            
-            keyboard.append([
-                KeyboardButton("/disablepartialtps"),
-                KeyboardButton("/disabletrailingsl"),
-                KeyboardButton("/disablelowerentries")
-            ])
-            
             # Create reply markup
             reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
             
-            # Send menu message
+            # Send menu message with overview of commands
+            menu_text = (
+                "🦖 Trade-a-saurus Rex Menu 🦖\n\n"
+                "Info Commands: /balance /stats /profits /status\n"
+                "Trading: /orders /history /thresholds /add /symbols\n"
+                "TP/SL: /tp_sl /set_tp /set_sl /set_partial_tp /show_trailing_sl\n"
+                "Financial: /deposit /withdraw /transactions\n"
+                "Visuals: /viz (charts and visualizations)\n"
+                "Controls: /power (pause/resume), /resetthresholds\n"
+                "Help: /help (detailed command list)"
+            )
+            
             await update.message.reply_text(
-                "Trade-a-saurus Rex Menu:",
+                menu_text,
                 reply_markup=reply_markup
             )
             
@@ -1257,25 +1385,27 @@ Type /help for detailed command information.
         return ConversationHandler.END
 
     async def show_viz_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show data visualization options"""
+        """Show visualization options"""
         if not self._is_authorized(update.effective_user.id):
             await update.message.reply_text("⛔ Unauthorized access")
             return
-
+            
         keyboard = [
-            [InlineKeyboardButton("📊 Daily Volume", callback_data=VisualizationType.DAILY_VOLUME)],
-            [InlineKeyboardButton("💰 Profit Distribution", callback_data=VisualizationType.PROFIT_DIST)],
-            [InlineKeyboardButton("📈 Order Types", callback_data=VisualizationType.ORDER_TYPES)],
-            [InlineKeyboardButton("⏰ Hourly Activity", callback_data=VisualizationType.HOURLY_ACTIVITY)],
-            [InlineKeyboardButton("💹 Balance History", callback_data=VisualizationType.BALANCE_CHART)],
-            [InlineKeyboardButton("🔄 ROI Comparison", callback_data=VisualizationType.ROI_COMPARISON)],
-            [InlineKeyboardButton("⚔️ S&P 500 vs BTC (YTD)", callback_data=VisualizationType.SP500_VS_BTC)],
-            [InlineKeyboardButton("🥧 Portfolio Composition", callback_data=VisualizationType.PORTFOLIO_COMPOSITION)]
+            [InlineKeyboardButton("📊 Balance History (30d)", callback_data="viz_balance_30")],
+            [InlineKeyboardButton("📊 Balance History (90d)", callback_data="viz_balance_90")],
+            [InlineKeyboardButton("📊 Balance History (All time)", callback_data="viz_balance_all")],
+            [InlineKeyboardButton("💹 Performance vs. BTC (30d)", callback_data="viz_btc_30")],
+            [InlineKeyboardButton("💹 Performance vs. BTC (90d)", callback_data="viz_btc_90")],
+            [InlineKeyboardButton("💰 Deposits & Withdrawals", callback_data="viz_transactions")],
+            [InlineKeyboardButton("🔙 Back to Menu", callback_data="show_menu")]
         ]
         
+        reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text(
-            "📊 Select Data Visualization:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            "📈 *Visualization Options*\n\n"
+            "Choose a chart to view trading data visualizations.",
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.MARKDOWN
         )
 
     async def handle_viz_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1994,6 +2124,9 @@ Type /help for detailed command information.
                     old_tp_price = order.take_profit.price
                     new_tp_price = Decimal(str(float(entry_price) * (1 + percentage / 100)))
                     
+                    # Align the price to the exchange's tick size requirements
+                    new_tp_price = self.binance_client._align_price_to_tick(order.symbol, new_tp_price)
+                    
                     # Update the order's TP in the database
                     order.take_profit.price = new_tp_price
                     order.take_profit.percentage = percentage
@@ -2111,6 +2244,9 @@ Type /help for detailed command information.
                     entry_price = order.price
                     old_sl_price = order.stop_loss.price
                     new_sl_price = Decimal(str(float(entry_price) * (1 - percentage / 100)))
+                    
+                    # Align the price to the exchange's tick size requirements
+                    new_sl_price = self.binance_client._align_price_to_tick(order.symbol, new_sl_price)
                     
                     # Update the order's SL in the database
                     order.stop_loss.price = new_sl_price
@@ -2274,6 +2410,55 @@ To change this setting:
             except Exception as e:
                 logger.error(f"Failed to send TP notification to {user_id}: {e}")
 
+    async def send_partial_tp_notification(self, order: Order, partial_tp):
+        """Send notification when Partial Take Profit level is triggered with detailed information"""
+        if not partial_tp or not partial_tp.triggered_at:
+            return
+            
+        # Get base currency from config
+        base_currency = self.config['trading'].get('base_currency', 'USDT')
+        
+        # Extract base asset (remove base currency suffix)
+        base_asset = order.symbol.replace(base_currency, '')
+        
+        # Calculate profit
+        entry_price = float(order.price)
+        tp_price = float(partial_tp.price)
+        
+        # Calculate the amount being sold in this partial TP
+        total_quantity = float(order.quantity)
+        position_percentage = partial_tp.position_percentage
+        sold_quantity = total_quantity * (position_percentage / 100)
+        
+        # Calculate USDC value of the sale
+        sale_value = sold_quantity * tp_price
+        
+        # Calculate profit
+        profit_percentage = partial_tp.profit_percentage
+        profit_amount = (tp_price - entry_price) * sold_quantity
+        
+        message = (
+            f"🔹 Partial Take Profit (Level {partial_tp.level}) Triggered!\n\n"
+            f"Symbol: {order.symbol}\n"
+            f"Entry Price: ${entry_price:.4f}\n"
+            f"TP Price: ${tp_price:.4f}\n\n"
+            f"Selling: {sold_quantity:.8f} {base_asset} ({position_percentage}% of position)\n"
+            f"Sale Value: ${sale_value:.2f} {base_currency}\n"
+            f"Profit: ${profit_amount:.2f} (+{profit_percentage:.2f}%)\n\n"
+            f"Remaining Position: {total_quantity - sold_quantity:.8f} {base_asset}\n"
+            f"Triggered at: {partial_tp.triggered_at.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        
+        for user_id in self.allowed_users:
+            try:
+                await self.application.bot.send_message(
+                    chat_id=user_id,
+                    text=message,
+                    reply_markup=self.markup
+                )
+            except Exception as e:
+                logger.error(f"Failed to send partial TP notification to {user_id}: {e}")
+
     async def send_sl_notification(self, order, sl, trailing=False):
         """Send notification when stop loss is triggered"""
         try:
@@ -2320,8 +2505,7 @@ To change this setting:
             # Send message
             await self.bot.send_message(
                 chat_id=self.chat_id,
-                text=message,
-                parse_mode=ParseMode.HTML
+                text=message
             )
             
         except Exception as e:
@@ -2367,8 +2551,7 @@ To change this setting:
             # Send message
             await self.bot.send_message(
                 chat_id=self.chat_id,
-                text=message,
-                parse_mode=ParseMode.HTML
+                text=message
             )
             
         except Exception as e:
@@ -2918,254 +3101,72 @@ To change this setting:
         )
 
     async def handle_symbol_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle callback for symbol management"""
-        query = update.callback_query
-        await query.answer()
+        """Handle all callback queries"""
+        callback_query = update.callback_query
+        data = callback_query.data
+        user_id = callback_query.from_user.id
         
-        data = query.data
+        if not self._is_authorized(user_id):
+            await callback_query.answer("⛔ Unauthorized access")
+            return
         
-        if data.startswith("remove_symbol:"):
-            symbol = data.split(":")[1]
+        try:
+            # Acknowledge the callback to remove the loading indicator
+            await callback_query.answer()
             
-            # Check if this was a pre-configured symbol
-            was_preconfigured = hasattr(self.binance_client, 'original_config_symbols') and \
-                               symbol in self.binance_client.original_config_symbols
-            
-            # Remove from database
-            success = await self.mongo_client.remove_trading_symbol(symbol)
-            
-            if success:
-                # Remove from the active config as well
-                if symbol in self.binance_client.config['trading']['pairs']:
-                    self.binance_client.config['trading']['pairs'].remove(symbol)
+            # Handle different callback types
+            if data == "show_menu":
+                await self.show_menu_from_callback(callback_query, context)
+                return
                 
-                # Cancel any pending orders for this symbol
-                canceled_orders = await self._cancel_symbol_orders(symbol)
-                
-                # Clear any triggered thresholds for this symbol
-                cleared_thresholds = await self._clear_symbol_thresholds(symbol)
+            # Handle visualization callbacks
+            if data.startswith("viz_"):
+                if data.startswith("viz_balance_"):
+                    # Extract days from callback data
+                    days_part = data.split("_")[2]
+                    days = 999999 if days_part == "all" else int(days_part)
+                    await self.send_balance_chart(callback_query, days)
+                    return
                     
-                # If it was a pre-configured symbol, add it to the removed list
-                if was_preconfigured:
-                    await self.mongo_client.add_removed_symbol(symbol)
-                    message = f"✅ Successfully removed {symbol} from the trading symbols list.\n" \
-                             f"• Canceled {canceled_orders} pending orders\n" \
-                             f"• Cleared thresholds for all timeframes\n" \
-                             f"(This pre-configured symbol will not be auto-added on restart)"
-                else:
-                    message = f"✅ Successfully removed {symbol} from the trading symbols list.\n" \
-                             f"• Canceled {canceled_orders} pending orders\n" \
-                             f"• Cleared thresholds for all timeframes"
+                elif data.startswith("viz_btc_"):
+                    # Extract days from callback data
+                    days = int(data.split("_")[2])
+                    await self.send_performance_chart(callback_query, days)
+                    return
                 
-                await query.edit_message_text(message)
-            else:
-                await query.edit_message_text(
-                    f"❌ Symbol {symbol} not found in the trading list."
-                )
+                elif data == "viz_transactions":
+                    # Show deposits and withdrawals visualization
+                    await self.send_transactions_chart(callback_query)
+                    return
+            
+            # Handle symbol management
+            if data.startswith("symbol_"):
+                parts = data.split("_")
+                action = parts[1]
+                symbol = parts[2] if len(parts) > 2 else None
+                
+                if action == "add":
+                    context.user_data["adding_symbol"] = True
+                    await callback_query.message.reply_text(
+                        "Please enter the symbol to add (e.g. BTCUSDT):",
+                        reply_markup=ForceReply(selective=True)
+                    )
+                    return
+                    
+                elif action == "remove" and symbol:
+                    await self.remove_symbol(callback_query, symbol)
+                    return
+                    
+                elif action == "list":
+                    await self.list_symbols(callback_query)
+                    return
+        except Exception as e:
+            logger.error(f"Error handling callback: {e}", exc_info=True)
+            await callback_query.message.reply_text(
+                f"❌ Error processing your request: {str(e)}"
+            )
 
     # Add helper methods to cancel orders and clear thresholds
-    async def _cancel_symbol_orders(self, symbol: str) -> int:
-        """Cancel all pending orders for a specific symbol"""
-        try:
-            # Find all pending orders for this symbol
-            pending_orders = await self.mongo_client.orders.find({
-                "symbol": symbol,
-                "status": "pending"
-            }).to_list(None)
-            
-            cancelled_count = 0
-            skipped_count = 0
-            for order in pending_orders:
-                order_id = order.get("order_id")
-                if order_id:
-                    try:
-                        # Try to cancel on Binance
-                        if await self.binance_client.cancel_order(symbol, order_id):
-                            # Update status in database
-                            await self.mongo_client.update_order_status(
-                                order_id, 
-                                OrderStatus.CANCELLED,
-                                cancelled_at=datetime.utcnow()
-                            )
-                            cancelled_count += 1
-                        else:
-                            # If cancel_order returns False, still update DB status
-                            await self.mongo_client.update_order_status(
-                                order_id, 
-                                OrderStatus.CANCELLED,
-                                cancelled_at=datetime.utcnow()
-                            )
-                            cancelled_count += 1
-                    except Exception as e:
-                        # Handle "Unknown order" errors by updating DB anyway
-                        if "Unknown order sent" in str(e) or "code=-2011" in str(e):
-                            logging.warning(f"Order {order_id} already cancelled or filled on exchange, updating database")
-                            await self.mongo_client.update_order_status(
-                                order_id, 
-                                OrderStatus.CANCELLED,
-                                cancelled_at=datetime.utcnow()
-                            )
-                            cancelled_count += 1
-                        else:
-                            logging.error(f"Error cancelling order {order_id}: {e}")
-                            skipped_count += 1
-                        
-            # Return the results
-            if skipped_count > 0:
-                logging.warning(f"Cancelled {cancelled_count} orders, skipped {skipped_count} orders due to errors")
-            return cancelled_count
-        except Exception as e:
-            logging.error(f"Error canceling orders for {symbol}: {e}")
-            return 0
-
-    async def _clear_symbol_thresholds(self, symbol: str) -> bool:
-        """Clear all triggered thresholds for a specific symbol"""
-        try:
-            # Clear from database - update to be more thorough
-            for timeframe in TimeFrame:
-                # Delete from threshold_state collection
-                await self.mongo_client.threshold_state.delete_one({
-                    "symbol": symbol,
-                    "timeframe": timeframe.value
-                })
-                
-                # Also clear from triggered_thresholds collection
-                await self.mongo_client.triggered_thresholds.delete_one({
-                    "symbol": symbol,
-                    "timeframe": timeframe.value
-                })
-            
-            # Clear from BinanceClient memory
-            if hasattr(self.binance_client, 'triggered_thresholds') and symbol in self.binance_client.triggered_thresholds:
-                del self.binance_client.triggered_thresholds[symbol]
-                
-            # Also remove from reference_prices if it exists there
-            if hasattr(self.binance_client, 'reference_prices') and symbol in self.binance_client.reference_prices:
-                for timeframe in TimeFrame:
-                    timeframe_key = f"{symbol}_{timeframe.value}"
-                    if timeframe_key in self.binance_client.reference_prices:
-                        del self.binance_client.reference_prices[timeframe_key]
-                    
-            # Add to a "blacklist" for the current trading cycle to prevent immediate reprocessing
-            if not hasattr(self.binance_client, 'removed_symbols_this_cycle'):
-                self.binance_client.removed_symbols_this_cycle = set()
-            self.binance_client.removed_symbols_this_cycle.add(symbol)
-                
-            return True
-        except Exception as e:
-            logging.error(f"Error clearing thresholds for {symbol}: {e}")
-            return False
-
-    async def send_partial_tp_notification(self, order: Order, partial_tp: PartialTakeProfit):
-        """Send notification when a partial take profit level is triggered"""
-        if not self.chat_id:
-            logger.warning("Cannot send partial TP notification: No chat ID available")
-            return
-            
-        try:
-            emoji = "🎯"
-            current_price = await self.binance_client.get_current_price(order.symbol)
-            
-            # Calculate profit details
-            entry_price = float(order.price)
-            tp_price = float(partial_tp.price)
-            position_percentage = partial_tp.position_percentage
-            profit_percentage = partial_tp.profit_percentage
-            
-            # Calculate the amount being sold at this level
-            original_quantity = float(order.quantity)
-            sell_quantity = original_quantity * (position_percentage / 100)
-            
-            # Calculate profit in currency
-            profit_per_unit = tp_price - entry_price
-            total_profit = profit_per_unit * sell_quantity
-            
-            message = (
-                f"{emoji} *Partial Take Profit Triggered - Level {partial_tp.level}* {emoji}\n\n"
-                f"Symbol: `{order.symbol}`\n"
-                f"Entry Price: `${entry_price:.4f}`\n"
-                f"TP Price: `${tp_price:.4f}` (+{profit_percentage:.2f}%)\n"
-                f"Current Price: `${current_price:.4f}`\n\n"
-                f"Position: {position_percentage:.0f}% of holdings "
-                f"({sell_quantity:.6f} {order.symbol.replace(self.binance_client.base_currency, '')})\n"
-                f"Profit: `${total_profit:.2f}` (+{profit_percentage:.2f}%)\n\n"
-                f"🦖 *RAWR!* Successfully locked in partial profits!"
-            )
-            
-            await self.send_message(self.chat_id, message, parse_mode="Markdown")
-            
-        except Exception as e:
-            logger.error(f"Error sending partial TP notification: {e}", exc_info=True)
-            
-    async def show_partial_tp(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show current partial take profit settings"""
-        if not self._is_authorized(update.effective_user.id):
-            await update.message.reply_text("⛔ Unauthorized access")
-            return
-            
-        try:
-            # Get current partial TP configuration
-            partial_tp_config = self.config['trading']['partial_take_profits']
-            enabled = partial_tp_config.get('enabled', False)
-            
-            # Get the levels
-            levels = []
-            if 'levels' in partial_tp_config:
-                for level_num, level in enumerate(partial_tp_config['levels'], 1):
-                    levels.append({
-                        'level': level_num,
-                        'position_percentage': level.get('position_percentage', 0),
-                        'profit_percentage': level.get('profit_percentage', 0)
-                    })
-            
-            # Create status message
-            message = f"🎯 *Partial Take Profit Settings*\n\n"
-            message += f"Status: {'✅ Enabled' if enabled else '❌ Disabled'}\n\n"
-            
-            if levels:
-                message += "*Configured Levels:*\n"
-                for level in levels:
-                    message += f"- Level {level['level']}: {level['position_percentage']}% of position at +{level['profit_percentage']}% profit\n"
-            else:
-                message += "*No levels configured*\n"
-                
-            # Add command examples
-            message += "\n*Available Commands:*\n"
-            message += "`/partial_tp_enable` - Enable partial take profits\n"
-            message += "`/partial_tp_disable` - Disable partial take profits\n"
-            message += "`/set_partial_tp <level> <position_percentage> <profit_percentage>` - Set a partial TP level\n"
-            message += "Example: `/set_partial_tp 1 25 1.5` sets level 1 to sell 25% of position at +1.5% profit"
-            
-            await update.message.reply_text(message, parse_mode="Markdown")
-            
-        except Exception as e:
-            logger.error(f"Error showing partial TP settings: {e}", exc_info=True)
-            await update.message.reply_text(f"❌ Error: {str(e)}")
-            
-    async def partial_tp_enable(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Enable partial take profits"""
-        if not self._is_authorized(update.effective_user.id):
-            await update.message.reply_text("⛔ Unauthorized access")
-            return
-            
-        try:
-            # Update the config
-            self.config['trading']['partial_take_profits']['enabled'] = True
-            
-            # Save to database
-            await self.mongo_client.update_trading_setting('partial_take_profits.enabled', True)
-            
-            # Get the number of configured levels
-            levels = self.config['trading']['partial_take_profits'].get('levels', [])
-            
-            # Send confirmation
-            await update.message.reply_text(
-                f"✅ Partial take profits have been enabled.\n"
-                f"Currently {len(levels)} levels are configured.\n"
-                f"Use `/show_partial_tp` to see current settings."
-            )
-            
-        except Exception as e:
             logger.error(f"Error enabling partial take profits: {e}", exc_info=True)
             await update.message.reply_text(f"❌ Error: {str(e)}")
             
@@ -3503,14 +3504,95 @@ To change this setting:
             )
 
     async def register_commands(self):
-        """Register command handlers"""
-        self.application.add_handler(CommandHandler("start", self.start_command))
-        self.application.add_handler(CommandHandler("menu", self.show_menu))
-        self.application.add_handler(CommandHandler("help", self.help_command))
-        self.application.add_handler(CommandHandler("status", self.status_command))
-        self.application.add_handler(CommandHandler("balance", self.balance_command))
-        self.application.add_handler(CommandHandler("orders", self.orders_command))
-        self.application.add_handler(CommandHandler("symbols", self.symbols_command))
+        """Register bot commands with the menu"""
+        try:
+            # Register commands in the app menu
+            commands = [
+                ('start', 'Start the bot'),
+                ('menu', 'Show main command menu'),
+                ('power', 'Toggle trading on/off'),
+                ('balance', 'Check current balance'),
+                ('stats', 'View trading statistics'),
+                ('profits', 'View profit/loss analysis'),
+                ('orders', 'View active orders'),
+                ('history', 'View order history'),
+                ('thresholds', 'Show price thresholds'),
+                ('add', 'Add manual trade'),
+                ('resetthresholds', 'Reset price thresholds'),
+                ('symbols', 'Manage trading symbols'),
+                ('viz', 'Show data visualizations'),
+                ('status', 'Check bot system status'),
+                ('tp_sl', 'View TP/SL settings'),
+                ('set_tp', 'Set take profit percentage'),
+                ('set_sl', 'Set stop loss percentage'),
+                ('set_partial_tp', 'Configure partial take profits'),
+                ('partial_tp_disable', 'Disable partial take profits'),
+                ('show_trailing_sl', 'Show trailing stop loss settings'),
+                ('trailing_sl_enable', 'Enable trailing stop loss'),
+                ('trailing_sl_disable', 'Disable trailing stop loss'),
+                ('set_lower_entries', 'Configure lower entries protection'),
+                ('deposit', 'Record a deposit'),
+                ('withdraw', 'Record a withdrawal'),
+                ('transactions', 'View deposit/withdrawal history'),
+                ('help', 'Show help text with all commands')
+            ]
+            
+            await self.application.bot.set_my_commands(commands)
+            
+            # Set command handlers
+            self.application.add_handler(CommandHandler("start", self.start_command))
+            self.application.add_handler(CommandHandler("menu", self.show_menu))
+            self.application.add_handler(CommandHandler("power", self.toggle_trading))
+            self.application.add_handler(CommandHandler("balance", self.balance_command))
+            self.application.add_handler(CommandHandler("stats", self.get_stats))
+            self.application.add_handler(CommandHandler("profits", self.show_profits))
+            self.application.add_handler(CommandHandler("history", self.get_order_history))
+            self.application.add_handler(CommandHandler("thresholds", self.show_thresholds))
+            self.application.add_handler(CommandHandler("add", self.add_trade_start))
+            self.application.add_handler(CommandHandler("help", self.help_command))
+            self.application.add_handler(CommandHandler("resetthresholds", self.reset_all_thresholds))
+            self.application.add_handler(CommandHandler("viz", self.show_viz_menu))
+            self.application.add_handler(CommandHandler("status", self.status_command))
+            self.application.add_handler(CommandHandler("symbols", self.list_symbols_command))
+            self.application.add_handler(CommandHandler("tp_sl", self.show_tp_sl))
+            self.application.add_handler(CommandHandler("set_tp", self.set_take_profit))
+            self.application.add_handler(CommandHandler("set_sl", self.set_stop_loss))
+            self.application.add_handler(CommandHandler("orders", self.orders_command))
+            self.application.add_handler(CommandHandler("deposit", self.deposit_command))
+            self.application.add_handler(CommandHandler("withdraw", self.withdrawal_command))
+            self.application.add_handler(CommandHandler("transactions", self.transactions_command))
+            
+            # Add specific command handlers for partial TP/trailing SL
+            self.application.add_handler(CommandHandler("set_partial_tp", self.set_partial_tp))
+            self.application.add_handler(CommandHandler("partial_tp_disable", self.partial_tp_disable))
+            self.application.add_handler(CommandHandler("show_trailing_sl", self.show_trailing_sl))
+            self.application.add_handler(CommandHandler("trailing_sl_enable", self.trailing_sl_enable))
+            self.application.add_handler(CommandHandler("trailing_sl_disable", self.trailing_sl_disable))
+            self.application.add_handler(CommandHandler("set_lower_entries", self.set_lower_entries))
+            
+            # Add callback query handler for viz menu
+            self.application.add_handler(CallbackQueryHandler(
+                self.handle_viz_selection, pattern=r'^(daily_volume|profit_distribution|order_types|hourly_activity|balance_chart|roi_comparison|sp500_vs_btc|portfolio_composition).*$')
+            )
+            
+            # Add callback query handler for threshold menu
+            self.application.add_handler(CallbackQueryHandler(
+                self.handle_threshold_selection, pattern=r'^(reset_daily|reset_weekly|reset_monthly)$')
+            )
+            
+            # Add callback query handler for symbol management
+            self.application.add_handler(CallbackQueryHandler(
+                self.handle_symbol_callback, pattern=r'^(symbol_remove|back_to_symbols|add_symbol).*$')
+            )
+            
+            # Error handler
+            self.application.add_error_handler(self.handle_error)
+            
+            logger.info("Bot commands registered")
+            return True
+        except Exception as e:
+            logger.error(f"Error registering commands: {e}", exc_info=True)
+            return False
 
     async def is_user_authorized(self, update: Update) -> bool:
         """Check if user is authorized to use the bot"""
@@ -3521,73 +3603,764 @@ To change this setting:
         return True
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Send help message"""
+        """Show help message with all available commands"""
+        if not self._is_authorized(update.effective_user.id):
+            await update.message.reply_text("⛔ Unauthorized access")
+            return
+            
+        # Add emoji to make help more visually appealing
+        message = "🦖 Trade-a-saurus Rex Bot Commands 🦖\n\n"
+        
+        # Basic commands
+        message += "Basic Commands:\n"
+        message += "/start - Start the bot\n"
+        message += "/menu - Show command menu\n"
+        message += "/power - Toggle trading on/off\n"
+        message += "/help - Show this help message\n"
+        message += "/status - Show system status\n\n"
+        
+        # Trading commands
+        message += "Trading Commands:\n"
+        message += "/balance - Check current balance\n"
+        message += "/stats - View trading statistics\n"
+        message += "/profits - View profit/loss analysis\n"
+        message += "/history - View order history\n"
+        message += "/orders - View active orders\n"
+        message += "/thresholds - Show threshold status\n"
+        message += "/resetthresholds - Reset all thresholds\n"
+        message += "/add - Add manual trade\n\n"
+        
+        # Symbol management
+        message += "Symbol Management:\n"
+        message += "/symbols - Manage trading symbols\n\n"
+        
+        # Take Profit/Stop Loss settings
+        message += "Take Profit & Stop Loss:\n"
+        message += "/tp_sl - View TP/SL settings\n"
+        message += "/set_tp <percentage> - Set take profit\n"
+        message += "/set_sl <percentage> - Set stop loss\n"
+        message += "/set_partial_tp - Configure partial take profits\n"
+        message += "/partial_tp_disable - Disable partial take profits\n"
+        message += "/set_lower_entries - Configure lower entries\n"
+        message += "/show_trailing_sl - Show trailing stop loss settings\n"
+        message += "/trailing_sl_enable - Enable trailing stop loss\n"
+        message += "/trailing_sl_disable - Disable trailing stop loss\n\n"
+        
+        # Financial tracking commands
+        message += "Financial Tracking:\n"
+        message += "/deposit <amount> - Record a deposit\n"
+        message += "/withdraw <amount> - Record a withdrawal\n"
+        message += "/transactions - View recent transactions\n\n"
+        
+        # Visualization commands
+        message += "Visualization Commands:\n"
+        message += "/viz - Show data visualization menu\n\n"
+        
+        # Footer
+        message += "Use /menu to show the button menu with all commands"
+        
+        await update.message.reply_text(message)
+
+    async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Check bot status"""
         try:
             if not await self.is_user_authorized(update):
                 return
                 
-            help_text = """
-<b>Trade-a-saurus Rex Bot Help</b>
+            # Get environment info
+            env_name = "TESTNET" if self.config['binance']['use_testnet'] else "MAINNET"
+            base_currency = self.config['trading']['base_currency']
+            
+            # Get trading status
+            trading_enabled = not self.is_paused
+            status_emoji = "✅" if trading_enabled else "❌"
+            
+            # Get feature statuses
+            trading_config = self.config.get('trading', {})
+            partial_tp_enabled = trading_config.get('partial_take_profit', {}).get('enabled', False)
+            trailing_sl_enabled = trading_config.get('trailing_stop_loss', {}).get('enabled', False)
+            lower_entries_enabled = trading_config.get('only_lower_entries', False)
+            
+            # Create status message
+            status_message = f"""
+<b>🦖 Trade-a-saurus Rex Status</b>
 
-<b>🔍 Information Commands:</b>
-/menu - Show main menu
-/help - Show this help message
-/status - Check bot status
-/balance - Check account balance
-/orders - List active orders
-/symbols - List configured symbols
-/price [symbol] - Get current price for symbol
+<b>Environment:</b> {env_name}
+<b>Base Currency:</b> {base_currency}
+<b>Trading Status:</b> {status_emoji} {"ACTIVE" if trading_enabled else "PAUSED"}
+<b>Reserve Balance:</b> ${self.binance_client.reserve_balance:.2f}
 
-<b>📊 Trading Commands:</b>
-/buy [symbol] [amount] - Create buy order
-/sell [symbol] [amount] - Create sell order
-/buylimit [symbol] [price] [amount] - Place limit buy order
-/selllimit [symbol] [price] [amount] - Place limit sell order
-/marketbuy [symbol] [amount] - Place market buy order
-/marketsell [symbol] [amount] - Place market sell order
-/cancel [orderid] - Cancel order
+<b>Features:</b>
+• Partial TP: {"✅ Enabled" if partial_tp_enabled else "❌ Disabled"}
+• Trailing SL: {"✅ Enabled" if trailing_sl_enabled else "❌ Disabled"}
+• Lower Entries Protection: {"✅ Enabled" if lower_entries_enabled else "❌ Disabled"}
 
-<b>⚙️ Configuration Commands:</b>
-/pausebot - Pause trading
-/resumebot - Resume trading
-/setdefault [symbol] [amount] - Set default order amount
-/settakeproft [percentage] - Set default take profit %
-/setstoploss [percentage] - Set default stop loss %
-/setleverage [value] - Set futures leverage
-/setmargin [type] - Set margin type (ISOLATED/CROSS)
-/setmode [mode] - Set trading mode (spot/futures)
-/setheartbeat [minutes] - Set heartbeat interval
-/enabletrading - Enable trading
-/disabletrading - Disable trading
-/enableaddorders - Enable adding new orders
-/disableaddorders - Disable adding new orders
+<b>Default Settings:</b>
+• Take Profit: {self.binance_client.default_tp_percentage}%
+• Stop Loss: {self.binance_client.default_sl_percentage}%
 
-<b>📉 Lower Entries Protection:</b>
-/enablelowerentries - Enable only lower entries protection
-/disablelowerentries - Disable only lower entries protection
-/setlowerentries [on/off] - Set lower entries protection
-
-<b>📈 Partial Take Profit Commands:</b>
-/showpartialtps - Show partial TP settings
-/enablepartialtps - Enable partial take profits
-/disablepartialtps - Disable partial take profits
-/setpartialtps [level] [percentage] [position%] - Set partial TP level
-  Example: /setpartialtps 1 2.5 25 - Level 1, +2.5% from entry, 25% of position
-
-<b>🛑 Trailing Stop Loss Commands:</b>
-/showtrailingsl - Show trailing SL settings
-/enabletrailingsl - Enable trailing stop loss
-/disabletrailingsl - Disable trailing stop loss
-/settrailingsl [activation] [callback] - Set trailing SL parameters
-  Example: /settrailingsl 3 1.5 - Activate at +3% profit, 1.5% callback
+<b>API Connection:</b> {await self._check_api_status()}
+<b>Database Connection:</b> {await self._check_db_status()}
 """
             
             await update.message.reply_text(
-                text=help_text,
+                text=status_message,
                 parse_mode=ParseMode.HTML,
                 reply_markup=self.markup
             )
             
         except Exception as e:
-            logger.error(f"Error sending help: {e}")
-            await update.message.reply_text("Error sending help message")
+            logger.error(f"Error checking status: {e}")
+            await update.message.reply_text("Error checking bot status.")
+            
+    async def _check_api_status(self) -> str:
+        """Check Binance API connection status"""
+        try:
+            result = await self.binance_client.check_connection()
+            return "✅ Connected" if result.get("success", False) else "❌ Disconnected"
+        except Exception:
+            return "❌ Error"
+            
+    async def _check_db_status(self) -> str:
+        """Check MongoDB connection status"""
+        try:
+            await self.mongo_client.db.command("ping")
+            return "✅ Connected"
+        except Exception:
+            return "❌ Disconnected"
+
+    async def handle_threshold_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle threshold reset selection from callback"""
+        try:
+            query = update.callback_query
+            await query.answer()
+            
+            if not self._is_authorized(query.from_user.id):
+                await query.edit_message_text(text="⛔ Unauthorized access")
+                return
+            
+            timeframe = query.data
+            if timeframe == "reset_daily":
+                await self.binance_client.reset_timeframe_thresholds("daily")
+                await query.edit_message_text(text="✅ Daily thresholds have been reset")
+            elif timeframe == "reset_weekly":
+                await self.binance_client.reset_timeframe_thresholds("weekly")
+                await query.edit_message_text(text="✅ Weekly thresholds have been reset")
+            elif timeframe == "reset_monthly":
+                await self.binance_client.reset_timeframe_thresholds("monthly")
+                await query.edit_message_text(text="✅ Monthly thresholds have been reset")
+                
+        except Exception as e:
+            logger.error(f"Error handling threshold selection: {e}")
+            if update.callback_query:
+                await update.callback_query.edit_message_text(
+                    text=f"❌ Error: {str(e)}"
+                )
+
+    # Add handler for orders command
+    async def orders_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show open orders"""
+        if not self._is_authorized(update.effective_user.id):
+            await update.message.reply_text("You're not authorized to use this bot.")
+            return
+            
+        try:
+            # Get all active orders
+            active_orders = await self.mongo_client.get_active_orders()
+            
+            if not active_orders:
+                await update.message.reply_text("No active orders found.")
+                return
+                
+            # Format the active orders
+            order_messages = []
+            for order in active_orders:
+                # Format date in a readable format
+                created_date = order.created_at.strftime("%Y-%m-%d %H:%M:%S")
+                
+                # Get basic order info
+                order_info = (
+                    f"🔹 Order: {order.symbol}\n"
+                    f"📅 Created: {created_date}\n"
+                    f"💰 Price: ${float(order.price):.8f}\n"
+                    f"🔢 Quantity: {float(order.quantity):.8f}\n"
+                    f"📊 Status: {order.status.value}\n"
+                )
+                
+                # Add TP/SL info if available
+                tp_sl_info = []
+                if order.take_profit:
+                    tp_sl_info.append(f"TP: ${float(order.take_profit.price):.8f} (+{order.take_profit.percentage:.2f}%)")
+                if order.stop_loss:
+                    tp_sl_info.append(f"SL: ${float(order.stop_loss.price):.8f} (-{order.stop_loss.percentage:.2f}%)")
+                
+                if tp_sl_info:
+                    order_info += "📈 " + " | ".join(tp_sl_info) + "\n"
+                    
+                order_messages.append(order_info)
+                
+            # Join all order messages with dividers
+            response = "📋 Active Orders:\n\n" + "\n\n".join(order_messages)
+            
+            # Send response
+            await update.message.reply_text(response)
+            
+        except Exception as e:
+            logger.error(f"Error getting orders: {e}")
+            await update.message.reply_text(f"❌ Error: {str(e)}")
+
+    # Alias for list_symbols_command
+    async def symbols_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Alias for list_symbols_command - used for command registration"""
+        return await self.list_symbols_command(update, context)
+
+    async def confirm_deposit(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle deposit confirmation messages"""
+        if not self._is_authorized(update.effective_user.id):
+            return
+            
+        # Extract info from the message
+        message_text = update.message.text
+        try:
+            # Message format: "Deposit confirmed: $100.00 - Note: Initial investment"
+            parts = message_text.split(' - Note: ', 1)
+            amount_part = parts[0].replace('Deposit confirmed: $', '').strip()
+            amount = Decimal(amount_part)
+            
+            note = parts[1] if len(parts) > 1 else None
+            
+            success = await self.mongo_client.record_deposit(
+                amount=amount,
+                notes=note
+            )
+            
+            if success:
+                await update.message.reply_text(
+                    f"✅ Deposit of ${float(amount):.2f} recorded successfully" + 
+                    (f"\nNote: {note}" if note else "")
+                )
+            else:
+                await update.message.reply_text("❌ Failed to record deposit")
+                
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error processing deposit confirmation: {str(e)}")
+            
+    async def confirm_withdrawal(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle withdrawal confirmation messages"""
+        if not self._is_authorized(update.effective_user.id):
+            return
+            
+        # Extract info from the message
+        message_text = update.message.text
+        try:
+            # Message format: "Withdrawal confirmed: $50.00 - Note: Moving to cold storage"
+            parts = message_text.split(' - Note: ', 1)
+            amount_part = parts[0].replace('Withdrawal confirmed: $', '').strip()
+            amount = Decimal(amount_part)
+            
+            note = parts[1] if len(parts) > 1 else None
+            
+            success = await self.mongo_client.record_withdrawal(
+                amount=amount,
+                notes=note
+            )
+            
+            if success:
+                await update.message.reply_text(
+                    f"✅ Withdrawal of ${float(amount):.2f} recorded successfully" + 
+                    (f"\nNote: {note}" if note else "")
+                )
+            else:
+                await update.message.reply_text("❌ Failed to record withdrawal")
+                
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error processing withdrawal confirmation: {str(e)}")
+            
+    async def handle_error(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle error messages"""
+        if not self._is_authorized(update.effective_user.id):
+            return
+            
+        # Just acknowledge the error
+        await update.message.reply_text("✅ Error acknowledged")
+
+    async def send_transactions_chart(self, callback_query: CallbackQuery):
+        """Generate and send a chart showing deposits and withdrawals over time"""
+        try:
+            # Get deposits and withdrawals data (all time)
+            transactions = await self.mongo_client.get_deposits_withdrawals(days=999999)
+            
+            if not transactions:
+                await callback_query.message.reply_text(
+                    "No transaction history available to visualize."
+                )
+                return
+                
+            # Convert to DataFrame for visualization
+            df = pd.DataFrame([
+                {
+                    'date': t['timestamp'],
+                    'amount': float(t['amount']),
+                    'type': 'Deposit' if float(t['amount']) > 0 else 'Withdrawal',
+                    'notes': t.get('notes', '')
+                }
+                for t in transactions
+            ])
+            
+            # Sort by date and convert to datetime
+            df['date'] = pd.to_datetime(df['date'])
+            df = df.sort_values('date')
+            
+            # Create cumulative sum series
+            df['cumulative'] = df['amount'].cumsum()
+            
+            # Generate the chart
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), gridspec_kw={'height_ratios': [1, 2]})
+            
+            # Top subplot: Individual transactions as bars
+            colors = df['amount'].apply(lambda x: 'green' if x > 0 else 'red')
+            ax1.bar(df['date'], df['amount'], color=colors, alpha=0.7)
+            
+            # Labels and styling for top subplot
+            ax1.set_title('Deposits and Withdrawals', fontsize=14)
+            ax1.set_ylabel('Amount ($)', fontsize=12)
+            ax1.grid(True, alpha=0.3)
+            ax1.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f'${x:,.2f}'))
+            ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+            plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45, ha='right')
+            
+            # Bottom subplot: Cumulative balance
+            ax2.plot(df['date'], df['cumulative'], 'b-', linewidth=2)
+            ax2.fill_between(df['date'], 0, df['cumulative'], alpha=0.2, color='blue')
+            
+            # Add markers for deposits and withdrawals on the cumulative chart
+            deposits = df[df['amount'] > 0]
+            withdrawals = df[df['amount'] < 0]
+            
+            if not deposits.empty:
+                ax2.scatter(deposits['date'], deposits['cumulative'], color='green', marker='^', s=80, label='Deposits')
+            
+            if not withdrawals.empty:
+                ax2.scatter(withdrawals['date'], withdrawals['cumulative'], color='red', marker='v', s=80, label='Withdrawals')
+            
+            # Labels and styling for bottom subplot
+            ax2.set_title('Cumulative Balance (Net Deposits)', fontsize=14)
+            ax2.set_ylabel('Net Deposits ($)', fontsize=12)
+            ax2.set_xlabel('Date', fontsize=12)
+            ax2.grid(True, alpha=0.3)
+            ax2.legend(loc='best')
+            ax2.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f'${x:,.2f}'))
+            ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+            plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45, ha='right')
+            
+            # Add summary text
+            latest_cum = df['cumulative'].iloc[-1] if not df.empty else 0
+            total_deposits = df[df['amount'] > 0]['amount'].sum()
+            total_withdrawals = abs(df[df['amount'] < 0]['amount'].sum())
+            
+            summary_text = (
+                f"Summary:\n"
+                f"Total Deposits: ${total_deposits:,.2f}\n"
+                f"Total Withdrawals: ${total_withdrawals:,.2f}\n"
+                f"Net Deposits: ${latest_cum:,.2f}"
+            )
+            
+            # Add text box with summary
+            props = dict(boxstyle='round', facecolor='white', alpha=0.8)
+            ax2.text(0.02, 0.97, summary_text, transform=ax2.transAxes,
+                   fontsize=10, verticalalignment='top', bbox=props)
+            
+            # Adjust layout
+            plt.tight_layout()
+            
+            # Save to buffer
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+            plt.close(fig)
+            buf.seek(0)
+            
+            # Send the image
+            await callback_query.message.reply_photo(
+                photo=buf,
+                caption="📊 *Deposits & Withdrawals Chart*\n"
+                      f"Showing all transactions with a net deposit of ${latest_cum:,.2f}",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Error generating transactions chart: {e}", exc_info=True)
+            await callback_query.message.reply_text(
+                "❌ Error generating transactions chart. Please try again later."
+            )
+
+    async def send_balance_chart(self, callback_query: CallbackQuery, days: int = 30):
+        """Generate and send a balance history chart"""
+        try:
+            # Get balance history data
+            balance_data = await self.mongo_client.get_balance_history(days=days)
+            
+            if not balance_data or len(balance_data) < 2:
+                await callback_query.message.reply_text(
+                    "Not enough balance history data available for charting."
+                )
+                return
+                
+            # Get buy orders data for chart annotations
+            buy_orders = await self.mongo_client.get_buy_orders(days=days)
+            
+            # Create chart generator
+            chart_gen = ChartGenerator()
+            
+            # Generate the chart
+            chart_bytes = await chart_gen.generate_balance_chart(
+                balance_data=balance_data,
+                btc_prices=[],  # Keep empty for backward compatibility
+                buy_orders=buy_orders
+            )
+            
+            if not chart_bytes:
+                await callback_query.message.reply_text(
+                    "Error generating chart. Please try again later."
+                )
+                return
+                
+            # Get latest balance info for caption
+            latest = balance_data[-1] if balance_data else None
+            caption = f"📊 *Balance History Chart*\n"
+            
+            if latest:
+                caption += f"Current Net Worth: ${float(latest['balance'] + latest['invested']):.2f}\n"
+                caption += f"Available: ${float(latest['balance']):.2f}, Invested: ${float(latest['invested']):.2f}"
+                
+            # Create buffer for the image
+            buf = io.BytesIO(chart_bytes)
+            buf.name = 'balance_chart.png'
+            
+            # Send the chart image
+            await callback_query.message.reply_photo(
+                photo=buf,
+                caption=caption,
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Error generating balance chart: {e}", exc_info=True)
+            await callback_query.message.reply_text(
+                "❌ Error generating balance chart. Please try again later."
+            )
+            
+    async def send_performance_chart(self, callback_query: CallbackQuery, days: int = 30):
+        """Generate and send performance chart comparing portfolio to benchmarks"""
+        try:
+            chat_id = callback_query.message.chat_id
+            
+            # Send "generating" message
+            temp_message = await callback_query.message.reply_text("📊 Generating portfolio ROI comparison...")
+            
+            await callback_query.answer()
+            
+            # Get portfolio performance data
+            await self._generate_roi_comparison(chat_id)
+            
+            # Delete the temporary message
+            await temp_message.delete()
+        except Exception as e:
+            logger.error(f"Error in performance chart callback: {e}")
+            await callback_query.answer("❌ Error generating chart")
+            await callback_query.message.reply_text(f"Error: {str(e)}")
+
+    async def show_menu_from_callback(self, callback_query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE):
+        """Show main menu in response to a callback query"""
+        try:
+            await self.show_menu(Update(callback_query.id, callback_query.message), context)
+        except Exception as e:
+            self.logger.error(f"Error showing menu from callback: {e}", exc_info=True)
+            await callback_query.message.reply_text("❌ Error showing menu. Please try /menu instead.")
+
+    async def remove_symbol(self, callback_query: CallbackQuery, symbol: str):
+        """Remove a trading symbol from the bot"""
+        try:
+            # Check if this was a pre-configured symbol
+            was_preconfigured = hasattr(self.binance_client, 'original_config_symbols') and \
+                               symbol in self.binance_client.original_config_symbols
+            
+            # Remove from database
+            success = await self.mongo_client.remove_trading_symbol(symbol)
+            
+            if success:
+                # Remove from the active config as well
+                if hasattr(self.binance_client, 'config') and 'trading' in self.binance_client.config:
+                    pairs = self.binance_client.config['trading'].get('pairs', [])
+                    if symbol in pairs:
+                        pairs.remove(symbol)
+                
+                # Cancel any pending orders for this symbol
+                canceled_orders = 0  # Placeholder, implement proper cancellation logic
+                
+                # Clear any triggered thresholds for this symbol
+                cleared_thresholds = True  # Placeholder, implement proper threshold clearing logic
+                    
+                # If it was a pre-configured symbol, add it to the removed list
+                if was_preconfigured:
+                    await self.mongo_client.add_removed_symbol(symbol)
+                    message = f"✅ Successfully removed {symbol} from the trading symbols list.\n" \
+                             f"• Canceled {canceled_orders} pending orders\n" \
+                             f"• Cleared thresholds for all timeframes\n" \
+                             f"(This pre-configured symbol will not be auto-added on restart)"
+                else:
+                    message = f"✅ Successfully removed {symbol} from the trading symbols list.\n" \
+                             f"• Canceled {canceled_orders} pending orders\n" \
+                             f"• Cleared thresholds for all timeframes"
+                
+                await callback_query.message.edit_text(message)
+            else:
+                await callback_query.message.edit_text(
+                    f"❌ Symbol {symbol} not found in the trading list."
+                )
+        except Exception as e:
+            self.logger.error(f"Error removing symbol {symbol}: {e}", exc_info=True)
+            await callback_query.message.reply_text(f"❌ Error removing symbol: {str(e)}")
+            
+    async def list_symbols(self, callback_query: CallbackQuery):
+        """List all active trading symbols with removal options"""
+        try:
+            # Get all active trading symbols
+            symbols = await self.mongo_client.get_trading_symbols()
+            
+            if not symbols:
+                await callback_query.message.edit_text(
+                    "No trading symbols configured. Use /add_symbol to add new symbols."
+                )
+                return
+                
+            # Sort the symbols
+            symbols.sort()
+            
+            # Create message text
+            message = f"📋 *Trading Symbols ({len(symbols)})*\n\n"
+            
+            # Create keyboard with removal buttons
+            keyboard = []
+            for i in range(0, len(symbols), 2):
+                row = []
+                row.append(InlineKeyboardButton(
+                    f"❌ {symbols[i]}",
+                    callback_data=f"symbol_remove_{symbols[i]}"
+                ))
+                
+                if i + 1 < len(symbols):
+                    row.append(InlineKeyboardButton(
+                        f"❌ {symbols[i+1]}",
+                        callback_data=f"symbol_remove_{symbols[i+1]}"
+                    ))
+                    
+                keyboard.append(row)
+                
+            # Add symbol name details to message
+            for symbol in symbols:
+                message += f"• {symbol}\n"
+                
+            # Add back button
+            keyboard.append([InlineKeyboardButton("➕ Add Symbol", callback_data="symbol_add")])
+            keyboard.append([InlineKeyboardButton("🔙 Back to Menu", callback_data="show_menu")])
+            
+            # Send the message
+            await callback_query.message.edit_text(
+                message,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception as e:
+            self.logger.error(f"Error listing symbols: {e}", exc_info=True)
+            await callback_query.message.reply_text(f"❌ Error listing symbols: {str(e)}")
+
+    async def deposit_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Record a deposit made to the trading account"""
+        try:
+            if not await self.is_user_authorized(update):
+                return
+                
+            # Check if amount was provided
+            if not context.args:
+                await update.message.reply_text(
+                    "⚠️ Please specify the amount to deposit.\n"
+                    "Example: /deposit 500 to record a $500 deposit."
+                )
+                return
+                
+            # Try to parse the amount
+            try:
+                amount = Decimal(context.args[0].replace(',', ''))
+            except (ValueError, InvalidOperation):
+                await update.message.reply_text(
+                    "❌ Invalid amount. Please provide a valid number."
+                )
+                return
+                
+            # Get optional notes if provided
+            notes = ' '.join(context.args[1:]) if len(context.args) > 1 else None
+            
+            # Record the deposit
+            success = await self.mongo_client.record_deposit(
+                amount=amount, 
+                notes=notes
+            )
+            
+            if success:
+                # Display confirmation with formatted amount
+                await update.message.reply_text(
+                    f"✅ Deposit of ${float(amount):,.2f} recorded successfully.\n"
+                    f"Your deposit will be reflected in the next balance report."
+                )
+                
+                # Log the deposit
+                logger.info(f"User {update.effective_user.id} recorded a deposit of ${float(amount):,.2f}")
+                
+                # Add suggestion to view balance chart
+                markup = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("View Balance Chart", callback_data="balance_chart_30")]
+                ])
+                
+                await update.message.reply_text(
+                    "Would you like to see your updated balance chart?",
+                    reply_markup=markup
+                )
+            else:
+                await update.message.reply_text(
+                    "❌ Failed to record deposit. Please try again."
+                )
+        except Exception as e:
+            logger.error(f"Error in deposit command: {e}")
+            await update.message.reply_text(f"❌ Error: {str(e)}")
+            
+    async def withdrawal_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Record a withdrawal from the trading account"""
+        try:
+            if not await self.is_user_authorized(update):
+                return
+                
+            # Check if amount was provided
+            if not context.args:
+                await update.message.reply_text(
+                    "⚠️ Please specify the amount to withdraw.\n"
+                    "Example: /withdraw 300 to record a $300 withdrawal."
+                )
+                
+                # Later in the method:
+                
+                # Display confirmation with formatted amount
+                await update.message.reply_text(
+                    f"✅ Withdrawal of ${float(amount):,.2f} recorded successfully.\n"
+                    f"Your withdrawal will be reflected in the next balance report."
+                )
+                return
+                
+            # Try to parse the amount
+            try:
+                amount = Decimal(context.args[0].replace(',', ''))
+            except (ValueError, InvalidOperation):
+                await update.message.reply_text(
+                    "❌ Invalid amount. Please provide a valid number."
+                )
+                return
+                
+            # Get optional notes if provided
+            notes = ' '.join(context.args[1:]) if len(context.args) > 1 else None
+            
+            # Record the withdrawal
+            success = await self.mongo_client.record_withdrawal(
+                amount=amount, 
+                notes=notes
+            )
+            
+            if success:
+                # Display confirmation with formatted amount
+                await update.message.reply_text(
+                    f"✅ Withdrawal of ${float(amount):,.2f} recorded successfully.\n"
+                    f"Your withdrawal will be reflected in the next balance report."
+                )
+                
+                # Log the withdrawal
+                logger.info(f"User {update.effective_user.id} recorded a withdrawal of ${float(amount):,.2f}")
+                
+                # Add suggestion to view balance chart
+                markup = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("View Balance Chart", callback_data="balance_chart_30")]
+                ])
+                
+                await update.message.reply_text(
+                    "Would you like to see your updated balance chart?",
+                    reply_markup=markup
+                )
+            else:
+                await update.message.reply_text(
+                    "❌ Failed to record withdrawal. Please try again."
+                )
+        except Exception as e:
+            logger.error(f"Error in withdrawal command: {e}")
+            await update.message.reply_text(f"❌ Error: {str(e)}")
+            
+    async def transactions_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Display recent deposits and withdrawals"""
+        try:
+            if not await self.is_user_authorized(update):
+                return
+                
+            # Parse days parameter if provided
+            days = 30
+            if context.args and context.args[0].isdigit():
+                days = int(context.args[0])
+                days = min(days, 365)  # Limit to 1 year max
+            
+            # Get transactions from the database
+            transactions = await self.mongo_client.get_deposits_withdrawals(days=days)
+            
+            if not transactions:
+                await update.message.reply_text(
+                    f"No deposits or withdrawals found in the last {days} days."
+                )
+                return
+                
+            # Calculate total deposits and withdrawals
+            total_deposit = Decimal('0')
+            total_withdrawal = Decimal('0')
+            
+            for tx in transactions:
+                if tx['amount'] > 0:
+                    total_deposit += tx['amount']
+                else:
+                    total_withdrawal += abs(tx['amount'])
+                    
+            # Format the message header
+            message = f"Transaction History (Last {days} days):\n\n"
+            message += f"Total Deposits: ${float(total_deposit):,.2f}\n"
+            message += f"Total Withdrawals: ${float(total_withdrawal):,.2f}\n"
+            message += f"Net Change: ${float(total_deposit - total_withdrawal):,.2f}\n\n"
+            
+            # Format each transaction
+            for i, tx in enumerate(transactions[:10], 1):  # Limit to first 10 transactions
+                tx_date = tx['timestamp'].strftime('%Y-%m-%d %H:%M')
+                amount = tx['amount']
+                tx_type = "Deposit" if amount > 0 else "Withdrawal"
+                notes = f" - {tx['notes']}" if tx.get('notes') else ""
+                
+                message += f"{i}. {tx_date} | {tx_type}: ${abs(float(amount)):,.2f}{notes}\n"
+                
+            # Add indicator if there are more transactions
+            if len(transactions) > 10:
+                message += f"\n...and {len(transactions) - 10} more transactions..."
+                
+            # Add button to view chart
+            markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton("View Balance Chart", callback_data="balance_chart_30")],
+                [InlineKeyboardButton("View Performance Chart", callback_data="performance_chart_30")]
+            ])
+            
+            await update.message.reply_text(
+                message,
+                reply_markup=markup
+            )
+        except Exception as e:
+            logger.error(f"Error in transactions command: {e}")
+            await update.message.reply_text(f"❌ Error: {str(e)}")
+            await update.message.reply_text(f"❌ Error: {str(e)}")

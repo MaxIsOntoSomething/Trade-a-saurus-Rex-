@@ -283,7 +283,8 @@ class ChartGenerator:
                 {
                     'timestamp': entry['timestamp'],
                     'balance': float(entry['balance']),
-                    'invested': float(entry['invested']) if entry.get('invested') is not None else 0
+                    'invested': float(entry['invested']) if entry.get('invested') is not None else 0,
+                    'net_deposits': float(entry.get('net_deposits', 0))
                 }
                 for entry in balance_data
             ])
@@ -292,19 +293,72 @@ class ChartGenerator:
             # Calculate net worth (total balance)
             balance_df['net_worth'] = balance_df['balance'] + balance_df['invested']
             
-            # Create figure
-            fig, ax = plt.subplots(figsize=(12, 8))
+            # Calculate portfolio performance excluding deposits/withdrawals effect
+            # First, get cumulative net deposits at each point
+            balance_df['cumulative_deposits'] = balance_df['net_deposits'].cumsum()
+            
+            # Create an adjusted net worth that removes deposit/withdrawal effects
+            first_net_worth = balance_df['net_worth'].iloc[0] - balance_df['cumulative_deposits'].iloc[0]
+            balance_df['adjusted_net_worth'] = balance_df['net_worth'] - balance_df['cumulative_deposits']
+            
+            # Calculate percentage change from initial adjusted worth for true performance
+            if first_net_worth > 0:
+                balance_df['true_performance'] = (balance_df['adjusted_net_worth'] / first_net_worth - 1) * 100
+            else:
+                balance_df['true_performance'] = 0
+            
+            # Create figure with subplots: balance chart and performance chart
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), gridspec_kw={'height_ratios': [3, 1]})
             
             # Format dates on x-axis
             date_formatter = mdates.DateFormatter('%Y-%m-%d')
             
-            # Plot lines
-            balance_df['invested'].plot(ax=ax, color='blue', linewidth=2, 
+            # Plot lines on main chart (ax1)
+            balance_df['invested'].plot(ax=ax1, color='blue', linewidth=2, 
                                       label='Invested Amount', alpha=0.7)
-            balance_df['balance'].plot(ax=ax, color='green', linewidth=2, 
+            balance_df['balance'].plot(ax=ax1, color='green', linewidth=2, 
                                      label='Available Balance', alpha=0.7)
-            balance_df['net_worth'].plot(ax=ax, color='purple', linewidth=2.5, 
+            balance_df['net_worth'].plot(ax=ax1, color='purple', linewidth=2.5, 
                                        label='Net Worth', linestyle='-')
+            
+            # Plot adjusted net worth as a dashed line
+            balance_df['adjusted_net_worth'].plot(ax=ax1, color='red', linewidth=2, 
+                                               label='Adj. Net Worth (excl. deposits)', 
+                                               linestyle='--', alpha=0.7)
+            
+            # Add deposit markers
+            if 'net_deposits' in balance_df.columns and any(balance_df['net_deposits'] != 0):
+                # Find points with deposits or withdrawals
+                deposit_points = balance_df[balance_df['net_deposits'] > 0]
+                withdrawal_points = balance_df[balance_df['net_deposits'] < 0]
+                
+                # Plot deposit markers
+                if not deposit_points.empty:
+                    ax1.scatter(deposit_points.index, deposit_points['net_worth'], 
+                               marker='^', color='green', s=80, label='Deposits',
+                               zorder=5, alpha=0.8)
+                    
+                    # Add deposit annotations
+                    for idx, row in deposit_points.iterrows():
+                        ax1.annotate(f"+${row['net_deposits']:.2f}", 
+                                    (idx, row['net_worth']),
+                                    xytext=(0, 15), textcoords='offset points',
+                                    ha='center', fontsize=8,
+                                    bbox=dict(boxstyle='round,pad=0.3', fc='green', alpha=0.3))
+                
+                # Plot withdrawal markers
+                if not withdrawal_points.empty:
+                    ax1.scatter(withdrawal_points.index, withdrawal_points['net_worth'], 
+                               marker='v', color='red', s=80, label='Withdrawals',
+                               zorder=5, alpha=0.8)
+                    
+                    # Add withdrawal annotations
+                    for idx, row in withdrawal_points.iterrows():
+                        ax1.annotate(f"${row['net_deposits']:.2f}", 
+                                    (idx, row['net_worth']),
+                                    xytext=(0, -15), textcoords='offset points',
+                                    ha='center', fontsize=8,
+                                    bbox=dict(boxstyle='round,pad=0.3', fc='red', alpha=0.3))
             
             # Initialize buy order variables
             buy_timestamps = []
@@ -327,42 +381,78 @@ class ChartGenerator:
             
             # Add small green dots for buy points if we have any
             if buy_timestamps:
-                ax.scatter(buy_timestamps, buy_values, color='lime', 
+                ax1.scatter(buy_timestamps, buy_values, color='lime', 
                           s=50, zorder=5, alpha=0.6, marker='o',
                           label='Buy Orders')
                 
                 # Add subtle annotations
                 for i, (x, y, label) in enumerate(zip(buy_timestamps, buy_values, annotations)):
                     if i % 2 == 0:  # Annotate every other point to reduce clutter
-                        ax.annotate(label, (x, y), xytext=(5, 5),
+                        ax1.annotate(label, (x, y), xytext=(5, 5),
                                   textcoords='offset points', fontsize=8,
                                   bbox=dict(facecolor='white', edgecolor='none', alpha=0.7),
                                   ha='left', va='bottom')
             
-            # Customize plot
-            ax.set_title('Portfolio Balance History', fontsize=14, pad=10)
-            ax.set_ylabel('Value (USDT)', fontsize=12)
-            ax.set_xlabel('Date', fontsize=12)
-            ax.grid(True, alpha=0.3)
-            ax.legend(loc='upper left', frameon=True, framealpha=0.8)
-            ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f'${x:,.2f}'))
+            # Customize first plot
+            ax1.set_title('Portfolio Balance History', fontsize=14, pad=10)
+            ax1.set_ylabel('Value ($)', fontsize=12)
+            ax1.grid(True, alpha=0.3)
+            ax1.legend(loc='upper left', frameon=True, framealpha=0.8)
+            ax1.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f'${x:,.2f}'))
             
-            # Format x-axis dates
-            ax.xaxis.set_major_formatter(date_formatter)
-            plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
+            # Format x-axis dates for first plot
+            ax1.xaxis.set_major_formatter(date_formatter)
+            plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45, ha='right')
+            
+            # Plot performance percentage on second chart (ax2)
+            if 'true_performance' in balance_df.columns:
+                balance_df['true_performance'].plot(ax=ax2, color='blue', linewidth=2, 
+                                                 label='Portfolio Performance (%)')
+                
+                # Add zero line for reference
+                ax2.axhline(y=0, color='black', linestyle='-', alpha=0.2)
+                
+                # Shade positive area green and negative area red
+                ax2.fill_between(balance_df.index, balance_df['true_performance'], 0, 
+                                where=balance_df['true_performance'] >= 0, 
+                                facecolor='green', alpha=0.3)
+                ax2.fill_between(balance_df.index, balance_df['true_performance'], 0, 
+                                where=balance_df['true_performance'] < 0, 
+                                facecolor='red', alpha=0.3)
+                
+                # Customize second plot
+                ax2.set_ylabel('Performance (%)', fontsize=12)
+                ax2.set_xlabel('Date', fontsize=12)
+                ax2.grid(True, alpha=0.3)
+                ax2.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f'{x:.1f}%'))
+                
+                # Format x-axis dates for second plot
+                ax2.xaxis.set_major_formatter(date_formatter)
+                plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45, ha='right')
             
             # Add summary box
             latest = balance_df.iloc[-1]
+            
+            # Calculate total deposits and withdrawals
+            total_deposits = balance_df[balance_df['net_deposits'] > 0]['net_deposits'].sum()
+            total_withdrawals = abs(balance_df[balance_df['net_deposits'] < 0]['net_deposits'].sum())
+            net_deposits_total = balance_df['cumulative_deposits'].iloc[-1]
+            
+            # Create summary text with deposit information
             summary_text = (
                 f"Current Status:\n"
                 f"Net Worth: ${latest['net_worth']:,.2f}\n"
                 f"Available: ${latest['balance']:,.2f}\n"
-                f"Invested: ${latest['invested']:,.2f}"
+                f"Invested: ${latest['invested']:,.2f}\n"
+                f"Total Deposits: ${total_deposits:,.2f}\n"
+                f"Total Withdrawals: ${total_withdrawals:,.2f}\n"
+                f"Net Deposits: ${net_deposits_total:,.2f}\n"
+                f"Actual Return: {latest['true_performance']:.2f}%"
             )
             
             # Add text box with summary
             props = dict(boxstyle='round', facecolor='white', alpha=0.8)
-            ax.text(0.02, 0.98, summary_text, transform=ax.transAxes,
+            ax1.text(0.02, 0.98, summary_text, transform=ax1.transAxes,
                     fontsize=9, verticalalignment='top', bbox=props)
             
             # Adjust layout
@@ -673,11 +763,41 @@ class ChartGenerator:
                 tp_price = float(order.take_profit.price)
                 tp_percentage = order.take_profit.percentage if hasattr(order.take_profit, 'percentage') else ((tp_price / float(order.price) - 1) * 100)
                 info.append(f"Take Profit: ${tp_price:.2f} (+{tp_percentage:.2f}%)")
+            
+            # Add partial take profit information if configured
+            if hasattr(order, 'partial_take_profits') and order.partial_take_profits and len(order.partial_take_profits) > 0:
+                info.append("\nPartial Take Profits:")
                 
+                for ptp in order.partial_take_profits:
+                    if hasattr(ptp, 'price') and ptp.price:
+                        ptp_price = float(ptp.price)
+                        profit_pct = ptp.profit_percentage if hasattr(ptp, 'profit_percentage') else ((ptp_price / float(order.price) - 1) * 100)
+                        position_pct = ptp.position_percentage if hasattr(ptp, 'position_percentage') else 0
+                        
+                        # Calculate exact quantity to be sold at this level
+                        quantity_sold = float(order.quantity) * (position_pct / 100)
+                        value_sold = quantity_sold * ptp_price
+                        
+                        info.append(f"• Level {ptp.level}: ${ptp_price:.4f} (+{profit_pct:.2f}%)")
+                        info.append(f"  Sell {position_pct}% of position ({quantity_sold:.8f} = ${value_sold:.2f})")
+                
+            # Add stop loss information if configured
             if order.stop_loss and hasattr(order.stop_loss, 'price') and order.stop_loss.price:
                 sl_price = float(order.stop_loss.price)
                 sl_percentage = order.stop_loss.percentage if hasattr(order.stop_loss, 'percentage') else ((1 - sl_price / float(order.price)) * 100)
                 info.append(f"Stop Loss: ${sl_price:.2f} (-{sl_percentage:.2f}%)")
+            
+            # Add trailing stop loss information if configured
+            if hasattr(order, 'trailing_stop_loss') and order.trailing_stop_loss:
+                tsl = order.trailing_stop_loss
+                if hasattr(tsl, 'activation_price') and tsl.activation_price:
+                    info.append("\nTrailing Stop Loss:")
+                    info.append(f"• Activation: +{tsl.activation_percentage:.2f}% (${float(tsl.activation_price):.4f})")
+                    info.append(f"• Callback Rate: {tsl.callback_rate:.2f}%")
+                    info.append(f"• Current Stop: ${float(tsl.current_stop_price):.4f}")
+                    
+                    if hasattr(tsl, 'activated_at') and tsl.activated_at:
+                        info.append(f"• Activated: {tsl.activated_at.strftime('%Y-%m-%d %H:%M:%S')}")
             
             if order.leverage:
                 info.append(f"Leverage: {order.leverage}x")
@@ -711,7 +831,7 @@ class ChartGenerator:
             ax.plot(dates, closes, 'b-', linewidth=2)
             
             # Add order price as horizontal line
-            ax.axhline(y=float(order.price), color='r', linestyle='--', alpha=0.8, label=f"Entry: ${float(order.price):,.2f}")
+            ax.axhline(y=float(order.price), color='b', linestyle='-', alpha=0.8, label=f"Entry: ${float(order.price):,.2f}")
             
             # Add reference price if available
             if reference_price is not None:
@@ -724,12 +844,43 @@ class ChartGenerator:
                 ax.axhline(y=tp_price, color='green', linestyle='--', alpha=0.8, 
                           label=f"TP: {tp_price:,.2f} (+{tp_percentage:.2f}%)")
             
+            # Add Partial Take Profit lines if configured
+            if hasattr(order, 'partial_take_profits') and order.partial_take_profits:
+                # Define colors for partial TPs
+                colors = ['#00FF00', '#33CC33', '#009900', '#006600']  # Green gradient
+                
+                for i, ptp in enumerate(order.partial_take_profits):
+                    if hasattr(ptp, 'price') and ptp.price:
+                        ptp_price = float(ptp.price)
+                        ptp_pct = ptp.profit_percentage
+                        position_pct = ptp.position_percentage
+                        
+                        # Use different color for each level
+                        color_idx = min(i, len(colors) - 1)
+                        
+                        ax.axhline(y=ptp_price, color=colors[color_idx], linestyle='--', alpha=0.8,
+                                  label=f"PTP {ptp.level}: {ptp_price:,.2f} (+{ptp_pct:.2f}%, {position_pct}%)")
+            
             # Add Stop Loss line if configured - Remove dollar signs
             if order.stop_loss and hasattr(order.stop_loss, 'price') and order.stop_loss.price:
                 sl_price = float(order.stop_loss.price)
                 sl_percentage = float(order.stop_loss.percentage) if hasattr(order.stop_loss, 'percentage') else ((1 - sl_price / float(order.price)) * 100)
                 ax.axhline(y=sl_price, color='red', linestyle='--', alpha=0.8, 
                           label=f"SL: {sl_price:,.2f} (-{sl_percentage:.2f}%)")
+            
+            # Add Trailing Stop Loss lines if configured
+            if hasattr(order, 'trailing_stop_loss') and order.trailing_stop_loss:
+                tsl = order.trailing_stop_loss
+                if hasattr(tsl, 'activation_price') and tsl.activation_price:
+                    # Activation line
+                    tsl_activation = float(tsl.activation_price)
+                    ax.axhline(y=tsl_activation, color='orange', linestyle=':', alpha=0.8,
+                              label=f"TSL Act: {tsl_activation:,.2f} (+{tsl.activation_percentage:.2f}%)")
+                    
+                    # Current stop line
+                    tsl_current = float(tsl.current_stop_price)
+                    ax.axhline(y=tsl_current, color='orange', linestyle='-', alpha=0.8,
+                              label=f"TSL: {tsl_current:,.2f}")
             
             # Format x-axis to show clean dates
             ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
@@ -783,6 +934,31 @@ class ChartGenerator:
                 ax.text(0.02, tp_price, f"TP: {tp_price:.2f} (+{tp_pct:.2f}%)", transform=ax.get_yaxis_transform(),
                        va='center', ha='left', fontsize=9, backgroundcolor='white', alpha=0.7)
             
+            # Add partial take profit lines if configured
+            if hasattr(order, 'partial_take_profits') and order.partial_take_profits:
+                # Define gradient colors for partial TPs
+                colors = ['#00FF00', '#33CC33', '#009900', '#006600']  # Green gradient
+                
+                for i, ptp in enumerate(order.partial_take_profits):
+                    if hasattr(ptp, 'price') and ptp.price:
+                        ptp_price = float(ptp.price)
+                        ptp_pct = ptp.profit_percentage
+                        position_pct = ptp.position_percentage
+                        
+                        # Use different color for each level with consistent pattern
+                        color_idx = min(i, len(colors) - 1)
+                        
+                        # Add dashed line with custom pattern for each level
+                        ax.axhline(y=ptp_price, color=colors[color_idx], linestyle='--', 
+                                   linewidth=1, alpha=0.7, dashes=(2, 1 + i))
+                        
+                        # Add text label for each partial TP level
+                        ax.text(0.02, ptp_price, 
+                               f"PTP {ptp.level}: {ptp_price:.2f} (+{ptp_pct:.2f}%, {position_pct}%)", 
+                               transform=ax.get_yaxis_transform(),
+                               va='center', ha='left', fontsize=9, 
+                               backgroundcolor='white', alpha=0.7, color=colors[color_idx])
+            
             # Add stop loss line if configured
             if order.stop_loss:
                 sl_price = float(order.stop_loss.price)
@@ -791,6 +967,29 @@ class ChartGenerator:
                 # Format the text without $ symbol inside the text method
                 ax.text(0.02, sl_price, f"SL: {sl_price:.2f} (-{sl_pct:.2f}%)", transform=ax.get_yaxis_transform(),
                        va='center', ha='left', fontsize=9, backgroundcolor='white', alpha=0.7)
+            
+            # Add trailing stop loss activation line if configured
+            if hasattr(order, 'trailing_stop_loss') and order.trailing_stop_loss:
+                tsl = order.trailing_stop_loss
+                if hasattr(tsl, 'activation_price') and tsl.activation_price:
+                    tsl_activation = float(tsl.activation_price)
+                    tsl_current = float(tsl.current_stop_price)
+                    
+                    # Add activation line (dotted orange)
+                    ax.axhline(y=tsl_activation, color='orange', linestyle=':', linewidth=1, alpha=0.7)
+                    ax.text(0.02, tsl_activation, 
+                           f"TSL Act: {tsl_activation:.2f} (+{tsl.activation_percentage:.2f}%)", 
+                           transform=ax.get_yaxis_transform(),
+                           va='center', ha='left', fontsize=9, 
+                           backgroundcolor='white', alpha=0.7)
+                    
+                    # Add current stop price (solid orange)
+                    ax.axhline(y=tsl_current, color='orange', linestyle='-', linewidth=1, alpha=0.7)
+                    ax.text(0.02, tsl_current, 
+                           f"TSL: {tsl_current:.2f}", 
+                           transform=ax.get_yaxis_transform(),
+                           va='center', ha='left', fontsize=9, 
+                           backgroundcolor='white', alpha=0.7)
             
             return True
         except Exception as e:

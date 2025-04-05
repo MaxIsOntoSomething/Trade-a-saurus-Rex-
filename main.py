@@ -238,7 +238,7 @@ async def load_and_merge_config() -> dict:
         # Initialize MongoDB client early to check for stored config
         mongo_client = MongoClient(
             uri=config['mongodb']['uri'],
-            database=config['mongodb']['database'],
+            database_name=config['mongodb']['database'],
             driver=config['mongodb'].get('driver', 'motor')
         )
         
@@ -308,6 +308,15 @@ async def check_initial_connection(binance_client: BinanceClient, config: dict) 
             logger.error("❌ No valid trading pairs found. Check your configuration.")
             return False
             
+        # Save valid pairs to database for persistence
+        if binance_client.mongo_client:
+            # Check if any trading symbols exist in database
+            existing_symbols = await binance_client.mongo_client.get_trading_symbols()
+            if not existing_symbols:
+                logger.info(f"No trading symbols in database, saving {len(valid_pairs)} validated pairs")
+                for symbol in valid_pairs:
+                    await binance_client.mongo_client.save_trading_symbol(symbol)
+            
         logger.info(f"✅ Found {len(valid_pairs)} valid trading pairs: {', '.join(valid_pairs)}")
         logger.info("=" * 50)
         return True
@@ -325,7 +334,7 @@ async def initialize_services(config):
         # Create MongoDB client with driver choice
         mongo_client = MongoClient(
             uri=config['mongodb']['uri'],
-            database=config['mongodb']['database'],
+            database_name=config['mongodb']['database'],
             driver=config['mongodb'].get('driver', 'motor')  # Pass the driver
         )
         

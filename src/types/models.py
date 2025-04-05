@@ -17,6 +17,8 @@ class OrderStatus(Enum):
 class OrderType(Enum):
     SPOT = "spot"
     FUTURES = "futures"
+    LIMIT = "limit"
+    MARKET = "market"
 
 class TradeDirection(Enum):
     LONG = "long"

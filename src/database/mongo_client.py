@@ -3,6 +3,9 @@ import asyncio
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Dict, List, Optional, Union, Any
+import os
+import uuid
+from dotenv import load_dotenv
 
 # Import drivers
 import motor.motor_asyncio
@@ -19,46 +22,44 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 class MongoClient:
-    def __init__(self, uri: str, database: str, driver: str = "motor"):
-        """
-        Initialize MongoDB client with support for Motor, PyMongo async, or PyMongo sync
+    def __init__(self, uri=None, database_name=None, env_file='.env', driver=None):
+        """Initialize MongoDB client"""
+        # Load environment variables
+        load_dotenv(env_file)
         
-        Args:
-            uri: MongoDB connection string
-            database: Database name
-            driver: 'motor' for Motor async, 'pymongo_async' for PyMongo async, or 'pymongo' for PyMongo sync
-        """
-        self.uri = uri
-        self.db_name = database
-        self.driver = self._validate_driver(driver)
-        self.is_async = self.driver in ["motor", "pymongo_async"]
+        # Override with passed parameters if provided
+        self.connection_string = uri or os.getenv('MONGODB_URI', 'mongodb://localhost:27017')
+        self.database_name = database_name or os.getenv('MONGODB_DATABASE', 'tradeasaurus')
         
-        logger.info(f"Initializing MongoDB client with {self.driver} driver")
+        # Validate and set driver type
+        self.driver = self._validate_driver(driver or os.getenv('MONGODB_DRIVER', 'motor'))
         
+        self.client = None
+        self.db = None
+        self.trading_pairs = None
+        self.settings = None
+        self.thresholds = None
+        self.orders = None
+        self.balance_history = None
+        self.reference_prices = None  
+        self.trading_symbols = None
+        self.deposits_withdrawals = None  # Collection for deposits and withdrawals
+        
+        if not self.connection_string:
+            raise ValueError("MongoDB connection string not provided")
+            
+        self.connect()
+    
+    def connect(self):
+        """Connect to MongoDB"""
         try:
-            # Handle replica set options for better read performance
-            if "replicaSet=" in uri and "readPreference=" not in uri:
-                if "?" in uri:
-                    uri += "&readPreference=primaryPreferred"
-                else:
-                    uri += "?readPreference=primaryPreferred"
-                    
-            # Initialize the appropriate client based on driver selection
-            if self.driver == "motor":
-                # Motor for async operations
-                self.client = motor.motor_asyncio.AsyncIOMotorClient(uri)
-                self.db = self.client[database]
-            elif self.driver == "pymongo_async":
-                # PyMongo async
-                self.client = pymongo.MongoClient(uri, asyncio=True)
-                self.db = self.client[database]
-            else:
-                # PyMongo sync
-                self.client = pymongo.MongoClient(uri)
-                self.db = self.client[database]
+            self.client = motor.motor_asyncio.AsyncIOMotorClient(self.connection_string)
+            self.db = self.client[self.database_name]
+            self.orders = self.db.orders
+            self.orders_collection = self.db.orders  # Add this alias
+            logger.info(f"MongoClient initialized with Motor driver for {self.database_name}")
             
             # Initialize collections
-            self.orders = self.db.orders
             self.threshold_state = self.db.threshold_state
             self.triggered_thresholds = self.db.triggered_thresholds
             self.balance_history = self.db.balance_history
@@ -67,8 +68,9 @@ class MongoClient:
             self.trading_symbols = self.db.trading_symbols
             self.removed_symbols = self.db.removed_symbols
             self.trading_config = self.db.trading_config  # New collection for trading config
+            self.deposits_withdrawals = self.db.deposits_withdrawals  # Add deposits_withdrawals collection
             
-            logger.info(f"Successfully connected to MongoDB ({self.driver}) at {uri}")
+            logger.info(f"Successfully connected to MongoDB at {self.connection_string}")
             
         except Exception as e:
             logger.error(f"Failed to connect to MongoDB: {e}")
@@ -84,43 +86,37 @@ class MongoClient:
         return driver
 
     async def init_indexes(self):
-        """Create indexes for MongoDB collections"""
-        try:
-            logger.info(f"Creating indexes using {self.driver} driver...")
-            # Create indexes with the appropriate driver method
-            if self.is_async:
-                # Async index creation for Motor
-                await self.orders.create_index([("order_id", 1)], unique=True)
-                await self.orders.create_index([("symbol", 1), ("status", 1)])
-                await self.orders.create_index([("created_at", 1)])
-                
-                await self.threshold_state.create_index([("symbol", 1), ("timeframe", 1)], unique=True)
-                await self.triggered_thresholds.create_index([("symbol", 1), ("timeframe", 1)])
-                await self.balance_history.create_index([("timestamp", -1)])
-                await self.reference_prices.create_index([("symbol", 1)], unique=True)
-                await self.invalid_symbols.create_index([("symbol", 1)], unique=True)
-                await self.trading_symbols.create_index([("symbol", 1)], unique=True)
-                await self.removed_symbols.create_index([("symbol", 1)], unique=True)
-                await self.trading_config.create_index([("key", 1)], unique=True)  # New index for config
-            else:
-                # Sync index creation for PyMongo
-                self.orders.create_index([("order_id", 1)], unique=True)
-                self.orders.create_index([("symbol", 1), ("status", 1)])
-                self.orders.create_index([("created_at", 1)])
-                
-                self.threshold_state.create_index([("symbol", 1), ("timeframe", 1)], unique=True)
-                self.triggered_thresholds.create_index([("symbol", 1), ("timeframe", 1)])
-                self.balance_history.create_index([("timestamp", -1)])
-                self.reference_prices.create_index([("symbol", 1)], unique=True)
-                self.invalid_symbols.create_index([("symbol", 1)], unique=True)
-                self.trading_symbols.create_index([("symbol", 1)], unique=True)
-                self.removed_symbols.create_index([("symbol", 1)], unique=True)
-                self.trading_config.create_index([("key", 1)], unique=True)  # New index for config
-            
-            logger.info("MongoDB indexes created successfully")
-        except Exception as e:
-            logger.error(f"Failed to create MongoDB indexes: {e}")
-            raise
+        """Create indexes for collections"""
+        # Create indexes for trading_symbols collection
+        self.trading_symbols.create_index([("symbol", pymongo.ASCENDING)], unique=True)
+        
+        # Create indexes for orders collection
+        self.orders.create_index([("order_id", pymongo.ASCENDING)], unique=True)
+        self.orders.create_index([("symbol", pymongo.ASCENDING)])
+        self.orders.create_index([("side", pymongo.ASCENDING)])
+        self.orders.create_index([("status", pymongo.ASCENDING)])
+        self.orders.create_index([("created_at", pymongo.DESCENDING)])
+        
+        # Create indexes for balance_history collection
+        self.balance_history.create_index([("timestamp", pymongo.DESCENDING)])
+        
+        # Create indexes for threshold_state collection
+        self.threshold_state.create_index([
+            ("symbol", pymongo.ASCENDING),
+            ("timeframe", pymongo.ASCENDING),
+            ("type", pymongo.ASCENDING)
+        ])
+        
+        # Create indexes for reference_prices collection
+        self.reference_prices.create_index([("symbol", pymongo.ASCENDING)], unique=True)
+        
+        # Create indexes for deposits_withdrawals collection
+        self.deposits_withdrawals.create_index([("timestamp", pymongo.DESCENDING)])
+        self.deposits_withdrawals.create_index([("transaction_id", pymongo.ASCENDING)], unique=True)
+        self.deposits_withdrawals.create_index([("transaction_type", pymongo.ASCENDING)])
+        
+        logger.info("MongoDB indexes initialized successfully")
+        return True
 
     def _validate_order_data(self, order: Order) -> bool:
         """Validate order data before insertion"""
@@ -671,27 +667,26 @@ class MongoClient:
             logger.error(f"Error getting visualization data: {e}")
             return []
 
-    async def record_balance(self, timestamp: datetime, balance: Decimal, invested: Decimal = None, fees: Decimal = None):
-        """
-        Record balance snapshot for historical tracking
+    async def record_balance(self, timestamp=None, balance=None, invested=None, fees=None):
+        """Record balance snapshot for historical tracking"""
+        timestamp = timestamp or datetime.now()
         
-        Args:
-            timestamp: The datetime of the snapshot
-            balance: The current balance in base currency
-            invested: The total amount invested in base currency
-            fees: The total fees paid in base currency
-        """
+        # Get net deposits since the last snapshot
+        net_deposits = await self._get_net_deposits_since_last_snapshot(timestamp)
+        
+        document = {
+            "timestamp": timestamp,
+            "balance": str(balance) if balance is not None else "0",
+            "invested": str(invested) if invested is not None else "0",
+            "fees": str(fees) if fees is not None else "0",
+            "net_deposits": str(net_deposits) if net_deposits is not None else "0"
+        }
+
         try:
-            await self.balance_history.insert_one({
-                "timestamp": timestamp,
-                "balance": str(balance),
-                "invested": str(invested) if invested is not None else None,
-                "fees": str(fees) if fees is not None else None,
-                "created_at": datetime.utcnow()
-            })
+            await self.balance_history.insert_one(document)
             return True
         except Exception as e:
-            logger.error(f"Failed to record balance: {e}")
+            logger.error(f"Error recording balance: {e}")
             return False
 
     async def get_balance_history(self, days: int = 30) -> List[Dict]:
@@ -709,7 +704,8 @@ class MongoClient:
                     "timestamp": doc["timestamp"],
                     "balance": Decimal(doc["balance"]),
                     "invested": Decimal(doc["invested"]) if doc.get("invested") else None,
-                    "fees": Decimal(doc["fees"]) if doc.get("fees") else Decimal('0')
+                    "fees": Decimal(doc["fees"]) if doc.get("fees") else Decimal('0'),
+                    "net_deposits": Decimal(doc.get("net_deposits", "0"))
                 })
                 
             return result
@@ -1281,8 +1277,8 @@ class MongoClient:
                 }
             }
             
-            if self.is_async:
-                # Async update for Motor
+            if self.driver in ["motor", "pymongo_async"]:
+                # Async update for Motor or PyMongo async
                 result = await self.trading_symbols.update_one(
                     {"symbol": symbol},
                     update_data,
@@ -1306,8 +1302,8 @@ class MongoClient:
     async def remove_trading_symbol(self, symbol: str) -> bool:
         """Remove a trading symbol by marking it as inactive"""
         try:
-            if self.is_async:
-                # Async update for Motor
+            if self.driver in ["motor", "pymongo_async"]:
+                # Async update for Motor or PyMongo async
                 result = await self.trading_symbols.update_one(
                     {"symbol": symbol},
                     {"$set": {"active": False, "updated_at": datetime.utcnow()}}
@@ -1378,7 +1374,7 @@ class MongoClient:
     async def _execute_find(self, collection, query: dict, **kwargs):
         """Execute find operation with proper driver handling"""
         try:
-            if self.is_async:
+            if self.driver in ["motor", "pymongo_async"]:
                 cursor = collection.find(query, **kwargs)
                 return await cursor.to_list(None)
             else:
@@ -1390,7 +1386,7 @@ class MongoClient:
     async def _execute_aggregate(self, collection, pipeline: list, **kwargs):
         """Execute aggregation with proper driver handling"""
         try:
-            if self.is_async:
+            if self.driver in ["motor", "pymongo_async"]:
                 cursor = collection.aggregate(pipeline, **kwargs)
                 return await cursor.to_list(None)
             else:
@@ -1402,7 +1398,7 @@ class MongoClient:
     async def _execute_update_one(self, collection, filter_dict: dict, update_dict: dict, **kwargs):
         """Execute update_one with proper driver handling"""
         try:
-            if self.is_async:
+            if self.driver in ["motor", "pymongo_async"]:
                 result = await collection.update_one(filter_dict, update_dict, **kwargs)
             else:
                 result = collection.update_one(filter_dict, update_dict, **kwargs)
@@ -1446,6 +1442,19 @@ class MongoClient:
                     update_data,
                     upsert=True
                 )
+            
+            # Handle trading pairs - save to trading_symbols collection
+            if 'pairs' in trading_config and trading_config['pairs']:
+                # Check if trading_symbols collection is empty
+                symbols_count = await self.trading_symbols.count_documents({})
+                
+                # Only import from config if no symbols exist in the database yet
+                if symbols_count == 0:
+                    logger.info(f"No trading symbols found in database, importing {len(trading_config['pairs'])} symbols from config")
+                    for symbol in trading_config['pairs']:
+                        await self.save_trading_symbol(symbol)
+                else:
+                    logger.info(f"Trading symbols already exist in database, skipping import from config")
                 
             logger.info(f"Saved trading configuration to database")
             return True
@@ -1517,3 +1526,112 @@ class MongoClient:
         except Exception as e:
             logger.error(f"Error retrieving active orders: {e}")
             return []
+
+    async def record_deposit(self, amount, timestamp=None, transaction_id=None, notes=None):
+        """Record a deposit to the account"""
+        if not amount or amount <= 0:
+            logger.error("Invalid deposit amount")
+            return False
+            
+        timestamp = timestamp or datetime.now()
+        transaction_id = transaction_id or str(uuid.uuid4())
+        
+        document = {
+            "timestamp": timestamp,
+            "transaction_id": transaction_id,
+            "transaction_type": "deposit",
+            "amount": str(amount),
+            "notes": notes
+        }
+        
+        try:
+            await self.deposits_withdrawals.insert_one(document)
+            logger.info(f"Deposit of {amount} recorded with ID {transaction_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Error recording deposit: {e}")
+            return False
+            
+    async def record_withdrawal(self, amount, timestamp=None, transaction_id=None, notes=None):
+        """Record a withdrawal from the account (stored as negative amount)"""
+        if not amount or amount <= 0:
+            logger.error("Invalid withdrawal amount")
+            return False
+            
+        timestamp = timestamp or datetime.now()
+        transaction_id = transaction_id or str(uuid.uuid4())
+        
+        # Store withdrawal as negative amount
+        document = {
+            "timestamp": timestamp,
+            "transaction_id": transaction_id,
+            "transaction_type": "withdrawal",
+            "amount": str(-amount),  # Negative value for withdrawals
+            "notes": notes
+        }
+        
+        try:
+            await self.deposits_withdrawals.insert_one(document)
+            logger.info(f"Withdrawal of {amount} recorded with ID {transaction_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Error recording withdrawal: {e}")
+            return False
+            
+    async def get_deposits_withdrawals(self, days=30):
+        """Get all deposits and withdrawals for a specified number of days"""
+        cutoff_date = datetime.now() - timedelta(days=days)
+        
+        try:
+            cursor = self.deposits_withdrawals.find(
+                {"timestamp": {"$gte": cutoff_date}}
+            ).sort("timestamp", pymongo.DESCENDING)
+            
+            transactions = []
+            async for doc in cursor:
+                # Convert string amounts to Decimal
+                doc["amount"] = Decimal(doc["amount"])
+                transactions.append(doc)
+                
+            return transactions
+        except Exception as e:
+            logger.error(f"Error getting deposits/withdrawals: {e}")
+            return []
+            
+    async def get_net_deposits(self, days=30):
+        """Calculate net deposits over a specified period"""
+        transactions = await self.get_deposits_withdrawals(days)
+        
+        if not transactions:
+            return Decimal("0")
+            
+        # Sum all transaction amounts (withdrawals are already stored as negative)
+        net_deposits = sum(t["amount"] for t in transactions)
+        return net_deposits
+        
+    async def _get_net_deposits_since_last_snapshot(self, current_timestamp):
+        """Calculate net deposits since the last balance snapshot"""
+        # Get timestamp of last balance record
+        last_record = await self.balance_history.find_one(
+            {"timestamp": {"$lt": current_timestamp}},
+            sort=[("timestamp", pymongo.DESCENDING)]
+        )
+        
+        if not last_record:
+            # If no previous record, get all deposits/withdrawals
+            return await self.get_net_deposits(days=36500)  # ~100 years
+            
+        # Get deposits/withdrawals since last record
+        try:
+            cursor = self.deposits_withdrawals.find(
+                {"timestamp": {"$gt": last_record["timestamp"], "$lte": current_timestamp}}
+            )
+            
+            net_deposits = Decimal("0")
+            async for doc in cursor:
+                net_deposits += Decimal(doc["amount"])
+                
+            return net_deposits
+        except Exception as e:
+            logger.error(f"Error calculating net deposits: {e}")
+            return Decimal("0")

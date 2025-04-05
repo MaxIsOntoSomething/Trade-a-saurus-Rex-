@@ -181,68 +181,65 @@ class BinanceClient:
             return False
 
     async def initialize(self):
-        """Initialize the Binance client with config and database state"""
+        """Initialize the Binance client"""
         try:
-            # Initialize client and load configuration
             self.client = AsyncClient(self.api_key, self.api_secret, testnet=self.testnet)
             
-            # Get trading symbols from database first if available
+            # Set a longer recvWindow to prevent timestamp issues
+            self.client.recv_window = 60000  # 60 seconds instead of default 5 seconds
+            
+            # Initialize rate limiter
+            self.rate_limiter = RateLimiter()
+            
+            # Get exchange information
+            await self.rate_limiter.acquire()
+            self.exchange_info = await self.client.get_exchange_info()
+            
+            # Initialize symbol info
+            for symbol_info in self.exchange_info['symbols']:
+                self.symbol_info[symbol_info['symbol']] = symbol_info
+                
+            # Get trading symbols to use
+            trading_symbols = []
+            
+            # First try to get trading symbols from database
             if self.mongo_client:
-                self.invalid_symbols = set()
-                
-                # Get invalid symbols from database first
-                invalid_symbol_docs = await self.mongo_client.invalid_symbols.find({}).to_list(None)
-                if invalid_symbol_docs:
-                    for doc in invalid_symbol_docs:
-                        self.invalid_symbols.add(doc['symbol'])
-                        
-                # Get trading symbols from database
-                self.trading_symbols = await self.mongo_client.get_trading_symbols()
-                
-                # Get removed symbols list
-                self.removed_symbols = await self.mongo_client.get_removed_symbols()
-                
-                # Store original config symbols for later reference
-                self.original_config_symbols = self.config['trading']['pairs'].copy()
-                
-                # Update the configuration with stored symbols
-                if self.trading_symbols:
-                    # Add database symbols to config, ensuring no duplicates
-                    for symbol in self.trading_symbols:
-                        if symbol not in self.config['trading']['pairs'] and symbol not in self.removed_symbols:
-                            self.config['trading']['pairs'].append(symbol)
-                            
-                    # Remove any symbols that were explicitly removed
-                    if self.removed_symbols:
-                        self.config['trading']['pairs'] = [
-                            symbol for symbol in self.config['trading']['pairs'] 
-                            if symbol not in self.removed_symbols
-                        ]
-                            
-                # Add any new symbols from config to database if they don't exist yet
-                for symbol in self.original_config_symbols:
-                    if (symbol not in self.trading_symbols and 
-                        symbol not in self.invalid_symbols and
-                        symbol not in self.removed_symbols):
+                db_symbols = await self.mongo_client.get_trading_symbols()
+                if db_symbols:
+                    logger.info(f"Retrieved {len(db_symbols)} trading symbols from database")
+                    trading_symbols = db_symbols
+                elif self.config and 'trading' in self.config and 'pairs' in self.config['trading']:
+                    # If no symbols in database, use the ones from config 
+                    logger.info(f"No trading symbols in database, using {len(self.config['trading']['pairs'])} symbols from config")
+                    trading_symbols = self.config['trading']['pairs']
+                    # Save to database for future use
+                    for symbol in trading_symbols:
                         await self.mongo_client.save_trading_symbol(symbol)
+            elif self.config and 'trading' in self.config and 'pairs' in self.config['trading']: 
+                # If no mongo client, just use config
+                logger.info(f"Using {len(self.config['trading']['pairs'])} symbols from config (no database)")
+                trading_symbols = self.config['trading']['pairs']
                 
-                # Reload trading symbols to ensure everything is in sync
-                self.trading_symbols = await self.mongo_client.get_trading_symbols()
+            if trading_symbols:
+                # Filter out invalid symbols
+                valid_symbols = await self.filter_valid_symbols(trading_symbols)
+                if valid_symbols:
+                    self.valid_symbols = set(valid_symbols)
+                    logger.info(f"Using {len(self.valid_symbols)} valid trading symbols")
+                else:
+                    logger.warning("No valid trading symbols found!")
+            else:
+                logger.warning("No trading symbols configured!")
             
-            # Cache symbol information for lot size and precision
-            try:
-                exchange_info = await self.client.get_exchange_info()
-                self.symbol_info = {}
-                for symbol_data in exchange_info['symbols']:
-                    self.symbol_info[symbol_data['symbol']] = symbol_data
-                logger.info(f"Cached information for {len(self.symbol_info)} symbols")
-            except Exception as e:
-                logger.error(f"Failed to cache symbol information: {e}")
+            # Set up initial trading state
+            await self.restore_threshold_state()
             
-            # Rest of the method remains the same...
-
+            # Return success
+            logger.info("Binance client initialized successfully")
+            return True
         except Exception as e:
             logger.error(f"Error initializing Binance client: {e}")
+            return False
 
     async def restore_threshold_state(self):
         """Restore the state of triggered thresholds with skip for removed symbols"""
@@ -680,37 +677,51 @@ class BinanceClient:
             return {}
 
     async def check_reserve_balance(self, order_amount: float) -> bool:
-        """Check if placing an order would violate reserve balance"""
+        """Check if we have enough reserve balance for a new order"""
         try:
-            logger.info("[RESERVE CHECK] Starting reserve balance check...")
-            
-            if self.reserve_balance is None or self.reserve_balance <= 0:
-                logger.info(f"[RESERVE CHECK] No valid reserve balance set (value: {self.reserve_balance})")
-                return True
-
-            # Get current balance in base currency
+            # Get current balance
             current_balance = await self.get_balance(self.base_currency)
-            logger.info(f"[RESERVE CHECK] Current balance: ${float(current_balance):,.2f} {self.base_currency}")
-            logger.info(f"[RESERVE CHECK] Reserve balance: ${float(self.reserve_balance):,.2f} {self.base_currency}")
             
-            # Get sum of pending orders
-            pending_orders_value = Decimal('0')
-            if self.telegram_bot and self.telegram_bot.mongo_client:
-                cursor = self.telegram_bot.mongo_client.orders.find({"status": "pending"})
-                async for order in cursor:
-                    pending_orders_value += (Decimal(str(order['price'])) * Decimal(str(order['quantity'])))
-
-            # Calculate remaining balance after pending orders
-            available_balance = float(current_balance - pending_orders_value)
-            remaining_after_order = available_balance - order_amount
-
-            logger.info(f"[RESERVE CHECK] Available after pending: ${available_balance:.2f} {self.base_currency}")
-            logger.info(f"[RESERVE CHECK] Remaining after order: ${remaining_after_order:.2f} {self.base_currency}")
-            logger.info(f"[RESERVE CHECK] Required reserve: ${float(self.reserve_balance):,.2f} {self.base_currency}")
-
-            # Check if remaining balance would be above reserve
-            return remaining_after_order >= self.reserve_balance
-
+            # Calculate pending order value
+            await self.rate_limiter.acquire()
+            # Use extended recvWindow to prevent timestamp issues
+            open_orders = await self.client.get_open_orders(recvWindow=60000)
+            
+            # Sum up the value of open orders
+            pending_value = Decimal('0')
+            for order in open_orders:
+                if order['symbol'].endswith(self.base_currency):
+                    # For buy orders, add price * quantity to pending
+                    if order['side'] == 'BUY':
+                        price = Decimal(order['price'])
+                        quantity = Decimal(order['origQty'])
+                        pending_value += price * quantity
+            
+            # Calculate free balance
+            free_balance = current_balance - pending_value - Decimal(str(self.reserve_balance))
+            
+            # Check if we have enough remaining balance for the order
+            has_sufficient = free_balance >= Decimal(str(order_amount))
+            
+            # Log balance details for debugging
+            logger.info(f"[RESERVE CHECK] Current Balance: ${float(current_balance):.2f}, "
+                         f"Pending: ${float(pending_value):.2f}, "
+                         f"Reserve: ${self.reserve_balance:.2f}, "
+                         f"Free: ${float(free_balance):.2f}, "
+                         f"Order: ${order_amount:.2f}, "
+                         f"Sufficient: {has_sufficient}")
+            
+            # If balance is insufficient, send alert to telegram bot
+            if not has_sufficient and self.telegram_bot:
+                await self.telegram_bot.send_reserve_alert(
+                    current_balance, self.reserve_balance, pending_value
+                )
+                
+            return has_sufficient
+            
+        except BinanceAPIException as e:
+            logger.error(f"[RESERVE CHECK] Error checking reserve balance: {e}")
+            return False
         except Exception as e:
             logger.error(f"[RESERVE CHECK] Error checking reserve balance: {e}")
             return False
@@ -791,6 +802,12 @@ class BinanceClient:
                 ticker = await self.client.get_symbol_ticker(symbol=symbol)
                 price = Decimal(ticker['price'])
                 
+                # Align price with exchange tick size requirements
+                aligned_price = self._align_price_to_tick(symbol, price)
+                if aligned_price != price:
+                    logger.info(f"Aligned price for {symbol} from {price} to {aligned_price} to match exchange requirements")
+                    price = aligned_price
+                
                 # Check if this would raise the average entry price when only_lower_entries is enabled
                 if not is_manual and self.config and 'trading' in self.config and self.config['trading'].get('only_lower_entries', False):
                     # Get existing position average entry price from MongoDB
@@ -853,7 +870,7 @@ class BinanceClient:
                         type='LIMIT',
                         timeInForce='GTC',
                         quantity=float(quantity),
-                        price=float(price)
+                        price=float(price)  # Using the aligned price here
                     )
                     order_id = str(order_response['orderId'])
                 
@@ -913,33 +930,53 @@ class BinanceClient:
     async def check_order_status(self, symbol: str, order_id: str) -> Optional[OrderStatus]:
         """Check the status of an order"""
         try:
-            order = await self.client.get_order(symbol=symbol, orderId=order_id)
+            await self.rate_limiter.acquire()
+            order = await self.client.get_order(symbol=symbol, orderId=order_id, recvWindow=60000)
+            
             if order['status'] == 'FILLED':
                 return OrderStatus.FILLED
-            elif order['status'] == 'CANCELED':
+            elif order['status'] == 'CANCELED' or order['status'] == 'REJECTED' or order['status'] == 'EXPIRED':
                 return OrderStatus.CANCELLED
-            return OrderStatus.PENDING
-        except BinanceAPIException as e:
-            logger.error(f"Failed to check order status: {e}")
-            return None
-            
-    async def get_balance(self, symbol: str = None) -> Decimal:
-        """Get balance for a specific asset"""
-        await self.rate_limiter.acquire()
-        try:
-            # Use the instance base_currency if no symbol is provided
-            if symbol is None:
-                symbol = self.base_currency or 'USDT'
+            else:
+                return OrderStatus.PENDING
                 
-            account = await self.client.get_account()
+        except BinanceAPIException as e:
+            logger.error(f"Error checking order status for {symbol} {order_id}: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Error checking order status: {e}")
+            return None
+
+    async def get_balance(self, symbol: str = None) -> Decimal:
+        """Get current balance for a symbol"""
+        try:
+            await self.rate_limiter.acquire()
+            
+            # Use extended recvWindow to prevent timestamp issues
+            account = await self.client.get_account(recvWindow=60000)
+            
+            # Get specified symbol balance or default to base currency
+            if not symbol:
+                symbol = self.base_currency
+                
             for balance in account['balances']:
-                if (balance['asset'] == symbol):
-                    return Decimal(balance['free'])
+                if balance['asset'] == symbol:
+                    free_balance = Decimal(balance['free'])
+                    locked_balance = Decimal(balance['locked'])
+                    total = free_balance + locked_balance
+                    logger.info(f"Current {symbol} balance: {total} (Free: {free_balance}, Locked: {locked_balance})")
+                    return total
+                    
+            logger.warning(f"No balance found for {symbol}")
             return Decimal('0')
+            
         except BinanceAPIException as e:
             logger.error(f"Failed to get balance: {e}")
-            raise
-            
+            return Decimal('0')
+        except Exception as e:
+            logger.error(f"Error retrieving balance: {e}")
+            return Decimal('0')
+
     async def get_balance_changes(self, symbol: str = 'USDT') -> Optional[Decimal]:
         """Get balance changes since last check"""
         current_balance = await self.get_balance(symbol)
@@ -1163,6 +1200,51 @@ class BinanceClient:
         except Exception as e:
             logger.error(f"Error getting price precision for {symbol}: {e}")
             return 8  # Default safe value
+
+    def _get_tick_size(self, symbol: str) -> Decimal:
+        """Get the minimum price increment (tick size) for a symbol"""
+        try:
+            if symbol in self.symbol_info:
+                for filter_data in self.symbol_info[symbol]['filters']:
+                    if filter_data['filterType'] == 'PRICE_FILTER':
+                        return Decimal(filter_data['tickSize'])
+            return Decimal('0.00000001')  # Default tick size if not available
+        except Exception as e:
+            logger.error(f"Error getting tick size for {symbol}: {e}")
+            return Decimal('0.00000001')  # Default safe value
+
+    def _align_price_to_tick(self, symbol: str, price: Decimal) -> Decimal:
+        """Align a price to the symbol's tick size requirements
+        
+        This is crucial for order placement as Binance will reject prices 
+        that don't align with the symbol's tick size.
+        """
+        try:
+            tick_size = self._get_tick_size(symbol)
+            if tick_size == Decimal('0'):
+                return price  # No alignment needed
+                
+            # Calculate precision from tick size
+            # For example, tick_size 0.01 means precision 2
+            precision = -tick_size.as_tuple().exponent
+            
+            # Round down for buy orders, round up for sell orders
+            # For now we'll implement a neutral rounding
+            price_str = f"{{:.{precision}f}}".format(float(price))
+            aligned_price = Decimal(price_str)
+            
+            # Extra safety - ensure price is a multiple of tick size
+            remainder = aligned_price % tick_size
+            if remainder > Decimal('0'):
+                aligned_price = aligned_price - remainder
+                
+            if aligned_price != price:
+                logger.info(f"Aligned price for {symbol} from {price} to {aligned_price} (tick size: {tick_size})")
+                
+            return aligned_price
+        except Exception as e:
+            logger.error(f"Error aligning price for {symbol}: {e}")
+            return price  # Return original price on error
 
     def _adjust_quantity_to_lot_size(self, symbol: str, quantity: Decimal) -> Decimal:
         """Adjust quantity to match symbol's lot size requirements"""
@@ -1414,7 +1496,8 @@ class BinanceClient:
                     # Calculate TP price
                     tp_multiplier = 1 + (profit_percentage / 100) if is_long else 1 - (profit_percentage / 100)
                     tp_price = order.price * Decimal(str(tp_multiplier))
-                    tp_price = Decimal(str(round(tp_price, price_precision)))
+                    # Apply tick size alignment instead of simple rounding
+                    tp_price = self._align_price_to_tick(order.symbol, tp_price)
                     
                     # Create PartialTakeProfit object
                     partial_tp = PartialTakeProfit(
@@ -1439,7 +1522,8 @@ class BinanceClient:
                 
                 # Calculate TP price
                 tp_price = order.price * Decimal(str(tp_multiplier))
-                tp_price = Decimal(str(round(tp_price, price_precision)))
+                # Apply tick size alignment instead of simple rounding
+                tp_price = self._align_price_to_tick(order.symbol, tp_price)
                 
                 logger.info(f"Regular take profit for {order.symbol}: Entry=${float(order.price)}, TP=${float(tp_price)} ({self.default_tp_percentage}%)")
                 
@@ -1464,12 +1548,14 @@ class BinanceClient:
                 # Calculate activation price (entry price + activation percentage)
                 activation_multiplier = 1 + (self.trailing_sl_activation / 100) if is_long else 1 - (self.trailing_sl_activation / 100)
                 activation_price = order.price * Decimal(str(activation_multiplier))
-                activation_price = Decimal(str(round(activation_price, price_precision)))
+                # Apply tick size alignment instead of simple rounding
+                activation_price = self._align_price_to_tick(order.symbol, activation_price)
                 
                 # Initial stop loss is same as regular SL or calculated from callback
                 initial_sl_multiplier = 1 - (self.trailing_sl_callback / 100) if is_long else 1 + (self.trailing_sl_callback / 100)
                 initial_stop_price = order.price * Decimal(str(initial_sl_multiplier))
-                initial_stop_price = Decimal(str(round(initial_stop_price, price_precision)))
+                # Apply tick size alignment instead of simple rounding
+                initial_stop_price = self._align_price_to_tick(order.symbol, initial_stop_price)
                 
                 # Create TrailingStopLoss object
                 order.trailing_stop_loss = TrailingStopLoss(
@@ -1493,7 +1579,8 @@ class BinanceClient:
                 
                 # Calculate SL price
                 sl_price = order.price * Decimal(str(sl_multiplier))
-                sl_price = Decimal(str(round(sl_price, price_precision)))
+                # Apply tick size alignment instead of simple rounding
+                sl_price = self._align_price_to_tick(order.symbol, sl_price)
                 
                 logger.info(f"Regular stop loss for {order.symbol}: Entry=${float(order.price)}, SL=${float(sl_price)} ({self.default_sl_percentage}%)")
                 
@@ -1602,7 +1689,8 @@ class BinanceClient:
                             callback_rate = order.trailing_stop_loss.callback_rate
                             callback_multiplier = 1 - (callback_rate / 100) if is_long else 1 + (callback_rate / 100)
                             new_stop_price = current_price_dec * Decimal(str(callback_multiplier))
-                            new_stop_price = Decimal(str(round(new_stop_price, price_precision)))
+                            # Apply tick size alignment instead of simple rounding
+                            new_stop_price = self._align_price_to_tick(order.symbol, new_stop_price)
                             
                             # Only update if new stop loss is better than current
                             if (is_long and new_stop_price > current_stop_price) or (not is_long and new_stop_price < current_stop_price):

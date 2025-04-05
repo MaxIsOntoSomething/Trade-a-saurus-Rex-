@@ -92,13 +92,6 @@ class OrderManager:
                 logger.info(f"Trading is paused, skipping {symbol}")
                 return
             
-            # Also, double-check against current trading_symbols list in database
-            if self.mongo_client:
-                trading_symbols = await self.mongo_client.get_trading_symbols()
-                if trading_symbols is not None and symbol not in trading_symbols:
-                    logger.info(f"Skipping {symbol} - not in active trading symbols list")
-                    return
-                
             # Get current price
             current_price = await self.binance_client.get_current_price(symbol)
             
@@ -218,13 +211,19 @@ class OrderManager:
                     logger.info("\n" + "="*50)
                     logger.info("Starting price check cycle")
                     
-                    # Get configured symbols, filtering out invalid ones
-                    configured_symbols = self.config['trading']['pairs']
-                    valid_symbols = [s for s in configured_symbols if s not in self.binance_client.invalid_symbols]
+                    # Get trading symbols from database instead of config
+                    valid_symbols = []
+                    if self.mongo_client:
+                        trading_symbols = await self.mongo_client.get_trading_symbols()
+                        # Filter out invalid symbols
+                        valid_symbols = [s for s in trading_symbols if s not in self.binance_client.invalid_symbols]
+                        logger.info(f"Processing {len(valid_symbols)} trading symbols from database")
+                    else:
+                        # Fallback to config if mongo_client is not available
+                        configured_symbols = self.config['trading']['pairs']
+                        valid_symbols = [s for s in configured_symbols if s not in self.binance_client.invalid_symbols]
+                        logger.info(f"Processing {len(valid_symbols)} trading symbols from config (fallback)")
                     
-                    if len(valid_symbols) < len(configured_symbols):
-                        logger.info(f"Processing {len(valid_symbols)} valid symbols (skipping {len(configured_symbols) - len(valid_symbols)} invalid)")
-
                     # Process symbols sequentially to maintain log order
                     for symbol in valid_symbols:
                         await self.process_symbol(symbol)
