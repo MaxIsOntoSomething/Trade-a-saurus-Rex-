@@ -8,15 +8,20 @@ from typing import Dict, List, Optional, Union, Any
 from decimal import Decimal  # Add the missing Decimal import
 from ..types.models import Order, OrderStatus, TimeFrame, TPSLStatus, OrderType
 from ..trading.binance_client import BinanceClient
+from ..trading.bybit_client import BybitClient
 from ..database.mongo_client import MongoClient
 from ..telegram.bot import TelegramBot
+
+# Type alias for exchange clients
+ExchangeClient = Union[BinanceClient, BybitClient]
 
 logger = logging.getLogger(__name__)
 
 class OrderManager:
-    def __init__(self, binance_client: BinanceClient, mongo_client: MongoClient, 
+    def __init__(self, binance_client: ExchangeClient, mongo_client: MongoClient, 
                  telegram_bot: TelegramBot, config: dict):
-        self.binance_client = binance_client
+        # Rename parameter internally to exchange_client for clarity
+        self.exchange_client = binance_client
         self.mongo_client = mongo_client
         self.telegram_bot = telegram_bot
         self.config = config
@@ -63,8 +68,14 @@ class OrderManager:
     async def check_connection_health(self):
         """Check if all connections are healthy"""
         try:
-            # Check Binance connection
-            await self.binance_client.client.ping()
+            # Check exchange connection
+            if isinstance(self.exchange_client, BinanceClient):
+                await self.exchange_client.client.ping()
+            elif isinstance(self.exchange_client, BybitClient):
+                # Bybit doesn't have a direct ping method, so check server time
+                response = self.exchange_client.client.get_server_time()
+                if 'retCode' not in response or response['retCode'] != 0:
+                    raise Exception("Bybit connection check failed")
             
             # Check MongoDB connection
             await self.mongo_client.db.command('ping')
@@ -78,22 +89,22 @@ class OrderManager:
         """Process a single symbol for threshold checking"""
         try:
             # Skip if the symbol was removed during this cycle
-            if hasattr(self.binance_client, 'removed_symbols_this_cycle') and symbol in self.binance_client.removed_symbols_this_cycle:
+            if hasattr(self.exchange_client, 'removed_symbols_this_cycle') and symbol in self.exchange_client.removed_symbols_this_cycle:
                 logger.info(f"Skipping symbol {symbol} that was removed this cycle")
                 return
                 
             # Skip invalid symbols
-            if symbol in self.binance_client.invalid_symbols:
+            if symbol in self.exchange_client.invalid_symbols:
                 logger.debug(f"Skipping known invalid symbol: {symbol}")
                 return
                 
             # Skip if trading is paused
-            if hasattr(self.binance_client, 'telegram_bot') and self.binance_client.telegram_bot.is_paused:
+            if hasattr(self.exchange_client, 'telegram_bot') and self.exchange_client.telegram_bot.is_paused:
                 logger.info(f"Trading is paused, skipping {symbol}")
                 return
             
             # Get current price
-            current_price = await self.binance_client.get_current_price(symbol)
+            current_price = await self.exchange_client.get_current_price(symbol)
             
             # Check if price is None (could happen with invalid symbols)
             if current_price is None:
@@ -104,7 +115,7 @@ class OrderManager:
             
             # Check if we have enough balance for at least one order
             order_amount = self.config['trading']['order_amount']
-            has_enough_balance = await self.binance_client.check_reserve_balance(order_amount)
+            has_enough_balance = await self.exchange_client.check_reserve_balance(order_amount)
             
             if not has_enough_balance:
                 logger.warning(f"Insufficient balance for orders. Current balance below required amount.")
@@ -114,7 +125,7 @@ class OrderManager:
                 logger.info(f"Checking {timeframe.value} timeframe...")
                 
                 # Get triggered thresholds
-                triggered_thresholds = await self.binance_client.check_thresholds(symbol, timeframe)
+                triggered_thresholds = await self.exchange_client.check_thresholds(symbol, timeframe)
                 
                 # Process each triggered threshold
                 for threshold in triggered_thresholds:
@@ -128,7 +139,7 @@ class OrderManager:
                     # Attempt to place an order for this threshold
                     try:
                         # Place buy order
-                        order = await self.binance_client.place_limit_buy_order(
+                        order = await self.exchange_client.place_limit_buy_order(
                             symbol=symbol,
                             amount=order_amount,
                             threshold=threshold,
@@ -175,8 +186,8 @@ class OrderManager:
                 last_check = current_time
 
                 # Reset the removed_symbols_this_cycle at the start of each new cycle
-                if hasattr(self.binance_client, 'removed_symbols_this_cycle'):
-                    self.binance_client.removed_symbols_this_cycle = set()
+                if hasattr(self.exchange_client, 'removed_symbols_this_cycle'):
+                    self.exchange_client.removed_symbols_this_cycle = set()
 
                 if not await self.check_connection_health():
                     logger.error("Connection health check failed, waiting 30s...")
@@ -188,10 +199,10 @@ class OrderManager:
                 if (now - last_balance_record).total_seconds() > 3600:  # 1 hour in seconds
                     try:
                         # Get current balance - explicitly use the configured base currency
-                        base_currency = self.binance_client.base_currency
-                        balance = await self.binance_client.get_balance(base_currency)
+                        base_currency = self.exchange_client.base_currency
+                        balance = await self.exchange_client.get_balance(base_currency)
                         
-                        # Get total invested amount - Fix: use the correct method name
+                        # Get total invested amount
                         invested = await self.calculate_invested_amount()
                         
                         # Record balance to MongoDB
@@ -216,12 +227,12 @@ class OrderManager:
                     if self.mongo_client:
                         trading_symbols = await self.mongo_client.get_trading_symbols()
                         # Filter out invalid symbols
-                        valid_symbols = [s for s in trading_symbols if s not in self.binance_client.invalid_symbols]
+                        valid_symbols = [s for s in trading_symbols if s not in self.exchange_client.invalid_symbols]
                         logger.info(f"Processing {len(valid_symbols)} trading symbols from database")
                     else:
                         # Fallback to config if mongo_client is not available
                         configured_symbols = self.config['trading']['pairs']
-                        valid_symbols = [s for s in configured_symbols if s not in self.binance_client.invalid_symbols]
+                        valid_symbols = [s for s in configured_symbols if s not in self.exchange_client.invalid_symbols]
                         logger.info(f"Processing {len(valid_symbols)} trading symbols from config (fallback)")
                     
                     # Process symbols sequentially to maintain log order
@@ -260,7 +271,7 @@ class OrderManager:
     async def create_order(self, symbol: str, timeframe: TimeFrame, threshold: float):
         """Create and store a new order"""
         try:
-            order = await self.binance_client.place_limit_buy_order(
+            order = await self.exchange_client.place_limit_buy_order(
                 symbol=symbol,
                 amount=self.config['trading']['order_amount'],
                 threshold=threshold,
@@ -282,7 +293,7 @@ class OrderManager:
             for order in pending_orders:
                 # Check if order should be cancelled due to time
                 if datetime.utcnow() - order.created_at > cancel_after:
-                    if await self.binance_client.cancel_order(order.symbol, order.order_id):
+                    if await self.exchange_client.cancel_order(order.symbol, order.order_id):
                         order.status = OrderStatus.CANCELLED
                         order.cancelled_at = datetime.utcnow()
                         await self.mongo_client.update_order_status(
@@ -292,7 +303,7 @@ class OrderManager:
                         continue
                 
                 # Check current order status
-                status = await self.binance_client.check_order_status(
+                status = await self.exchange_client.check_order_status(
                     order.symbol, order.order_id
                 )
                 
@@ -305,7 +316,7 @@ class OrderManager:
                         )
                         
                         # Check balance changes
-                        balance_change = await self.binance_client.get_balance_changes()
+                        balance_change = await self.exchange_client.get_balance_changes()
                         if balance_change:
                             order.balance_change = balance_change
                             await self.telegram_bot.send_balance_update(
@@ -313,7 +324,7 @@ class OrderManager:
                             )
                         
                         # Create TP/SL orders if configured
-                        await self.binance_client.create_tp_sl_orders(order)
+                        await self.exchange_client.create_tp_sl_orders(order)
                         # Update order in database with TP/SL information
                         await self.mongo_client.insert_order(order)
                         
@@ -374,7 +385,7 @@ class OrderManager:
         """Check if any timeframes need to be reset"""
         try:
             for timeframe in TimeFrame:
-                reset_occurred = await self.binance_client.check_timeframe_reset(timeframe)
+                reset_occurred = await self.exchange_client.check_timeframe_reset(timeframe)
                 if reset_occurred:
                     logger.info(f"Timeframe {timeframe.value} was reset")
                     # Additional reset-related tasks can be added here
@@ -427,7 +438,7 @@ class OrderManager:
                     continue
                     
                 # Check if TP or SL is triggered
-                triggers = await self.binance_client.check_tp_sl_triggers(order)
+                triggers = await self.exchange_client.check_tp_sl_triggers(order)
                 tp_triggered = triggers.get('tp_triggered', False)
                 sl_triggered = triggers.get('sl_triggered', False)
                 partial_tp_triggered = triggers.get('partial_tp_triggered', [])

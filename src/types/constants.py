@@ -5,6 +5,7 @@ PRECISION = {
     'BTC': 6,
     'ETH': 5,
     'USDT': 2,
+    'USDC': 2,
     'DEFAULT': 8
 }
 
@@ -21,8 +22,13 @@ REQUEST_WEIGHT_DEFAULT = 1
 
 # Order related constants
 MIN_NOTIONAL = {
-    'BTCUSDT': 10,
-    'ETHUSDT': 10,
+    'BTCUSDC': 10,
+    'ETHUSDC': 10,
+    'BNBUSDC': 10,
+    'SOLUSDC': 10,
+    'AVAXUSDC': 10,
+    'ADAUSDC': 10,
+    'XRPUSDC': 10,
     'DEFAULT': 10
 }
 

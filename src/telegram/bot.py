@@ -9,17 +9,19 @@ from telegram.ext import (
     MessageHandler,
     CallbackQueryHandler,
     filters,
-    ContextTypes
+    ContextTypes,
+    ConversationHandler
 )
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Union, Any
 import re
 import time
 import uuid
 
 from ..types.models import Order, OrderStatus, TimeFrame, OrderType, TradeDirection, TPSLStatus, PartialTakeProfit
 from ..trading.binance_client import BinanceClient
+from ..trading.bybit_client import BybitClient
 from ..database.mongo_client import MongoClient
 from ..types.constants import NOTIFICATION_EMOJI
 from ..utils.chart_generator import ChartGenerator
@@ -80,6 +82,7 @@ class TelegramBot:
         self.is_paused = False
         self.application = None
         self.order_data = {}  # Store order data during creation
+        self.temp_trade_data = {}  # Initialize temp_trade_data for manual trade workflow
         
         # Create default keyboard markup for reply messages
         self.markup = ReplyKeyboardMarkup(
@@ -960,22 +963,91 @@ Type /help for detailed command information.
 
             # Initialize order data
             user_id = update.effective_user.id
-            self.order_data[user_id] = {"step": "order_type"}
+            self.temp_trade_data[user_id] = {}
 
+            # Get trading symbols for autocomplete suggestions
+            trading_symbols = await self.mongo_client.get_trading_symbols()
+            base_currency = self.config['trading']['base_currency']
+            
+            # Create a cancel button
+            keyboard = [[KeyboardButton("Cancel")]]
+            
+            # Add some popular symbols as quick buttons if available
+            popular_symbols = []
+            for symbol in ["BTC", "ETH", "SOL", "BNB"]:
+                complete_symbol = f"{symbol}{base_currency}"
+                if complete_symbol in trading_symbols:
+                    popular_symbols.append(complete_symbol)
+            
+            # Add popular symbols in rows of 2
+            if popular_symbols:
+                for i in range(0, len(popular_symbols), 2):
+                    row = popular_symbols[i:i+2]
+                    keyboard.insert(0, [KeyboardButton(s) for s in row])
+            
+            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+
+            await update.message.reply_text(
+                f"Enter the trading symbol (e.g., BTCUSDT):\n\nActive trading pairs use {base_currency} as base currency.",
+                reply_markup=reply_markup
+            )
+            return SYMBOL
+            
+        except Exception as e:
+            logger.error(f"Error starting trade workflow: {e}")
+            await update.message.reply_text("Error starting trade workflow. Try again.")
+            return ConversationHandler.END
+            
+    async def add_trade_symbol(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle symbol input for manual trade"""
+        try:
+            symbol = update.message.text.upper().strip()
+            
+            # Cancel if requested
+            if symbol.lower() == "cancel":
+                await self.add_trade_cancel(update, context)
+                return ConversationHandler.END
+                
+            # Validate symbol format and save to user data
+            # Get base currency from config
+            base_currency = self.config['trading'].get('base_currency', 'USDT')
+            
+            # Basic format validation
+            if len(symbol) < 5:  # Minimum length check (e.g., BTCUSDT)
+                await update.message.reply_text(f"Symbol is too short. Please use format like BTCUSDT.")
+                return SYMBOL
+                
+            # Check if symbol exists in exchange
+            is_valid = False
+            if isinstance(self.binance_client, BinanceClient):
+                is_valid = await self.binance_client.check_symbol_validity(symbol)
+            elif isinstance(self.binance_client, BybitClient):
+                is_valid = await self.binance_client.check_symbol_validity(symbol)
+                
+            if not is_valid:
+                await update.message.reply_text(f"Symbol {symbol} not found on the exchange. Please check and try again.")
+                return SYMBOL
+                
+            # Store symbol in user data
+            self.temp_trade_data[update.effective_user.id]['symbol'] = symbol
+            
             # Create order type selection keyboard
             keyboard = [
                 [KeyboardButton("Spot"), KeyboardButton("Futures")],
                 [KeyboardButton("Cancel")]
             ]
             reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
-
+            
             await update.message.reply_text(
                 "Select order type:",
                 reply_markup=reply_markup
             )
+            return ORDER_TYPE
+            
         except Exception as e:
-            logger.error(f"Error starting trade workflow: {e}")
-            await update.message.reply_text("Error starting trade workflow. Try again.")
+            logger.error(f"Error processing symbol: {e}")
+            await update.message.reply_text(f"Error: {str(e)}")
+            return SYMBOL
 
     async def add_trade_order_type(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle order type input (SPOT/FUTURES)"""
@@ -1090,7 +1162,8 @@ Type /help for detailed command information.
             order_type = user_data['order_type'].value
             leverage = user_data.get('leverage', 1)  # Default to 1 if not set (for spot trades)
             
-            # Calculate fees automatically using the BinanceClient's fee calculation
+            # Calculate fees automatically using the exchange client's fee calculation
+            # Note: binance_client is the actual exchange client (could be BinanceClient or BybitClient)
             fees, fee_asset = await self.binance_client.calculate_fees(
                 user_data['symbol'], 
                 price, 
@@ -1122,10 +1195,13 @@ Type /help for detailed command information.
             
             # Send confirmation with auto-calculated fees
             direction_info = f"\nDirection: {order.direction.value}" if order.direction else ""
-            leverage_info = f"\nLeverage: {order.leverage}x" if order.leverage else ""
+            leverage_info = f"\nLeverage: {order.leverage}x" if order.leverage and order.leverage > 1 else ""
+            
+            # Include exchange in the notification
+            exchange_name = "Binance" if isinstance(self.binance_client, BinanceClient) else "Bybit"
             
             await update.message.reply_text(
-                f"✅ Manual trade added:\n"
+                f"✅ Manual trade added to {exchange_name}:\n"
                 f"Symbol: {order.symbol}\n"
                 f"Type: {order.order_type.value}"
                 f"{direction_info}"
@@ -1345,7 +1421,8 @@ Type /help for detailed command information.
             order_type = user_data['order_type'].value
             leverage = user_data.get('leverage', 1)  # Default to 1 if not set (for spot trades)
             
-            # Calculate fees automatically using the BinanceClient's fee calculation
+            # Calculate fees automatically using the exchange client's fee calculation
+            # Note: binance_client is the actual exchange client (could be BinanceClient or BybitClient)
             fees, fee_asset = await self.binance_client.calculate_fees(
                 user_data['symbol'], 
                 price, 
@@ -1377,10 +1454,13 @@ Type /help for detailed command information.
             
             # Send confirmation with auto-calculated fees
             direction_info = f"\nDirection: {order.direction.value}" if order.direction else ""
-            leverage_info = f"\nLeverage: {order.leverage}x" if order.leverage else ""
+            leverage_info = f"\nLeverage: {order.leverage}x" if order.leverage and order.leverage > 1 else ""
+            
+            # Include exchange in the notification
+            exchange_name = "Binance" if isinstance(self.binance_client, BinanceClient) else "Bybit"
             
             await update.message.reply_text(
-                f"✅ Manual trade added:\n"
+                f"✅ Manual trade added to {exchange_name}:\n"
                 f"Symbol: {order.symbol}\n"
                 f"Type: {order.order_type.value}"
                 f"{direction_info}"
@@ -3835,7 +3915,26 @@ To change this setting:
             self.application.add_handler(CommandHandler("profits", self.show_profits))
             self.application.add_handler(CommandHandler("history", self.get_order_history))
             self.application.add_handler(CommandHandler("thresholds", self.show_thresholds))
-            self.application.add_handler(CommandHandler("add", self.add_trade_start))
+            
+            # Create conversation handler for add_trade workflow
+            add_trade_conv = ConversationHandler(
+                entry_points=[CommandHandler("add", self.add_trade_start)],
+                states={
+                    SYMBOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_trade_symbol)],
+                    ORDER_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_trade_order_type)],
+                    LEVERAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_trade_leverage)],
+                    DIRECTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_trade_direction)],
+                    AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_trade_amount)],
+                    PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_trade_final)]
+                },
+                fallbacks=[CommandHandler("cancel", self.add_trade_cancel),
+                          MessageHandler(filters.Regex('^Cancel$'), self.add_trade_cancel)]
+            )
+            
+            # Add the conversation handler
+            self.application.add_handler(add_trade_conv)
+            
+            # Add other command handlers
             self.application.add_handler(CommandHandler("help", self.help_command))
             self.application.add_handler(CommandHandler("resetthresholds", self.reset_all_thresholds))
             self.application.add_handler(CommandHandler("viz", self.show_viz_menu))

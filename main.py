@@ -14,6 +14,7 @@ if sys.platform == 'win32':
 
 from dotenv import load_dotenv
 from src.trading.binance_client import BinanceClient
+from src.trading.bybit_client import BybitClient  # Import the new Bybit client
 from src.database.mongo_client import MongoClient
 from src.telegram.bot import TelegramBot, DINO_ASCII
 from src.trading.order_manager import OrderManager
@@ -25,13 +26,27 @@ logger = logging.getLogger(__name__)
 
 def validate_config(config: dict) -> bool:
     """Validate configuration parameters with updated structure"""
+    # Check for exchange_type field
+    if 'exchange_type' not in config:
+        logger.error("Missing exchange_type in config. Must be either 'binance' or 'bybit'")
+        return False
+        
+    if config['exchange_type'] not in ['binance', 'bybit']:
+        logger.error(f"Invalid exchange_type: {config['exchange_type']}. Must be either 'binance' or 'bybit'")
+        return False
+    
+    # Validate fields based on selected exchange
+    exchange_type = config['exchange_type']
+    
     required_fields = {
-        'binance': ['spot_testnet', 'mainnet', 'use_testnet'],
         'telegram': ['bot_token', 'allowed_users'],
         'mongodb': ['uri', 'database'],
         'trading': ['base_currency', 'order_amount', 'cancel_after_hours', 
                    'pairs', 'thresholds']
     }
+    
+    # Add exchange-specific required fields
+    required_fields[exchange_type] = ['spot_testnet', 'mainnet', 'use_testnet']
     
     try:
         for section, fields in required_fields.items():
@@ -44,13 +59,13 @@ def validate_config(config: dict) -> bool:
                     logger.error(f"Missing field: {section}.{field}")
                     return False
                     
-        # Additional validation for nested API keys
-        if 'api_key' not in config['binance']['spot_testnet'] or 'api_secret' not in config['binance']['spot_testnet']:
-            logger.error("Missing Binance spot testnet API credentials")
+        # Additional validation for nested API keys based on selected exchange
+        if 'api_key' not in config[exchange_type]['spot_testnet'] or 'api_secret' not in config[exchange_type]['spot_testnet']:
+            logger.error(f"Missing {exchange_type} spot testnet API credentials")
             return False
             
-        if 'api_key' not in config['binance']['mainnet'] or 'api_secret' not in config['binance']['mainnet']:
-            logger.error("Missing Binance mainnet API credentials")
+        if 'api_key' not in config[exchange_type]['mainnet'] or 'api_secret' not in config[exchange_type]['mainnet']:
+            logger.error(f"Missing {exchange_type} mainnet API credentials")
             return False
             
         return True
@@ -60,6 +75,12 @@ def validate_config(config: dict) -> bool:
 
 def load_config_from_env() -> dict:
     """Load configuration from environment variables with support for both API sets"""
+    # Get the exchange type
+    exchange_type = os.getenv('EXCHANGE_TYPE', 'binance').lower()
+    if exchange_type not in ['binance', 'bybit']:
+        logger.warning(f"Invalid EXCHANGE_TYPE: {exchange_type}. Defaulting to 'binance'")
+        exchange_type = 'binance'
+    
     # Load reserve balance with proper parsing
     try:
         reserve_balance = os.getenv('TRADING_RESERVE_BALANCE')
@@ -160,8 +181,9 @@ def load_config_from_env() -> dict:
     mongodb_load_config = os.getenv('MONGODB_LOAD_CONFIG', 'true').lower() == 'true'
     logger.info(f"[CONFIG] Load config from MongoDB: {mongodb_load_config}")
 
-    # Rest of the config loading with spot_testnet/mainnet API keys
+    # Combine all configs with both exchange configurations
     config = {
+        'exchange_type': exchange_type,
         'binance': {
             'spot_testnet': {
                 'api_key': os.getenv('BINANCE_SPOT_TESTNET_API_KEY'),
@@ -172,6 +194,17 @@ def load_config_from_env() -> dict:
                 'api_secret': os.getenv('BINANCE_MAINNET_API_SECRET')
             },
             'use_testnet': os.getenv('BINANCE_USE_TESTNET', 'true').lower() == 'true'
+        },
+        'bybit': {
+            'spot_testnet': {
+                'api_key': os.getenv('BYBIT_SPOT_TESTNET_API_KEY'),
+                'api_secret': os.getenv('BYBIT_SPOT_TESTNET_API_SECRET')
+            },
+            'mainnet': {
+                'api_key': os.getenv('BYBIT_MAINNET_API_KEY'),
+                'api_secret': os.getenv('BYBIT_MAINNET_API_SECRET')
+            },
+            'use_testnet': os.getenv('BYBIT_USE_TESTNET', 'true').lower() == 'true'
         },
         'telegram': {
             'bot_token': os.getenv('TELEGRAM_BOT_TOKEN'),
@@ -212,6 +245,7 @@ def load_config_from_env() -> dict:
     # Log the TP/SL settings specifically for debugging
     logger.info(f"[CONFIG] Take Profit setting: {config['trading']['take_profit']}")
     logger.info(f"[CONFIG] Stop Loss setting: {config['trading']['stop_loss']}")
+    logger.info(f"[CONFIG] Using exchange: {config['exchange_type']}")
     
     return config
 
@@ -257,6 +291,7 @@ async def load_and_merge_config() -> dict:
         # Log final configuration
         config_logger.log_config(
             f"Active Configuration:\n"
+            f"Exchange: {config['exchange_type']}\n"
             f"Base Currency: {config['trading']['base_currency']}\n"
             f"Reserve Balance: ${config['trading']['reserve_balance']:,.2f}\n"
             f"Trading Pairs: {', '.join(config['trading']['pairs'])}"
@@ -268,14 +303,23 @@ async def load_and_merge_config() -> dict:
         logger.error(f"Error loading configuration: {e}")
         raise
 
-async def check_initial_connection(binance_client: BinanceClient, config: dict) -> bool:
+async def check_initial_connection(exchange_client, config: dict) -> bool:
     """Check initial connection and get prices for all configured pairs"""
     try:
-        logger.info("Testing connection to Binance...")
-        await binance_client.client.ping()
+        exchange_type = config['exchange_type']
+        logger.info(f"Testing connection to {exchange_type.capitalize()}...")
+        
+        # Check connection based on exchange type
+        if exchange_type == 'binance':
+            await exchange_client.client.ping()
+        elif exchange_type == 'bybit':
+            # Bybit connection check using server time
+            response = exchange_client.client.get_server_time()
+            if 'retCode' not in response or response['retCode'] != 0:
+                raise Exception(f"Failed to connect to Bybit: {response.get('retMsg', 'Unknown error')}")
         
         logger.info("=" * 50)
-        logger.info("✅ Successfully connected to Binance")
+        logger.info(f"✅ Successfully connected to {exchange_type.capitalize()}")
         
         # Check validity of all configured pairs
         valid_pairs = []
@@ -283,51 +327,58 @@ async def check_initial_connection(binance_client: BinanceClient, config: dict) 
         
         for symbol in config['trading']['pairs']:
             try:
-                ticker = await binance_client.client.get_symbol_ticker(symbol=symbol)
-                price = float(ticker['price'])
-                logger.info(f"🔸 Current {symbol} Price: ${price:,.2f}")
-                valid_pairs.append(symbol)
-            except Exception as e:
-                error_message = str(e)
-                if "APIError(code=-1121): Invalid symbol" in error_message:
+                # Get current price based on exchange
+                current_price = await exchange_client.get_current_price(symbol)
+                
+                if current_price is not None:
+                    logger.info(f"🔸 Current {symbol} Price: ${current_price:,.2f}")
+                    valid_pairs.append(symbol)
+                else:
                     logger.warning(f"❌ Invalid symbol: {symbol} - Removing from trading pairs.")
                     invalid_pairs.append(symbol)
                     # Track invalid symbol
-                    binance_client.invalid_symbols.add(symbol)
-                    if binance_client.mongo_client:
-                        await binance_client.mongo_client.save_invalid_symbol(symbol, error_message)
-                else:
-                    logger.error(f"❌ Error checking {symbol}: {e}")
+                    exchange_client.invalid_symbols.add(symbol)
+                    if exchange_client.mongo_client:
+                        await exchange_client.mongo_client.save_invalid_symbol(symbol, "Invalid symbol")
+            except Exception as e:
+                error_message = str(e)
+                logger.warning(f"❌ Invalid symbol: {symbol} - {error_message}")
+                invalid_pairs.append(symbol)
+                # Track invalid symbol
+                exchange_client.invalid_symbols.add(symbol)
+                if exchange_client.mongo_client:
+                    await exchange_client.mongo_client.save_invalid_symbol(symbol, error_message)
         
         # Update config with only valid pairs
         if invalid_pairs:
             logger.warning(f"Removed {len(invalid_pairs)} invalid pairs: {', '.join(invalid_pairs)}")
             config['trading']['pairs'] = valid_pairs
             
+        # If no valid symbols are found, warn the user but don't add default symbols
         if not valid_pairs:
             logger.error("❌ No valid trading pairs found. Check your configuration.")
             return False
-            
+                
         # Save valid pairs to database for persistence
-        if binance_client.mongo_client:
+        if exchange_client.mongo_client:
             # Check if any trading symbols exist in database
-            existing_symbols = await binance_client.mongo_client.get_trading_symbols()
+            existing_symbols = await exchange_client.mongo_client.get_trading_symbols()
             if not existing_symbols:
                 logger.info(f"No trading symbols in database, saving {len(valid_pairs)} validated pairs")
                 for symbol in valid_pairs:
-                    await binance_client.mongo_client.save_trading_symbol(symbol)
+                    await exchange_client.mongo_client.save_trading_symbol(symbol)
             
         logger.info(f"✅ Found {len(valid_pairs)} valid trading pairs: {', '.join(valid_pairs)}")
         logger.info("=" * 50)
         return True
     except Exception as e:
         logger.error("=" * 50)
-        logger.error(f"❌ Failed to connect to Binance: {e}")
+        logger.error(f"❌ Failed to connect to {config['exchange_type'].capitalize()}: {e}")
         logger.error("=" * 50)
         return False
 
 async def initialize_services(config):
-    """Initialize all services with updated Binance API structure"""
+    """Initialize all services with support for both exchanges"""
     try:
         logger.info("Initializing services...")
         
@@ -345,6 +396,7 @@ async def initialize_services(config):
         base_currency = config['trading'].get('base_currency', 'USDT')
         
         # Log important configuration information
+        logger.info(f"Exchange: {config['exchange_type']}")
         logger.info(f"Base Currency: {base_currency}")
         logger.info(f"Reserve Balance: ${config['trading'].get('reserve_balance', 0):,.2f}")
         logger.info(f"Trading Pairs: {', '.join(config['trading']['pairs'])}")
@@ -354,48 +406,62 @@ async def initialize_services(config):
             if not pair.endswith(base_currency):
                 logger.warning(f"Pair {pair} doesn't use {base_currency} as base currency. This might cause issues.")
         
+        # Get the exchange type
+        exchange_type = config['exchange_type']
+        
         # Determine which API keys to use based on use_testnet setting
-        use_testnet = config['binance']['use_testnet']
+        use_testnet = config[exchange_type]['use_testnet']
         api_env = 'spot_testnet' if use_testnet else 'mainnet'
         
-        # Initialize Binance client with the appropriate API keys
-        binance_client = BinanceClient(
-            api_key=config['binance'][api_env]['api_key'],
-            api_secret=config['binance'][api_env]['api_secret'],
-            testnet=use_testnet,
-            mongo_client=mongo_client,
-            config=config
-        )
+        # Initialize the appropriate exchange client
+        if exchange_type == 'binance':
+            exchange_client = BinanceClient(
+                api_key=config['binance'][api_env]['api_key'],
+                api_secret=config['binance'][api_env]['api_secret'],
+                testnet=use_testnet,
+                mongo_client=mongo_client,
+                config=config
+            )
+        elif exchange_type == 'bybit':
+            exchange_client = BybitClient(
+                api_key=config['bybit'][api_env]['api_key'],
+                api_secret=config['bybit'][api_env]['api_secret'],
+                testnet=use_testnet,
+                mongo_client=mongo_client,
+                config=config
+            )
+        else:
+            raise ValueError(f"Unsupported exchange type: {exchange_type}")
         
         # Initialize client connection
-        await binance_client.initialize()
+        await exchange_client.initialize()
         
         # Log reserve balance after initialization to verify
-        logger.info(f"[VERIFY] Reserve balance after BinanceClient init: ${binance_client.reserve_balance:,.2f}")
-        logger.info(f"[VERIFY] Take Profit setting: {binance_client.default_tp_percentage}%")
-        logger.info(f"[VERIFY] Stop Loss setting: {binance_client.default_sl_percentage}%")
+        logger.info(f"[VERIFY] Reserve balance after {exchange_type} client init: ${exchange_client.reserve_balance:,.2f}")
+        logger.info(f"[VERIFY] Take Profit setting: {exchange_client.default_tp_percentage}%")
+        logger.info(f"[VERIFY] Stop Loss setting: {exchange_client.default_sl_percentage}%")
         
         # Initialize Telegram bot
         telegram_bot = TelegramBot(
             token=config['telegram']['bot_token'],
             allowed_users=config['telegram']['allowed_users'],
-            binance_client=binance_client,
+            binance_client=exchange_client,  # Pass exchange client as binance_client for backward compatibility
             mongo_client=mongo_client,
             config=config
         )
         
         # Link components
-        binance_client.telegram_bot = telegram_bot
+        exchange_client.telegram_bot = telegram_bot
         
         # Initialize telegram bot
         await telegram_bot.initialize()
         
-        # Verify reserve balance one more time after all initialization (NEW CODE)
-        logger.info(f"[VERIFY] Final reserve balance: ${binance_client.reserve_balance:,.2f}")
+        # Verify reserve balance one more time after all initialization
+        logger.info(f"[VERIFY] Final reserve balance: ${exchange_client.reserve_balance:,.2f}")
         
         # Initialize OrderManager
         order_manager = OrderManager(
-            binance_client=binance_client,
+            binance_client=exchange_client,  # Pass exchange client as binance_client for backward compatibility
             mongo_client=mongo_client,
             telegram_bot=telegram_bot,
             config=config
@@ -403,7 +469,7 @@ async def initialize_services(config):
         
         return {
             'mongo_client': mongo_client,
-            'binance_client': binance_client,
+            'exchange_client': exchange_client,
             'telegram_bot': telegram_bot,
             'order_manager': order_manager
         }
@@ -412,7 +478,7 @@ async def initialize_services(config):
         raise
 
 async def main():
-    """Main function with improved config loading"""
+    """Main function with improved config loading and support for multiple exchanges"""
     print(DINO_ASCII)
     logger.info("Starting Trade-a-saurus Rex...")
     
@@ -423,7 +489,8 @@ async def main():
         # Debug log the configuration
         logger.info("=" * 50)
         logger.info("[CONFIG] Active Configuration:")
-        logger.info(f"[CONFIG] Environment: {'TESTNET' if config['binance']['use_testnet'] else 'MAINNET'}")
+        logger.info(f"[CONFIG] Exchange: {config['exchange_type'].upper()}")
+        logger.info(f"[CONFIG] Environment: {'TESTNET' if config[config['exchange_type']]['use_testnet'] else 'MAINNET'}")
         logger.info(f"[CONFIG] Base Currency: {config['trading']['base_currency']}")
         logger.info(f"[CONFIG] Reserve Balance: ${config['trading']['reserve_balance']:,.2f}")
         logger.info(f"[CONFIG] Trading Pairs: {', '.join(config['trading']['pairs'])}")
@@ -437,9 +504,14 @@ async def main():
             return
 
         services = await initialize_services(config)
-        binance_client = services['binance_client']
+        exchange_client = services['exchange_client']
         telegram_bot = services['telegram_bot']
         order_manager = services['order_manager']
+        
+        # Check connection to the exchange
+        if not await check_initial_connection(exchange_client, config):
+            logger.error(f"Failed to connect to {config['exchange_type'].capitalize()}, exiting...")
+            return
         
         # Run both components concurrently
         try:
@@ -470,7 +542,7 @@ async def main():
             await asyncio.gather(
                 order_manager.stop(),
                 telegram_bot.stop(),
-                binance_client.close(),
+                exchange_client.close(),
                 return_exceptions=True
             )
             
