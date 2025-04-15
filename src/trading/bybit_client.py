@@ -31,6 +31,21 @@ class BybitClient:
         self.testnet = testnet
         self.client = None
         self.ws_client = None
+        
+        # Fix for "Illegal category" error
+        # For testnet, use "linear" category, for production use "spot"
+        # linear refers to USDT perpetual futures which is available on testnet
+        # spot refers to spot trading which is not available on testnet
+        self.trading_category = "linear" if testnet else "spot"
+        logger.info(f"[INIT] Using trading category: {self.trading_category} for {'testnet' if testnet else 'mainnet'}")
+        
+        # Add clear warning if using testnet with USDC pairs
+        if testnet and config and 'trading' in config:
+            base_currency = config['trading'].get('base_currency', 'USDT')
+            if base_currency == 'USDC':
+                logger.warning(f"[INIT] ⚠️ WARNING: USDC spot trading is NOT available on Bybit Testnet!")
+                logger.warning(f"[INIT] Please switch to USDT as base currency when using testnet, or switch to mainnet for USDC trading.")
+        
         self.reference_prices = {}
         self.triggered_thresholds = {}
         self.rate_limiter = RateLimiter()
@@ -149,24 +164,25 @@ class BybitClient:
     async def initialize(self):
         """Initialize the Bybit client"""
         try:
-            # Initialize HTTP client for Bybit API
+            # Initialize HTTP client
             self.client = HTTP(
-                testnet=self.testnet,
                 api_key=self.api_key,
-                api_secret=self.api_secret
+                api_secret=self.api_secret,
+                testnet=self.testnet,
+                recv_window=10000
             )
             
             # Initialize WebSocket client if needed
             if self.testnet:
-                ws_endpoint = "wss://stream-testnet.bybit.com/v5/public/spot"
+                ws_endpoint = f"wss://stream-testnet.bybit.com/v5/public/{self.trading_category}"
             else:
-                ws_endpoint = "wss://stream.bybit.com/v5/public/spot"
+                ws_endpoint = f"wss://stream.bybit.com/v5/public/{self.trading_category}"
                 
             self.ws_client = WebSocket(
                 testnet=self.testnet,
                 api_key=self.api_key,
                 api_secret=self.api_secret,
-                channel_type="spot"  # Changed to spot
+                channel_type=self.trading_category
             )
             
             # Initialize rate limiter
@@ -178,8 +194,8 @@ class BybitClient:
             # Get exchange information and symbols
             try:
                 await self.rate_limiter.acquire()
-                # Get instruments info for spot trading
-                response = await self.make_request('get_instruments_info', params={"category": "spot"})
+                # Get instruments info for the specified trading category
+                response = await self.make_request('get_instruments_info', params={"category": self.trading_category})
                 
                 if response and isinstance(response, dict) and response.get('retCode') == 0:
                     instruments = response.get('result', {}).get('list', [])
@@ -193,6 +209,7 @@ class BybitClient:
                     
             except Exception as e:
                 logger.error(f"Error getting instruments info: {e}")
+                traceback.print_exc()
                 return False
             
             # Get trading symbols from configuration or database
@@ -227,6 +244,7 @@ class BybitClient:
             
         except Exception as e:
             logger.error(f"Error initializing Bybit client: {e}")
+            traceback.print_exc()  # Print full stack trace
             return False
             
     async def restore_threshold_state(self):
@@ -701,7 +719,7 @@ class BybitClient:
                 
             # Prepare order creation parameters for Bybit API
             order_params = {
-                "category": "spot",
+                "category": self.trading_category,
                 "symbol": symbol,
                 "side": "Buy",
                 "orderType": "Limit",
@@ -758,7 +776,7 @@ class BybitClient:
             
             # Cancelling order through Bybit API
             response = self.client.cancel_order(
-                category="spot",
+                category=self.trading_category,
                 symbol=symbol,
                 orderId=order_id
             )
@@ -781,7 +799,7 @@ class BybitClient:
             
             # Get order details from Bybit API
             response = self.client.get_order_history(
-                category="spot",
+                category=self.trading_category,
                 symbol=symbol,
                 orderId=order_id
             )
@@ -877,7 +895,7 @@ class BybitClient:
             await self.rate_limiter.acquire()
             response = await self.make_request(
                 method="get_tickers",
-                params={"category": "spot", "symbol": symbol}
+                params={"category": self.trading_category, "symbol": symbol}
             )
             
             # Validate response
@@ -1058,14 +1076,14 @@ class BybitClient:
         """Check if a symbol is valid on Bybit"""
         try:
             # First try to get ticker info
-            response = await self.make_request('get_tickers', params={"category": "spot", "symbol": symbol})
+            response = await self.make_request('get_tickers', params={"category": self.trading_category, "symbol": symbol})
             
             if response['retCode'] == 0 and response['result']:
                 logger.info(f"Symbol {symbol} validated via ticker info")
                 return True
             
             # If ticker fails, try instruments info
-            instruments_response = await self.make_request('get_instruments_info', params={"category": "spot", "symbol": symbol})
+            instruments_response = await self.make_request('get_instruments_info', params={"category": self.trading_category, "symbol": symbol})
             
             if instruments_response['retCode'] == 0 and instruments_response['result']:
                 logger.info(f"Symbol {symbol} validated via instruments info")
@@ -1388,7 +1406,7 @@ class BybitClient:
             # Get kline/candle data from Bybit
             await self.rate_limiter.acquire()
             response = self.client.get_kline(
-                category="spot",
+                category=self.trading_category,
                 symbol=symbol,
                 interval=bybit_interval,
                 limit=count + 5  # Request a few extra candles
@@ -1467,8 +1485,7 @@ class BybitClient:
             
             # Get wallet balance
             balance_response = self.client.get_wallet_balance(
-                accountType="UNIFIED",
-                coin=self.base_currency
+                accountType="UNIFIED"
             )
             
             if not balance_response or not isinstance(balance_response, dict) or balance_response.get('retCode') != 0:
@@ -1514,7 +1531,7 @@ class BybitClient:
             # Use daily klines for longer periods
             await self.rate_limiter.acquire()
             response = self.client.get_kline(
-                category="spot",
+                category=self.trading_category,
                 symbol=symbol,
                 interval="D",  # Daily candles
                 limit=200  # Maximum allowed by Bybit
@@ -1779,6 +1796,14 @@ class BybitClient:
                     # Start with a moderate window of 10000ms
                     kwargs['recv_window'] = 10000 + (5000 * current_retry)
                 
+                # Ensure category parameter is correctly set for relevant methods
+                if method == 'get_instruments_info' or method == 'get_tickers':
+                    if params is None:
+                        params = {}
+                    # Make sure we have the proper category parameter
+                    if 'category' not in params:
+                        params['category'] = self.trading_category
+                
                 # Handle direct client method calls vs HTTP methods
                 try:
                     if endpoint:
@@ -1797,7 +1822,11 @@ class BybitClient:
                         if not hasattr(self.client, method):
                             raise ValueError(f"Unknown client method: {method}")
                         func = getattr(self.client, method)
-                        response = func(*args, **kwargs)
+                        # Add the parameters to the method call if they exist
+                        if params:
+                            response = func(*args, **params, **kwargs)
+                        else:
+                            response = func(*args, **kwargs)
                     
                     # Standardize response format
                     if isinstance(response, dict):
@@ -1860,4 +1889,4 @@ class BybitClient:
             return {'retCode': 0, 'result': response}
         except Exception as e:
             logger.error(f"Error getting server time: {e}")
-            return {'retCode': -1, 'retMsg': str(e)} 
+            return {'retCode': -1, 'retMsg': str(e)}
