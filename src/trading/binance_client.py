@@ -1540,6 +1540,10 @@ class BinanceClient:
                     logger.info(f"Placing TP order for {order.symbol} at {float(tp_price)}")
                     # tp_order_id = "tp_" + order.order_id  # In a real implementation, this would be the actual order ID
                     # order.take_profit.order_id = tp_order_id
+            else:
+                # If TP percentage is 0 or not enabled, no take profit will be set
+                order.take_profit = None
+                logger.info(f"Take profit disabled for {order.symbol} (percentage is {self.default_tp_percentage})")
             
             # Handle Trailing Stop Loss (overrides regular stop loss)
             if self.trailing_sl_enabled:
@@ -1597,6 +1601,10 @@ class BinanceClient:
                     logger.info(f"Placing SL order for {order.symbol} at {float(sl_price)}")
                     # sl_order_id = "sl_" + order.order_id  # In a real implementation, this would be the actual order ID
                     # order.stop_loss.order_id = sl_order_id
+            else:
+                # If SL percentage is 0 or not enabled, no stop loss will be set
+                order.stop_loss = None
+                logger.info(f"Stop loss disabled for {order.symbol} (percentage is {self.default_sl_percentage})")
             
             return tp_order_id, sl_order_id
             

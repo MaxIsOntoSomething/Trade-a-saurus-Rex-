@@ -816,7 +816,7 @@ class BybitClient:
                 else:
                     return OrderStatus.PENDING
             else:
-                logger.error(f"Could not find order {order_id} for {symbol}")
+                logger.warning(f"Could not find order {order_id} for {symbol}")
                 return None
                 
         except Exception as e:
@@ -1206,7 +1206,7 @@ class BybitClient:
                     logger.error(f"Error setting up partial take profits: {e}")
             
             # Always convert to Decimal when doing calculations, even if TP is disabled
-            if tp_percentage is not None:
+            if tp_percentage is not None and tp_percentage > 0:
                 tp_percentage = Decimal(str(tp_percentage))
                 tp_price = entry_price * (Decimal('1') + tp_percentage / Decimal('100'))
                 order.take_profit = TakeProfit(
@@ -1214,8 +1214,12 @@ class BybitClient:
                     percentage=float(tp_percentage),
                     status=TPSLStatus.PENDING
                 )
-                
-            if sl_percentage is not None:
+            else:
+                # If TP percentage is 0 or None, disable take profit
+                order.take_profit = None
+                logger.info(f"Take profit disabled (percentage is {tp_percentage})")
+            
+            if sl_percentage is not None and sl_percentage > 0:
                 sl_percentage = Decimal(str(sl_percentage))
                 sl_price = entry_price * (Decimal('1') - sl_percentage / Decimal('100'))
                 order.stop_loss = StopLoss(
@@ -1223,6 +1227,10 @@ class BybitClient:
                     percentage=float(sl_percentage),
                     status=TPSLStatus.PENDING
                 )
+            else:
+                # If SL percentage is 0 or None, disable stop loss
+                order.stop_loss = None
+                logger.info(f"Stop loss disabled (percentage is {sl_percentage})")
             
             # Setup trailing stop loss if enabled
             if trailing_sl_enabled:
@@ -1431,6 +1439,7 @@ class BybitClient:
                 
                 formatted_candles.append({
                     'open_time': int(candle[0]),  # timestamp
+                    'timestamp': int(candle[0]),  # add timestamp field for validator
                     'open': float(candle[1]),     # open
                     'high': float(candle[2]),     # high
                     'low': float(candle[3]),      # low

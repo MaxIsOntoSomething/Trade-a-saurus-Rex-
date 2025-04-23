@@ -473,8 +473,9 @@ class ChartGenerator:
     async def generate_roi_comparison_chart(self, 
                                     portfolio_data: Dict,
                                     btc_performance: Dict,
-                                    sp500_performance: Dict = None) -> Optional[bytes]:
-        """Generate chart comparing portfolio ROI with BTC and S&P 500"""
+                                    sp500_performance: Dict = None,
+                                    gold_performance: Dict = None) -> Optional[bytes]:
+        """Generate chart comparing portfolio ROI with BTC, S&P 500, and Gold"""
         try:
             # Create a common date range for all data series
             all_dates = set()
@@ -482,6 +483,8 @@ class ChartGenerator:
             all_dates.update(btc_performance.keys())
             if sp500_performance:
                 all_dates.update(sp500_performance.keys())
+            if gold_performance:
+                all_dates.update(gold_performance.keys())
             
             date_range = sorted(list(all_dates))
             
@@ -494,6 +497,8 @@ class ChartGenerator:
             df['Bitcoin'] = pd.Series(btc_performance)
             if sp500_performance:
                 df['S&P 500'] = pd.Series(sp500_performance)
+            if gold_performance:
+                df['Gold'] = pd.Series(gold_performance)
             
             # Forward fill missing values
             df = df.fillna(method='ffill')
@@ -508,6 +513,8 @@ class ChartGenerator:
             df['Bitcoin'].plot(ax=ax, color='orange', linewidth=2, label='Bitcoin')
             if 'S&P 500' in df.columns:
                 df['S&P 500'].plot(ax=ax, color='blue', linewidth=2, label='S&P 500')
+            if 'Gold' in df.columns:
+                df['Gold'].plot(ax=ax, color='gold', linewidth=2, label='Gold')
             
             # Add zero line
             ax.axhline(y=0, color='gray', linestyle='--', alpha=0.7)
@@ -538,6 +545,8 @@ class ChartGenerator:
             )
             if 'S&P 500' in final_values:
                 summary_text += f"\nS&P 500: {final_values['S&P 500']:.2f}%"
+            if 'Gold' in final_values:
+                summary_text += f"\nGold: {final_values['Gold']:.2f}%"
             
             # Add text box with performance summary
             props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)

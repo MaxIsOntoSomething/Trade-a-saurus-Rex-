@@ -68,6 +68,7 @@ class VisualizationType:
     ROI_COMPARISON = "roi_comparison"  # Add new visualization type for ROI comparison
     SP500_VS_BTC = "sp500_vs_btc"  # Add new visualization type for S&P 500 vs BTC comparison
     PORTFOLIO_COMPOSITION = "portfolio_composition"  # Add new visualization type
+    GOLD_COMPARISON = "gold_comparison"  # Add new visualization type for Gold comparison
 
 class TelegramBot:
     def __init__(self, token: str, allowed_users: List[int], 
@@ -1512,8 +1513,8 @@ Type /help for detailed command information.
             [InlineKeyboardButton("💹 Performance vs. BTC (90d)", callback_data="viz_btc_90")],
             [InlineKeyboardButton("💰 Deposits & Withdrawals", callback_data="viz_transactions")],
             
-            # Add back the S&P 500 and Portfolio options
-            [InlineKeyboardButton("📈 Portfolio Performance", callback_data=VisualizationType.SP500_VS_BTC)],
+            # Update description to include Gold
+            [InlineKeyboardButton("📈 Portfolio vs BTC/S&P500/Gold", callback_data=VisualizationType.SP500_VS_BTC)],
             [InlineKeyboardButton("🥧 Portfolio Composition", callback_data=VisualizationType.PORTFOLIO_COMPOSITION)],
             
             # Text-based visualizations
@@ -1558,7 +1559,7 @@ Type /help for detailed command information.
             
         # Special handling for S&P 500 vs BTC comparison - now labeled as Portfolio Performance
         if viz_type == VisualizationType.SP500_VS_BTC:
-            await query.message.reply_text("Generating Portfolio Performance chart (BTC vs S&P 500)...", reply_markup=self.markup)
+            await query.message.reply_text("Generating Portfolio Performance chart (BTC vs S&P 500 vs Gold)...", reply_markup=self.markup)
             await self._generate_sp500_vs_btc_comparison(query.message.chat_id)
             return
             
@@ -1712,7 +1713,7 @@ Type /help for detailed command information.
             # Get first trade date
             first_trade_date = await self.mongo_client.get_first_trade_date()
             if not first_trade_date:
-                await self.application.bot.send_message(  # Use application.bot instead of bot
+                await self.application.bot.send_message(
                     chat_id=chat_id,
                     text="No trade history found. Cannot generate ROI comparison."
                 )
@@ -1721,7 +1722,7 @@ Type /help for detailed command information.
             # Get portfolio performance data
             portfolio_data = await self.mongo_client.get_portfolio_performance(first_trade_date)
             if not portfolio_data:
-                await self.application.bot.send_message(  # Use application.bot instead of bot
+                await self.application.bot.send_message(
                     chat_id=chat_id,
                     text="Could not calculate portfolio performance. No completed trades found."
                 )
@@ -1733,29 +1734,40 @@ Type /help for detailed command information.
             # Get benchmark data
             btc_performance = await self.binance_client.get_historical_benchmark("BTCUSDT", days_since_first)
             sp500_performance = await self.binance_client.get_historical_benchmark("SP500", days_since_first)
+            
+            # Import and use the Gold scraper to get gold performance data
+            from ..utils.yahoo_GOLD_scrapooooor import YahooGoldScraper
+            gold_scraper = YahooGoldScraper()
+            gold_data = await gold_scraper.get_gold_data(days_since_first)
+            
+            # Format gold data to match the expected format
+            gold_performance = {}
+            if gold_data:
+                gold_performance = gold_data
 
             # Generate chart
             chart_bytes = await self.chart_generator.generate_roi_comparison_chart(
                 portfolio_data,
                 btc_performance,
-                sp500_performance
+                sp500_performance,
+                gold_performance
             )
 
             if chart_bytes:
-                await self.application.bot.send_photo(  # Use application.bot instead of bot
+                await self.application.bot.send_photo(
                     chat_id=chat_id,
                     photo=chart_bytes,
-                    caption="ROI Comparison: Portfolio vs BTC vs S&P 500"
+                    caption="ROI Comparison: Portfolio vs BTC vs S&P 500 vs Gold"
                 )
             else:
-                await self.application.bot.send_message(  # Use application.bot instead of bot
+                await self.application.bot.send_message(
                     chat_id=chat_id,
                     text="Error generating ROI comparison chart."
                 )
 
         except Exception as e:
             logger.error(f"Error generating ROI comparison: {e}", exc_info=True)
-            await self.application.bot.send_message(  # Use application.bot instead of bot
+            await self.application.bot.send_message(
                 chat_id=chat_id,
                 text="Error generating ROI comparison chart."
             )
@@ -2203,10 +2215,10 @@ Type /help for detailed command information.
             percentage_str = message_parts[1].strip().replace('%', '')
             
             percentage = float(percentage_str)
-            if percentage <= 0 or percentage > 100:
+            if percentage < 0 or percentage > 100:
                 await self.send_message(
                     update.effective_chat.id,
-                    "Take profit percentage must be between 0 and 100."
+                    "Take profit percentage must be between 0 and 100. Set to 0 to disable take profit."
                 )
                 return
                 
@@ -2276,23 +2288,38 @@ Type /help for detailed command information.
                     change_direction = "⬆️" if order['change_percent'] > 0 else "⬇️"
                     update_info += f"\n- {order['symbol']} (ID: {order['order_id']}): ${order['old_tp_price']:.2f} → ${order['new_tp_price']:.2f} {change_direction}"
                 
-                message = (
-                    f"✅ Take profit set to {percentage}% for all symbols.\n"
-                    f"*Changed from:* {old_tp}% → {percentage}%{update_info}"
-                )
+                if percentage == 0:
+                    message = (
+                        f"✅ Take profit has been disabled for all symbols.\n"
+                        f"*Changed from:* {old_tp}% → {percentage}%{update_info}"
+                    )
+                else:
+                    message = (
+                        f"✅ Take profit set to {percentage}% for all symbols.\n"
+                        f"*Changed from:* {old_tp}% → {percentage}%{update_info}"
+                    )
                 await self.send_message(
                     update.effective_chat.id,
                     message,
                     parse_mode='Markdown'
                 )
             else:
-                await self.send_message(
-                    update.effective_chat.id,
-                    f"✅ Take profit set to {percentage}% for all symbols.\n"
-                    f"*Changed from:* {old_tp}% → {percentage}%\n\n"
-                    f"*No existing orders* needed to be updated.",
-                    parse_mode='Markdown'
-                )
+                if percentage == 0:
+                    await self.send_message(
+                        update.effective_chat.id,
+                        f"✅ Take profit has been disabled for all symbols.\n"
+                        f"*Changed from:* {old_tp}% → {percentage}%\n\n"
+                        f"*No existing orders* needed to be updated.",
+                        parse_mode='Markdown'
+                    )
+                else:
+                    await self.send_message(
+                        update.effective_chat.id,
+                        f"✅ Take profit set to {percentage}% for all symbols.\n"
+                        f"*Changed from:* {old_tp}% → {percentage}%\n\n"
+                        f"*No existing orders* needed to be updated.",
+                        parse_mode='Markdown'
+                    )
                 
         except Exception as e:
             logger.error(f"Error setting take profit: {e}")
@@ -2324,10 +2351,10 @@ Type /help for detailed command information.
             percentage_str = message_parts[1].strip().replace('%', '')
             
             percentage = float(percentage_str)
-            if percentage <= 0 or percentage > 100:
+            if percentage < 0 or percentage > 100:
                 await self.send_message(
                     update.effective_chat.id,
-                    "Stop loss percentage must be between 0 and 100."
+                    "Stop loss percentage must be between 0 and 100. Set to 0 to disable stop loss."
                 )
                 return
                 
@@ -2397,23 +2424,38 @@ Type /help for detailed command information.
                     change_direction = "⬆️" if order['change_percent'] > 0 else "⬇️"
                     update_info += f"\n- {order['symbol']} (ID: {order['order_id']}): ${order['old_sl_price']:.2f} → ${order['new_sl_price']:.2f} {change_direction}"
                 
-                message = (
-                    f"✅ Stop loss set to {percentage}% for all symbols.\n"
-                    f"*Changed from:* {old_sl}% → {percentage}%{update_info}"
-                )
+                if percentage == 0:
+                    message = (
+                        f"✅ Stop loss has been disabled for all symbols.\n"
+                        f"*Changed from:* {old_sl}% → {percentage}%{update_info}"
+                    )
+                else:
+                    message = (
+                        f"✅ Stop loss set to {percentage}% for all symbols.\n"
+                        f"*Changed from:* {old_sl}% → {percentage}%{update_info}"
+                    )
                 await self.send_message(
                     update.effective_chat.id,
                     message,
                     parse_mode='Markdown'
                 )
             else:
-                await self.send_message(
-                    update.effective_chat.id,
-                    f"✅ Stop loss set to {percentage}% for all symbols.\n"
-                    f"*Changed from:* {old_sl}% → {percentage}%\n\n"
-                    f"*No existing orders* needed to be updated.",
-                    parse_mode='Markdown'
-                )
+                if percentage == 0:
+                    await self.send_message(
+                        update.effective_chat.id,
+                        f"✅ Stop loss has been disabled for all symbols.\n"
+                        f"*Changed from:* {old_sl}% → {percentage}%\n\n"
+                        f"*No existing orders* needed to be updated.",
+                        parse_mode='Markdown'
+                    )
+                else:
+                    await self.send_message(
+                        update.effective_chat.id,
+                        f"✅ Stop loss set to {percentage}% for all symbols.\n"
+                        f"*Changed from:* {old_sl}% → {percentage}%\n\n"
+                        f"*No existing orders* needed to be updated.",
+                        parse_mode='Markdown'
+                    )
                 
         except Exception as e:
             logger.error(f"Error setting stop loss: {e}")
@@ -2761,7 +2803,7 @@ To change this setting:
             for data_point in btc_data:
                 if data_point['timestamp'].year == current_year:
                     date_str = data_point['timestamp'].strftime('%Y-%m-%d')
-                    price = float(data_point['price'])
+                    price = float(data_point['close'])  # Changed from 'price' to 'close'
                     
                     # Set start price to first entry of the year
                     if btc_start_price is None:
@@ -2785,6 +2827,23 @@ To change this setting:
                 logger.warning(f"Error fetching S&P 500 data for {current_year}: {e}, using simulated data")
                 sp500_data = await self._generate_simulated_sp500_data(days_since_start + 5)
             
+            # Get Gold data from Yahoo Gold scraper
+            gold_data = {}
+            try:
+                # Import Gold scraper
+                from ..utils.yahoo_GOLD_scrapooooor import YahooGoldScraper
+                gold_scraper = YahooGoldScraper()
+                gold_raw_data = await gold_scraper.get_gold_data(days_since_start + 5)
+                
+                # If we got data, use it
+                if gold_raw_data and len(gold_raw_data) >= 2:
+                    gold_data = gold_raw_data
+                    logger.info(f"Successfully fetched Gold data for {current_year} with {len(gold_data)} data points")
+                else:
+                    logger.warning(f"Failed to get Gold data for {current_year}, using empty dataset")
+            except Exception as e:
+                logger.warning(f"Error fetching Gold data for {current_year}: {e}")
+            
             # Filter S&P 500 data to only include this year
             sp500_ytd = {}
             first_date = None
@@ -2805,12 +2864,34 @@ To change this setting:
                 except (ValueError, IndexError) as e:
                     logger.warning(f"Error processing date {date}: {e}")
             
+            # Filter Gold data to only include this year
+            gold_ytd = {}
+            first_gold_date = None
+            first_gold_value = 0
+            
+            if gold_data:
+                # Sort the dates to find the earliest one in the current year
+                gold_dates = sorted(gold_data.keys())
+                for date in gold_dates:
+                    try:
+                        year = int(date.split('-')[0])
+                        if year == current_year:
+                            if first_gold_date is None:
+                                first_gold_date = date
+                                first_gold_value = gold_data[date]
+                            
+                            # Adjust values to be relative to the first day of the year
+                            gold_ytd[date] = gold_data[date] - first_gold_value
+                    except (ValueError, IndexError) as e:
+                        logger.warning(f"Error processing gold date {date}: {e}")
+            
             # Create the comparison chart with explicit current year
             chart_bytes = await self._create_portfolio_comparison_chart(
                 btc_ytd_prices, 
                 sp500_ytd, 
                 portfolio_performance,
-                current_year
+                current_year,
+                gold_ytd
             )
             
             if not chart_bytes:
@@ -2824,6 +2905,7 @@ To change this setting:
             # Get current values for caption
             btc_current = list(btc_ytd_prices.values())[-1] if btc_ytd_prices and btc_ytd_prices.values() else 0
             sp500_current = list(sp500_ytd.values())[-1] if sp500_ytd and sp500_ytd.values() else 0
+            gold_current = list(gold_ytd.values())[-1] if gold_ytd and gold_ytd.values() else 0
             
             # Build caption with explicit current year
             caption_parts = [f"📈 Portfolio Performance ({current_year})\n"]
@@ -2834,7 +2916,11 @@ To change this setting:
             
             # Add benchmark performances
             caption_parts.append(f"🟠 Bitcoin: {btc_current:.2f}%")
-            caption_parts.append(f"🔵 S&P 500: {sp500_current:.2f}%\n")
+            caption_parts.append(f"🔵 S&P 500: {sp500_current:.2f}%")
+            # Add Gold performance if available
+            if gold_ytd and gold_ytd.values():
+                caption_parts.append(f"🟡 Gold: {gold_current:.2f}%")
+            caption_parts.append("\n")
             
             # Add explanation with explicit current year
             caption_parts.append(f"Chart shows percentage change since January 1, {current_year}")
@@ -2857,7 +2943,8 @@ To change this setting:
     
     async def _create_portfolio_comparison_chart(self, btc_data: dict, sp500_data: dict, 
                                                 portfolio_performance: float = None, 
-                                                year: int = None) -> Optional[bytes]:
+                                                year: int = None,
+                                                gold_data: dict = None) -> Optional[bytes]:
         """Create portfolio performance comparison chart"""
         try:
             import matplotlib.pyplot as plt
@@ -2888,19 +2975,34 @@ To change this setting:
             if not sp500_df.empty:
                 sp500_df['date'] = pd.to_datetime(sp500_df['date'])
                 sp500_df.set_index('date', inplace=True)
+                
+            # Create Gold DataFrame if data is provided
+            gold_df = None
+            if gold_data and len(gold_data) > 0:
+                gold_df = pd.DataFrame([
+                    {'date': date, 'value': value} for date, value in gold_data.items()
+                ])
+                
+                if not gold_df.empty:
+                    gold_df['date'] = pd.to_datetime(gold_df['date'])
+                    gold_df.set_index('date', inplace=True)
             
             # Create figure
             fig, ax = plt.subplots(figsize=(12, 8))
             
-            # Plot both datasets
+            # Plot datasets
             if not btc_df.empty:
                 btc_df['value'].plot(ax=ax, color='orange', linewidth=2, label='Bitcoin')
             
             if not sp500_df.empty:
                 sp500_df['value'].plot(ax=ax, color='blue', linewidth=2, label='S&P 500')
+                
+            # Plot Gold data if available
+            if gold_df is not None and not gold_df.empty:
+                gold_df['value'].plot(ax=ax, color='gold', linewidth=2, label='Gold')
             
             # Get date range for portfolio performance line
-            if btc_df.empty and sp500_df.empty:
+            if btc_df.empty and sp500_df.empty and (gold_df is None or gold_df.empty):
                 # No data available, create a simple date range
                 start_date = datetime(year, 1, 1)
                 end_date = datetime.now()
@@ -2910,8 +3012,10 @@ To change this setting:
                 # Use the range from available data
                 if not btc_df.empty:
                     date_range = [btc_df.index.min(), btc_df.index.max()]
-                else:
+                elif not sp500_df.empty:
                     date_range = [sp500_df.index.min(), sp500_df.index.max()]
+                elif gold_df is not None and not gold_df.empty:
+                    date_range = [gold_df.index.min(), gold_df.index.max()]
             
             # Add portfolio performance as a horizontal line - ensure it's never skipped
             portfolio_performance = 0.0 if portfolio_performance is None else portfolio_performance
@@ -2958,6 +3062,14 @@ To change this setting:
                           xy=(sp500_df.index[-1], final_sp500),
                           xytext=(5, -15), textcoords='offset points',
                           fontsize=11, color='blue')
+                          
+            # Annotate Gold if available
+            if gold_df is not None and not gold_df.empty:
+                final_gold = gold_df['value'].iloc[-1]
+                ax.annotate(f"{final_gold:.1f}%", 
+                          xy=(gold_df.index[-1], final_gold),
+                          xytext=(5, -25), textcoords='offset points',
+                          fontsize=11, color='gold')
             
             # Save to buffer
             buf = io.BytesIO()
