@@ -39,6 +39,7 @@ class BinanceClient:
         self.performance_reporter = None
         
         self.reference_prices = {}
+        # Initialize a single instance of triggered_thresholds
         self.triggered_thresholds = {}
         self.rate_limiter = RateLimiter()
         self.symbol_info = {}
@@ -60,18 +61,39 @@ class BinanceClient:
         # Set reserve balance and base currency directly from config
         self.base_currency = None
         self.reserve_balance = 0
+        self.thresholds = {}
         if config and 'trading' in config:
             self.base_currency = config['trading'].get('base_currency', 'USDT')
             self.reserve_balance = float(config['trading'].get('reserve_balance', 0))
             logger.info(f"[INIT] Config loaded directly: Base Currency={self.base_currency}, Reserve=${self.reserve_balance:,.2f}")
+            
+            # Initialize thresholds from config
+            if 'thresholds' in config['trading']:
+                self.thresholds = config['trading']['thresholds']
+                logger.info(f"[INIT] Loaded thresholds from config: {self.thresholds}")
+                
+                # Ensure thresholds are properly structured for timeframe access
+                for timeframe in TimeFrame:
+                    if timeframe.value not in self.thresholds:
+                        self.thresholds[timeframe.value] = []
+                        logger.debug(f"[INIT] Created empty threshold list for {timeframe.value}")
         
         # Initialize Yahoo SP500 scraper
         self.yahoo_scraper = YahooSP500Scraper()
         
-        # Initialize thresholds dictionary with nested structure to track triggered thresholds
-        self.triggered_thresholds = {}
+        # Add regex pattern for valid Binance symbols
+        self.valid_symbol_pattern = re.compile(r'^[A-Z0-9\-.]{1,20}$')
         
-        # Initialize pairs with nested dictionaries for each timeframe if config is provided
+        # Set up thresholds with proper default structure if not provided in config
+        if not self.thresholds:
+            self.thresholds = {
+                'daily': [1, 2, 5],
+                'weekly': [5, 10, 15],
+                'monthly': [10, 20, 30]
+            }
+            logger.info(f"[INIT] Using default thresholds: {self.thresholds}")
+        
+        # Initialize triggered_thresholds with proper structure for each trading pair
         if config and 'trading' in config and 'pairs' in config['trading']:
             pairs = config['trading']['pairs']
             for pair in pairs:
@@ -80,6 +102,17 @@ class BinanceClient:
                     'weekly': set(),
                     'monthly': set()
                 }
+            
+            logger.info(f"[INIT] Initialized triggered_thresholds for {len(pairs)} pairs with proper timeframe structure")
+        
+        # Ensure thresholds for each timeframe exist
+        for timeframe in TimeFrame:
+            if timeframe.value not in self.thresholds:
+                self.thresholds[timeframe.value] = []
+                logger.warning(f"[INIT] Missing threshold for {timeframe.value}, created empty list")
+
+        # Log final threshold structure
+        logger.info(f"[INIT] Final threshold configuration: {self.thresholds}")
         
         # Add default TP/SL values
         self.default_tp_percentage = 0
@@ -563,7 +596,17 @@ class BinanceClient:
                     await self.telegram_bot.check_btc_price_jump(current_price, reference_price)
             
             # Get thresholds for this timeframe
+            if not self.thresholds:
+                logger.warning(f"No thresholds configured for any timeframe")
+                return []
+                
             thresholds = self.thresholds.get(timeframe.value, [])
+            if not thresholds:
+                logger.debug(f"No thresholds configured for {timeframe.value}")
+                return []
+                
+            logger.debug(f"Checking {len(thresholds)} thresholds for {symbol} {timeframe.value}: {thresholds}")
+            logger.debug(f"Current price: {current_price}, Reference price: {reference_price}, Change: {price_change:.2f}%")
             
             # Check if we've triggered any thresholds
             triggered = []
@@ -588,10 +631,13 @@ class BinanceClient:
                                 current_price, reference_price, price_change
                             )
             
+            if triggered:
+                logger.info(f"Triggered {len(triggered)} thresholds for {symbol} {timeframe.value}: {triggered}")
+            
             return triggered
             
         except Exception as e:
-            logger.error(f"Error checking thresholds for {symbol}: {e}")
+            logger.error(f"Error checking thresholds for {symbol}: {e}", exc_info=True)
             return []
 
     async def mark_threshold_triggered(self, symbol: str, timeframe: TimeFrame, threshold: float):
@@ -656,6 +702,26 @@ class BinanceClient:
             # Get current trading pairs (excluding invalid ones)
             valid_pairs = [p for p in self.config['trading']['pairs'] if p not in self.invalid_symbols]
             
+            # Get thresholds for this timeframe
+            timeframe_thresholds = []
+            try:
+                if 'trading' in self.config and 'thresholds' in self.config['trading']:
+                    timeframe_thresholds = self.config['trading']['thresholds'].get(timeframe_str, [])
+                else:
+                    timeframe_thresholds = self.thresholds.get(timeframe_str, [])
+                    
+                logger.info(f"Using thresholds for {timeframe_str}: {timeframe_thresholds}")
+            except Exception as th_error:
+                logger.error(f"Error accessing thresholds for {timeframe_str}: {th_error}", exc_info=True)
+                # Use default thresholds if there's an error accessing the configured ones
+                if timeframe_str == 'daily':
+                    timeframe_thresholds = [1, 2, 5]
+                elif timeframe_str == 'weekly':
+                    timeframe_thresholds = [5, 10, 15]
+                elif timeframe_str == 'monthly':
+                    timeframe_thresholds = [10, 20, 30]
+                logger.info(f"Using default thresholds for {timeframe_str}: {timeframe_thresholds}")
+            
             # Gather information about reference prices for notification
             for symbol in valid_pairs:
                 timeframe = TimeFrame(timeframe_str)
@@ -665,7 +731,7 @@ class BinanceClient:
                     reset_info['pairs'].append({
                         'symbol': symbol,
                         'reference_price': price,
-                        'thresholds': self.config['trading']['thresholds'][timeframe_str]
+                        'thresholds': timeframe_thresholds
                     })
             
             # Clear in-memory thresholds for this timeframe
@@ -684,7 +750,7 @@ class BinanceClient:
             return reset_info
             
         except Exception as e:
-            logger.error(f"Error resetting {timeframe_str} thresholds: {e}")
+            logger.error(f"Error resetting {timeframe_str} thresholds: {e}", exc_info=True)
             return None
 
     async def restore_triggered_thresholds(self):
@@ -699,38 +765,51 @@ class BinanceClient:
             # Process each stored threshold
             for threshold_data in stored_thresholds:
                 symbol = threshold_data['symbol']
-                timeframe = TimeFrame(threshold_data['timeframe'])
+                timeframe_value = threshold_data['timeframe']
                 threshold = threshold_data['threshold']
                 
                 # Initialize nested dictionaries if needed
                 if symbol not in self.triggered_thresholds:
-                    self.triggered_thresholds[symbol] = {}
-                if timeframe not in self.triggered_thresholds[symbol]:
-                    self.triggered_thresholds[symbol][timeframe] = []
+                    self.triggered_thresholds[symbol] = {
+                        'daily': set(),
+                        'weekly': set(),
+                        'monthly': set()
+                    }
+                
+                # Convert timeframe string to enum if needed for compatibility
+                try:
+                    timeframe = TimeFrame(timeframe_value)
+                    timeframe_value = timeframe.value  # Ensure we're using the string value
+                except (ValueError, TypeError):
+                    # If conversion fails, keep the original value
+                    pass
+                
+                # Ensure the timeframe exists in the dictionary
+                if timeframe_value not in self.triggered_thresholds[symbol]:
+                    self.triggered_thresholds[symbol][timeframe_value] = set()
                     
                 # Add threshold to in-memory storage
-                if threshold not in self.triggered_thresholds[symbol][timeframe]:
-                    self.triggered_thresholds[symbol][timeframe].append(threshold)
+                self.triggered_thresholds[symbol][timeframe_value].add(threshold)
                     
                 # Add to notification data
                 if symbol not in restored_info:
                     restored_info[symbol] = {}
-                if timeframe not in restored_info[symbol]:
-                    restored_info[symbol][timeframe] = []
-                restored_info[symbol][timeframe].append(threshold)
+                if timeframe_value not in restored_info[symbol]:
+                    restored_info[symbol][timeframe_value] = []
+                restored_info[symbol][timeframe_value].append(threshold)
                 
             # Store restored threshold info for notification
             self.restored_threshold_info = restored_info
             
             # Log restoration results
             total_count = sum(len(thresholds) for symbol_data in self.triggered_thresholds.values() 
-                            for thresholds in symbol_data.values())
+                             for thresholds in symbol_data.values())
             logger.info(f"Restored {total_count} triggered thresholds from database")
             
             return self.triggered_thresholds
             
         except Exception as e:
-            logger.error(f"Error restoring triggered thresholds: {e}")
+            logger.error(f"Error restoring triggered thresholds: {e}", exc_info=True)
             return {}
 
     async def check_reserve_balance(self, order_amount: float) -> bool:

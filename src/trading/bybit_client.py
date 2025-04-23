@@ -1992,3 +1992,27 @@ class BybitClient:
         except Exception as e:
             logger.error(f"Error getting server time: {e}")
             return {'retCode': -1, 'retMsg': str(e)}
+
+    def _parse_tp_sl_setting(self, setting) -> float:
+        """Parse take profit or stop loss setting that can be in percentage format or numeric
+        
+        Args:
+            setting: Take profit or stop loss setting (e.g., "5%", 5)
+            
+        Returns:
+            Parsed value as float
+        """
+        try:
+            if isinstance(setting, str) and '%' in setting:
+                # Remove percentage sign and convert to float
+                return float(setting.replace('%', ''))
+            elif isinstance(setting, (int, float)):
+                # Already a number, just convert to float
+                return float(setting)
+            else:
+                # Default case if input is unexpected
+                logger.warning(f"Unexpected TP/SL setting format: {setting}, using default value")
+                return 0.0
+        except Exception as e:
+            logger.error(f"Error parsing TP/SL setting '{setting}': {e}")
+            return 0.0

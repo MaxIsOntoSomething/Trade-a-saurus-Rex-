@@ -85,13 +85,17 @@ class TelegramBot:
         self.order_data = {}  # Store order data during creation
         self.temp_trade_data = {}  # Initialize temp_trade_data for manual trade workflow
         
+        # Determine client type
+        self.client_type = type(self.binance_client).__name__
+        logger.info(f"Using trading client: {self.client_type}")
+        
         # Create default keyboard markup for reply messages
         self.markup = ReplyKeyboardMarkup(
             [[KeyboardButton("/menu"), KeyboardButton("/help")]],
             resize_keyboard=True
         )
         
-        # Set base currency and reserve balance in binance client immediately
+        # Set base currency and reserve balance in client immediately
         if 'trading' in self.config:
             self.binance_client.base_currency = self.config['trading'].get('base_currency', 'USDT')
             self.binance_client.reserve_balance = float(self.config['trading'].get('reserve_balance', 0))
@@ -146,12 +150,17 @@ Status: Ready to ROAR! 🦖
             
             logger.info("Telegram bot is now running!")
             
+            # Determine exchange name and environment
+            client_type = type(self.binance_client).__name__
+            exchange_name = client_type.replace("Client", "")
+            environment = "TESTNET" if self.binance_client.testnet else "MAINNET"
+            
             # Send startup notification to all allowed users
             for user_id in self.allowed_users:
                 try:
                     await self.bot.send_message(
                         chat_id=user_id,
-                        text=f"🦖 Trade-a-saurus Rex is now online!\nEnvironment: {'TESTNET' if self.config['binance']['use_testnet'] else 'MAINNET'}",
+                        text=f"🦖 Trade-a-saurus Rex is now online!\nExchange: {exchange_name}\nEnvironment: {environment}",
                         reply_markup=self.markup
                     )
                 except Exception as e:
@@ -279,86 +288,153 @@ Type /help for detailed command information.
             return
 
         try:
-            # Get all balances from Binance
-            all_balances = await self.binance_client.client.get_account()
-            
-            if not all_balances or 'balances' not in all_balances:
-                await update.message.reply_text("❌ Error retrieving balance information.")
-                return
-                
-            # Get list of active trading symbols
-            active_symbols = await self.mongo_client.get_trading_symbols()
-            
-            # Extract base currency from symbols (e.g., USDT from BTCUSDT)
+            # Determine which type of client we're using
+            client_type = type(self.binance_client).__name__
             base_currency = self.binance_client.base_currency
             
-            # Create set of traded assets by extracting the first part of each symbol
-            traded_assets = set()
-            for symbol in active_symbols:
-                if symbol.endswith(base_currency):
-                    # For pairs like BTCUSDT, extract BTC
-                    traded_assets.add(symbol[:-len(base_currency)])
-                elif base_currency in symbol:
-                    # Fallback for other formats
-                    traded_assets.add(symbol.replace(base_currency, ''))
-                    
-            # List of major coins to always show
-            always_show_coins = ['BTC', 'ETH', 'SOL', 'USDC', 'USDT']
-            
-            # Combine traded assets and always show coins
-            display_assets = traded_assets.union(set(always_show_coins))
-            
-            # Format the balances
+            # Get balances based on client type
             balances = []
             
-            for balance in all_balances['balances']:
-                asset = balance['asset']
-                free = float(balance['free'])
-                locked = float(balance['locked'])
-                total = free + locked
+            if client_type == 'BinanceClient':
+                # For Binance client
+                all_balances = await self.binance_client.client.get_account()
                 
-                # Skip assets with zero balance
-                if total <= 0:
-                    continue
+                if not all_balances or 'balances' not in all_balances:
+                    await update.message.reply_text("❌ Error retrieving balance information.")
+                    return
+                    
+                # Get list of active trading symbols
+                active_symbols = await self.mongo_client.get_trading_symbols()
                 
-                # Only show base currency, traded assets and major coins
-                if asset not in display_assets and asset != base_currency:
-                    continue
+                # Create set of traded assets by extracting the first part of each symbol
+                traded_assets = set()
+                for symbol in active_symbols:
+                    if symbol.endswith(base_currency):
+                        # For pairs like BTCUSDT, extract BTC
+                        traded_assets.add(symbol[:-len(base_currency)])
+                    elif base_currency in symbol:
+                        # Fallback for other formats
+                        traded_assets.add(symbol.replace(base_currency, ''))
+                        
+                # List of major coins to always show
+                always_show_coins = ['BTC', 'ETH', 'SOL', 'USDC', 'USDT']
                 
-                # Get USD value of the asset for display purposes
-                asset_value = 0.0
-                if asset == base_currency:
-                    # Direct USD value for base currency (assuming base currency is pegged to USD)
-                    asset_value = total
-                else:
-                    # Try to get price for this asset against base currency
-                    try:
-                        symbol_pair = f"{asset}{base_currency}"
-                        price = await self.binance_client.get_current_price(symbol_pair)
-                        asset_value = total * price
-                    except Exception as e:
-                        logging.debug(f"Could not get price for {symbol_pair}: {e}")
-                        # Try reverse pair if available
+                # Combine traded assets and always show coins
+                display_assets = traded_assets.union(set(always_show_coins))
+                
+                # Format the balances
+                for balance in all_balances['balances']:
+                    asset = balance['asset']
+                    free = float(balance['free'])
+                    locked = float(balance['locked'])
+                    total = free + locked
+                    
+                    # Skip assets with zero balance
+                    if total <= 0:
+                        continue
+                    
+                    # Only show base currency, traded assets and major coins
+                    if asset not in display_assets and asset != base_currency:
+                        continue
+                    
+                    # Get USD value of the asset for display purposes
+                    asset_value = 0.0
+                    if asset == base_currency:
+                        # Direct USD value for base currency (assuming base currency is pegged to USD)
+                        asset_value = total
+                    else:
+                        # Try to get price for this asset against base currency
                         try:
-                            symbol_pair = f"{base_currency}{asset}"
+                            symbol_pair = f"{asset}{base_currency}"
                             price = await self.binance_client.get_current_price(symbol_pair)
-                            if price > 0:
-                                asset_value = total / price
+                            asset_value = total * price
                         except Exception as e:
-                            logging.debug(f"Could not get price for reverse pair {symbol_pair}: {e}")
+                            logging.debug(f"Could not get price for {symbol_pair}: {e}")
+                            # Try reverse pair if available
+                            try:
+                                symbol_pair = f"{base_currency}{asset}"
+                                price = await self.binance_client.get_current_price(symbol_pair)
+                                if price > 0:
+                                    asset_value = total / price
+                            except Exception as e:
+                                logging.debug(f"Could not get price for reverse pair {symbol_pair}: {e}")
+                        
+                    # Highlight active trading assets
+                    prefix = ""
+                    if asset in traded_assets:
+                        prefix = "🔵 "  # Blue dot for active trading assets
+                    elif asset == base_currency:
+                        prefix = "💵 "  # Cash symbol for base currency
+                        
+                    if asset == base_currency:
+                        # Format base currency with special label
+                        balances.append(f"{prefix}{asset}: {total:.8f} (Base Currency)")
+                    else:
+                        balances.append(f"{prefix}{asset}: {total:.8f} ≈ ${asset_value:.2f}")
                     
-                # Highlight active trading assets
-                prefix = ""
-                if asset in traded_assets:
-                    prefix = "🔵 "  # Blue dot for active trading assets
-                elif asset == base_currency:
-                    prefix = "💵 "  # Cash symbol for base currency
+            elif client_type == 'BybitClient':
+                # For Bybit client
+                # Get balances directly from BybitClient's get_balance method
+                try:
+                    # Get total balance for base currency first
+                    base_balance = await self.binance_client.get_balance(base_currency)
+                    base_balance_value = float(base_balance)
                     
-                if asset == base_currency:
-                    # Format base currency with special label
-                    balances.append(f"{prefix}{asset}: {total:.8f} (Base Currency)")
-                else:
-                    balances.append(f"{prefix}{asset}: {total:.8f} ≈ ${asset_value:.2f}")
+                    # Add base currency to balances with special label
+                    balances.append(f"💵 {base_currency}: {base_balance_value:.8f} (Base Currency)")
+                    
+                    # Get list of active trading symbols
+                    active_symbols = await self.mongo_client.get_trading_symbols()
+                    
+                    # Create set of traded assets by extracting the first part of each symbol
+                    traded_assets = set()
+                    for symbol in active_symbols:
+                        if symbol.endswith(base_currency):
+                            # For pairs like BTCUSDT, extract BTC
+                            traded_assets.add(symbol[:-len(base_currency)])
+                            
+                    # List of major coins to always show
+                    always_show_coins = ['BTC', 'ETH', 'SOL', 'USDC', 'USDT']
+                    always_show_coins.remove(base_currency) if base_currency in always_show_coins else None
+                    
+                    # Combine traded assets and always show coins
+                    display_assets = traded_assets.union(set(always_show_coins))
+                    
+                    # Get each asset's balance
+                    for asset in display_assets:
+                        try:
+                            balance = await self.binance_client.get_balance(asset)
+                            balance_value = float(balance)
+                            
+                            # Skip assets with zero balance
+                            if balance_value <= 0:
+                                continue
+                                
+                            # Get USD value of the asset
+                            asset_value = 0.0
+                            try:
+                                symbol_pair = f"{asset}{base_currency}"
+                                price = await self.binance_client.get_current_price(symbol_pair)
+                                asset_value = balance_value * float(price)
+                            except Exception as e:
+                                logging.debug(f"Could not get price for {symbol_pair}: {e}")
+                                
+                            # Add prefix for traded assets
+                            prefix = "🔵 " if asset in traded_assets else ""
+                            
+                            # Add to balances list
+                            balances.append(f"{prefix}{asset}: {balance_value:.8f} ≈ ${asset_value:.2f}")
+                        except Exception as e:
+                            logging.debug(f"Error getting balance for {asset}: {e}")
+                            
+                except Exception as e:
+                    logging.error(f"Error getting Bybit balances: {e}")
+                    await update.message.reply_text(f"❌ Error retrieving balance: {str(e)}")
+                    return
+            else:
+                # Unknown client type
+                await update.message.reply_text(f"❌ Unsupported client type: {client_type}")
+                return
                 
             # Sort balances: first base currency, then active trading assets, then others
             sorted_balances = []
@@ -865,45 +941,37 @@ Type /help for detailed command information.
             await update.message.reply_text("Error showing menu")
 
     async def show_thresholds(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show detailed threshold information"""
+        """Show current thresholds and status"""
         if not self._is_authorized(update.effective_user.id):
             await update.message.reply_text("⛔ Unauthorized access")
             return
             
         try:
-            now = datetime.utcnow()
+            # Get all timeframes
+            timeframes = list(TimeFrame)
             message_parts = []
             
-            for timeframe in TimeFrame:
-                # Get next reset time with corrected timezone handling
+            # Determine client type
+            client_type = type(self.binance_client).__name__
+            
+            for timeframe in timeframes:
+                # Calculate next reset time
+                now = datetime.utcnow()
+                
                 if timeframe == TimeFrame.DAILY:
-                    # For daily, next reset is at UTC midnight
-                    next_reset = now.replace(hour=0, minute=0, second=0, microsecond=0)
-                    if now >= next_reset:
-                        next_reset += timedelta(days=1)
-
+                    # Next day at midnight UTC
+                    next_reset = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
                 elif timeframe == TimeFrame.WEEKLY:
-                    # For weekly, next reset is Monday UTC midnight
-                    days_until_monday = (7 - now.weekday()) % 7
-                    next_reset = now.replace(hour=0, minute=0, second=0, microsecond=0)
-                    if days_until_monday == 0 and now >= next_reset:
-                        days_until_monday = 7
-                    next_reset += timedelta(days=days_until_monday)
-
-                else:  # MONTHLY
-                    # For monthly, next reset is 1st of next month UTC midnight
+                    # Next Monday at midnight UTC
+                    days_until_monday = 7 - now.weekday() if now.weekday() > 0 else 7
+                    next_reset = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=days_until_monday)
+                elif timeframe == TimeFrame.MONTHLY:
+                    # 1st of next month at midnight UTC
+                    next_reset = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
                     if now.month == 12:
-                        next_reset = now.replace(year=now.year + 1, month=1, day=1,
-                                              hour=0, minute=0, second=0, microsecond=0)
+                        next_reset = next_reset.replace(year=now.year + 1, month=1)
                     else:
-                        next_reset = now.replace(month=now.month + 1, day=1,
-                                              hour=0, minute=0, second=0, microsecond=0)
-                    if now.day == 1 and now >= next_reset:
-                        # If we're on the 1st but after midnight, use next month
-                        if now.month == 12:
-                            next_reset = next_reset.replace(year=next_reset.year + 1, month=1)
-                        else:
-                            next_reset = next_reset.replace(month=next_reset.month + 1)
+                        next_reset = next_reset.replace(month=now.month + 1)
                 
                 # Calculate time until reset
                 time_until_reset = next_reset - now
@@ -920,25 +988,52 @@ Type /help for detailed command information.
                     # Get current and reference prices
                     ref_price = self.binance_client.reference_prices.get(symbol, {}).get(timeframe)
                     
-                    # Get current price
-                    ticker = await self.binance_client.client.get_symbol_ticker(symbol=symbol)
-                    current_price = float(ticker['price'])
+                    # Get current price using the appropriate method for the client type
+                    current_price = None
+                    
+                    if client_type == 'BinanceClient':
+                        try:
+                            ticker = await self.binance_client.client.get_symbol_ticker(symbol=symbol)
+                            current_price = float(ticker['price'])
+                        except Exception as e:
+                            logging.error(f"Error getting price for {symbol} with BinanceClient: {e}")
+                            current_price = await self.binance_client.get_current_price(symbol)
+                    else:  # BybitClient or other
+                        try:
+                            current_price = await self.binance_client.get_current_price(symbol)
+                            if hasattr(current_price, 'is_nan') and current_price.is_nan():
+                                current_price = None
+                            else:
+                                current_price = float(current_price)
+                        except Exception as e:
+                            logging.error(f"Error getting price for {symbol}: {e}")
                     
                     # Calculate price change if reference price exists
-                    if (ref_price):
+                    if ref_price and current_price:
                         price_change = ((current_price - ref_price) / ref_price) * 100
                         price_info = f"Open: ${ref_price:,.2f} | Current: ${current_price:,.2f} ({price_change:+.2f}%)"
-                    else:
+                    elif current_price:
                         price_info = f"Current: ${current_price:,.2f}"
+                    else:
+                        price_info = "Price data unavailable"
                     
                     # Get threshold information with proper access to triggered thresholds
                     triggered = []
                     if symbol in self.binance_client.triggered_thresholds:
                         if timeframe.value in self.binance_client.triggered_thresholds[symbol]:
-                            triggered = list(self.binance_client.triggered_thresholds[symbol][timeframe.value])
+                            triggered_data = self.binance_client.triggered_thresholds[symbol][timeframe.value]
+                            # Handle both set and list types
+                            if isinstance(triggered_data, set):
+                                triggered = list(triggered_data)
+                            else:
+                                triggered = triggered_data
                     
-                    available = [t for t in self.config['trading']['thresholds'][timeframe.value] 
-                               if t not in triggered]
+                    # Get available thresholds from config
+                    if 'trading' in self.config and 'thresholds' in self.config['trading'] and timeframe.value in self.config['trading']['thresholds']:
+                        available = [t for t in self.config['trading']['thresholds'][timeframe.value] 
+                                  if t not in triggered]
+                    else:
+                        available = []
                     
                     # Format symbol section
                     timeframe_msg.extend([
@@ -4096,77 +4191,70 @@ To change this setting:
         await update.message.reply_text(message)
 
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Check bot status"""
+        """Show current status of the trading bot"""
+        if not await self.is_user_authorized(update):
+            return
+            
         try:
-            if not await self.is_user_authorized(update):
-                return
-                
-            # Get environment info
-            env_name = "TESTNET" if self.config['binance']['use_testnet'] else "MAINNET"
-            base_currency = self.config['trading']['base_currency']
+            # Get base currency information
+            base_currency = self.config['trading'].get('base_currency', 'USDT')
+            reserve = float(self.config['trading'].get('reserve_balance', 0))
             
-            # Get trading status
-            trading_enabled = not self.is_paused
-            status_emoji = "✅" if trading_enabled else "❌"
+            # Determine client type and environment
+            client_type = type(self.binance_client).__name__
+            is_testnet = self.binance_client.testnet
+            environment = "TESTNET" if is_testnet else "MAINNET"
+            exchange_name = client_type.replace("Client", "")
             
-            # Get feature statuses
-            trading_config = self.config.get('trading', {})
-            partial_tp_config = trading_config.get('partial_take_profit', {})
-            partial_tp_enabled = partial_tp_config.get('enabled', False)
-            trailing_sl_enabled = trading_config.get('trailing_stop_loss', {}).get('enabled', False)
-            lower_entries_enabled = trading_config.get('only_lower_entries', False)
+            # Check if TP/SL is enabled
+            tp_percentage = getattr(self.binance_client, 'default_tp_percentage', 0)
+            sl_percentage = getattr(self.binance_client, 'default_sl_percentage', 0)
             
-            # Create partial TP details if enabled
-            partial_tp_details = ""
-            if partial_tp_enabled and 'levels' in partial_tp_config:
-                levels = partial_tp_config.get('levels', [])
-                if levels:
-                    partial_tp_details = "\n<b>Partial TP Levels:</b>"
-                    for i, level in enumerate(levels, 1):
-                        if i <= len(levels) and 'profit_percentage' in level and 'position_percentage' in level:
-                            partial_tp_details += f"\n• Level {i}: {level['position_percentage']}% at +{level['profit_percentage']}% profit"
+            # Check if trailing SL is enabled
+            trailing_sl_enabled = getattr(self.binance_client, 'trailing_sl_enabled', False)
             
-            # Create status message
-            status_message = f"""
-<b>🦖 Trade-a-saurus Rex Status</b>
-
-<b>Environment:</b> {env_name}
-<b>Base Currency:</b> {base_currency}
-<b>Trading Status:</b> {status_emoji} {"ACTIVE" if trading_enabled else "PAUSED"}
-<b>Reserve Balance:</b> ${self.binance_client.reserve_balance:.2f}
-
-<b>Features:</b>
-• Partial TP: {"✅ Enabled" if partial_tp_enabled else "❌ Disabled"}{partial_tp_details}
-• Trailing SL: {"✅ Enabled" if trailing_sl_enabled else "❌ Disabled"}
-• Lower Entries Protection: {"✅ Enabled" if lower_entries_enabled else "❌ Disabled"}
-
-<b>Default Settings:</b>
-• Take Profit: {self.binance_client.default_tp_percentage}%
-• Stop Loss: {self.binance_client.default_sl_percentage}%
-
-<b>API Connection:</b> {"✅ Connected" if self.binance_client and self.binance_client.client else "❌ Disconnected"}
-<b>Database Connection:</b> {await self._check_db_status()}
-"""
+            # Check partial TP
+            partial_tp_enabled = False
+            if 'trading' in self.config and 'partial_take_profit' in self.config['trading']:
+                partial_tp_enabled = self.config['trading']['partial_take_profit'].get('enabled', False)
             
-            await update.message.reply_text(
-                text=status_message,
-                parse_mode=ParseMode.HTML,
-                reply_markup=self.markup
-            )
+            # Check lower entries protection
+            only_lower_entries = getattr(self.binance_client, 'only_lower_entries', False)
+            
+            # Format status message
+            status = [
+                f"🦖 Trade-a-saurus Rex Status\n",
+                f"Exchange: {exchange_name}",
+                f"Environment: {environment}",
+                f"Base Currency: {base_currency}",
+                f"Trading Status: {'⏸ PAUSED' if self.is_paused else '✅ ACTIVE'}",
+                f"Reserve Balance: ${reserve:,.2f}\n",
+                f"Features:",
+                f"• Partial TP: {'✅ Enabled' if partial_tp_enabled else '❌ Disabled'}",
+                f"• Trailing SL: {'✅ Enabled' if trailing_sl_enabled else '❌ Disabled'}",
+                f"• Lower Entries Protection: {'✅ Enabled' if only_lower_entries else '❌ Disabled'}\n",
+                f"Default Settings:",
+                f"• Take Profit: {tp_percentage}%",
+                f"• Stop Loss: {sl_percentage}%\n",
+                f"API Connection: {await self._check_api_status()}",
+                f"Database Connection: {await self._check_db_status()}"
+            ]
+            
+            await update.message.reply_text('\n'.join(status))
             
         except Exception as e:
-            logger.error(f"Error checking status: {e}")
-            await update.message.reply_text("Error checking bot status.")
-            
+            logger.error(f"Error getting status: {e}")
+            await update.message.reply_text(f"Error getting status: {str(e)}")
+
     async def _check_api_status(self) -> str:
-        """Check Binance API connection status"""
+        """Check if API connection is working"""
         try:
-            if self.binance_client and self.binance_client.client:
-                await self.binance_client.client.ping()
-                return "✅ Connected"
-            return "❌ Disconnected"
-        except Exception:
-            return "❌ Disconnected"
+            # Check the connection based on client type
+            result = await self.binance_client.check_connection()
+            return "✅ Connected" if result and result.get("success", False) else "❌ Disconnected"
+        except Exception as e:
+            logger.error(f"Error checking API status: {e}")
+            return "❌ Error"
             
     async def _check_db_status(self) -> str:
         """Check MongoDB connection status"""
