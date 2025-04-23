@@ -1801,25 +1801,41 @@ Type /help for detailed command information.
         """Send notification about timeframe threshold reset"""
         try:
             timeframe = reset_data['timeframe']
-            timestamp = reset_data['timestamp']
-            pairs = reset_data['pairs']
+            
+            # Handle the timestamp format
+            timestamp = reset_data.get('timestamp')
+            if isinstance(timestamp, str):
+                # Parse ISO format string
+                timestamp_str = timestamp
+            elif isinstance(timestamp, datetime):
+                # Format datetime object
+                timestamp_str = timestamp.strftime('%Y-%m-%d %H:%M:%S UTC')
+            else:
+                # Default case
+                timestamp_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+            
+            # Check if pairs info is available
+            pairs = reset_data.get('pairs', [])
             
             # Create message header
             message = [
                 f"🔄 {timeframe.upper()} Thresholds Reset",
-                f"Time: {timestamp.strftime('%Y-%m-%d %H:%M:%S UTC')}",
-                f"\nMonitoring {len(pairs)} pairs with new reference prices:"
+                f"Time: {timestamp_str}"
             ]
             
-            # Add pair details
-            for pair_info in pairs:
-                symbol = pair_info['symbol']
-                ref_price = pair_info['reference_price']
-                thresholds = pair_info['thresholds']
+            # Add pairs info if available
+            if pairs:
+                message.append(f"\nMonitoring {len(pairs)} pairs with new reference prices:")
                 
-                message.append(f"\n{symbol}:")
-                message.append(f"  Reference: ${ref_price:,.2f}")
-                message.append(f"  Thresholds: {', '.join(f'{t}%' for t in thresholds)}")
+                # Add pair details
+                for pair_info in pairs:
+                    symbol = pair_info['symbol']
+                    ref_price = pair_info['reference_price']
+                    thresholds = pair_info['thresholds']
+                    
+                    message.append(f"\n{symbol}:")
+                    message.append(f"  Reference: ${ref_price:,.2f}")
+                    message.append(f"  Thresholds: {', '.join(f'{t}%' for t in thresholds)}")
             
             # Send message to all allowed users
             for user_id in self.allowed_users:
@@ -3983,114 +3999,34 @@ To change this setting:
             )
 
     async def register_commands(self):
-        """Register bot commands with the menu"""
-        try:
-            # Register commands in the app menu
-            commands = [
-                ('start', 'Start the bot'),
-                ('menu', 'Show main command menu'),
-                ('power', 'Toggle trading on/off'),
-                ('balance', 'Check current balance'),
-                ('stats', 'View trading statistics'),
-                ('profits', 'View profit/loss analysis'),
-                ('orders', 'View active orders'),
-                ('history', 'View order history'),
-                ('thresholds', 'Show price thresholds'),
-                ('add', 'Add manual trade'),
-                ('resetthresholds', 'Reset price thresholds'),
-                ('symbols', 'Manage trading symbols'),
-                ('viz', 'Show data visualizations'),
-                ('status', 'Check bot system status'),
-                ('tp_sl', 'View TP/SL settings'),
-                ('set_tp', 'Set take profit percentage'),
-                ('set_sl', 'Set stop loss percentage'),
-                ('set_partial_tp', 'Configure partial take profits'),
-                ('partial_tp_disable', 'Disable partial take profits'),
-                ('show_trailing_sl', 'Show trailing stop loss settings'),
-                ('trailing_sl_enable', 'Enable trailing stop loss'),
-                ('trailing_sl_disable', 'Disable trailing stop loss'),
-                ('set_lower_entries', 'Configure lower entries protection'),
-                ('deposit', 'Record a deposit'),
-                ('withdraw', 'Record a withdrawal'),
-                ('transactions', 'View deposit/withdrawal history'),
-                ('help', 'Show help text with all commands')
-            ]
-            
-            await self.application.bot.set_my_commands(commands)
-            
-            # Set command handlers
-            self.application.add_handler(CommandHandler("start", self.start_command))
-            self.application.add_handler(CommandHandler("menu", self.show_menu))
-            self.application.add_handler(CommandHandler("power", self.toggle_trading))
-            self.application.add_handler(CommandHandler("balance", self.balance_command))
-            self.application.add_handler(CommandHandler("stats", self.get_stats))
-            self.application.add_handler(CommandHandler("profits", self.show_profits))
-            self.application.add_handler(CommandHandler("history", self.get_order_history))
-            self.application.add_handler(CommandHandler("thresholds", self.show_thresholds))
-            
-            # Create conversation handler for add_trade workflow
-            add_trade_conv = ConversationHandler(
-                entry_points=[CommandHandler("add", self.add_trade_start)],
-                states={
-                    SYMBOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_trade_symbol)],
-                    ORDER_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_trade_order_type)],
-                    LEVERAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_trade_leverage)],
-                    DIRECTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_trade_direction)],
-                    AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_trade_amount)],
-                    PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_trade_final)]
-                },
-                fallbacks=[CommandHandler("cancel", self.add_trade_cancel),
-                          MessageHandler(filters.Regex('^Cancel$'), self.add_trade_cancel)]
-            )
-            
-            # Add the conversation handler
-            self.application.add_handler(add_trade_conv)
-            
-            # Add other command handlers
-            self.application.add_handler(CommandHandler("help", self.help_command))
-            self.application.add_handler(CommandHandler("resetthresholds", self.reset_all_thresholds))
-            self.application.add_handler(CommandHandler("viz", self.show_viz_menu))
-            self.application.add_handler(CommandHandler("status", self.status_command))
-            self.application.add_handler(CommandHandler("symbols", self.list_symbols_command))
-            self.application.add_handler(CommandHandler("tp_sl", self.show_tp_sl))
-            self.application.add_handler(CommandHandler("set_tp", self.set_take_profit))
-            self.application.add_handler(CommandHandler("set_sl", self.set_stop_loss))
-            self.application.add_handler(CommandHandler("orders", self.orders_command))
-            self.application.add_handler(CommandHandler("deposit", self.deposit_command))
-            self.application.add_handler(CommandHandler("withdraw", self.withdrawal_command))
-            self.application.add_handler(CommandHandler("transactions", self.transactions_command))
-            
-            # Add specific command handlers for partial TP/trailing SL
-            self.application.add_handler(CommandHandler("set_partial_tp", self.set_partial_tp))
-            self.application.add_handler(CommandHandler("partial_tp_disable", self.partial_tp_disable))
-            self.application.add_handler(CommandHandler("show_trailing_sl", self.show_trailing_sl))
-            self.application.add_handler(CommandHandler("trailing_sl_enable", self.trailing_sl_enable))
-            self.application.add_handler(CommandHandler("trailing_sl_disable", self.trailing_sl_disable))
-            self.application.add_handler(CommandHandler("set_lower_entries", self.set_lower_entries))
-            
-            # Add callback query handler for viz menu
-            self.application.add_handler(CallbackQueryHandler(
-                self.handle_viz_selection, pattern=r'^(daily_volume|profit_distribution|order_types|hourly_activity|balance_chart|roi_comparison|sp500_vs_btc|portfolio_composition).*$')
-            )
-            
-            # Add callback query handler for threshold menu
-            self.application.add_handler(CallbackQueryHandler(
-                self.handle_threshold_selection, pattern=r'^(reset_daily|reset_weekly|reset_monthly)$')
-            )
-            
-            # Add callback query handler for symbol management
-            self.application.add_handler(CallbackQueryHandler(
-                self.handle_symbol_callback, pattern=r'^(symbol_remove|back_to_symbols|add_symbol).*$')
-            )
-            
-            # Error handler
-            self.application.add_error_handler(self.handle_error)
-            
-            logger.info("Bot commands registered")
-            return True
-        except Exception as e:
-            logger.error(f"Error registering commands: {e}", exc_info=True)
-            return False
+        """Register all command handlers"""
+        # Basic commands
+        self.application.add_handler(CommandHandler("start", self.start_command))
+        self.application.add_handler(CommandHandler("help", self.help_command))
+        self.application.add_handler(CommandHandler("menu", self.show_menu))
+        self.application.add_handler(CommandHandler("power", self.toggle_trading))
+        self.application.add_handler(CommandHandler("status", self.status_command))
+        self.application.add_handler(CommandHandler("thresholds", self.show_thresholds))
+        self.application.add_handler(CommandHandler("balance", self.balance_command))
+        self.application.add_handler(CommandHandler("stats", self.get_stats))
+        self.application.add_handler(CommandHandler("orders", self.orders_command))
+        self.application.add_handler(CommandHandler("symbols", self.symbols_command))
+        self.application.add_handler(CommandHandler("history", self.get_order_history))
+        self.application.add_handler(CommandHandler("profits", self.show_profits))
+        self.application.add_handler(CommandHandler("addsymbol", self.add_symbol_command))
+        self.application.add_handler(CommandHandler("removesymbol", self.remove_symbol_command))
+        self.application.add_handler(CommandHandler("listsymbols", self.list_symbols_command))
+        self.application.add_handler(CommandHandler("deposit", self.deposit_command))
+        self.application.add_handler(CommandHandler("withdraw", self.withdrawal_command))
+        self.application.add_handler(CommandHandler("transactions", self.transactions_command))
+        self.application.add_handler(CommandHandler("resetall", self.reset_all_thresholds))
+        self.application.add_handler(CommandHandler("tp", self.show_tp_sl))
+        self.application.add_handler(CommandHandler("tpsl", self.show_tp_sl))
+        self.application.add_handler(CommandHandler("trailing", self.show_trailing_sl))
+        self.application.add_handler(CommandHandler("lowerentries", self.show_lower_entries))
+        
+        # Debug command to simulate BTC price jump
+        self.application.add_handler(CommandHandler("btcjump", self.simulate_btc_jump))
 
     async def is_user_authorized(self, update: Update) -> bool:
         """Check if user is authorized to use the bot"""
@@ -4874,4 +4810,71 @@ To change this setting:
         except Exception as e:
             logger.error(f"Error in transactions command: {e}")
             await update.message.reply_text(f"❌ Error: {str(e)}")
+            await update.message.reply_text(f"❌ Error: {str(e)}")
+
+    async def check_btc_price_jump(self, current_price: float, reference_price: float) -> None:
+        """Check if BTC has jumped more than 10% in a day and send a special image
+        
+        Args:
+            current_price: Current BTC price
+            reference_price: Reference BTC price from previous check
+        """
+        try:
+            # Calculate price change percentage
+            price_change_percent = ((current_price - reference_price) / reference_price) * 100
+            
+            # If price increased by more than 10%
+            if price_change_percent > 10:
+                logger.info(f"BTC price jumped by {price_change_percent:.2f}% - Sending we are back image!")
+                
+                # Path to the image
+                image_path = "src/img/weareback.jpeg"
+                
+                # Send image to all allowed users
+                for user_id in self.allowed_users:
+                    try:
+                        with open(image_path, 'rb') as img:
+                            await self.application.bot.send_photo(
+                                chat_id=user_id,
+                                photo=img,
+                                caption=f"🚀 BTC is back! Price jumped by {price_change_percent:.2f}% today!"
+                            )
+                        logger.info(f"Sent 'weareback' image to user {user_id}")
+                    except Exception as e:
+                        logger.error(f"Failed to send BTC jump image to user {user_id}: {e}")
+                
+        except Exception as e:
+            logger.error(f"Error checking BTC price jump: {e}")
+
+    async def simulate_btc_jump(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Simulate a BTC price jump for testing
+        
+        Command: /btcjump
+        """
+        try:
+            # Check if user is authorized
+            if not self._is_authorized(update.effective_user.id):
+                await update.message.reply_text("⛔ You are not authorized to use this bot")
+                return
+                
+            # Simulate a price jump by setting arbitrary prices
+            reference_price = 30000.0  # Simulate previous price
+            current_price = 33500.0    # Simulate current price (>10% increase)
+            
+            # Log the action
+            logger.info(f"User {update.effective_user.id} simulated a BTC price jump")
+            
+            # Send a message confirming we're simulating the jump
+            await update.message.reply_text(
+                "🧪 Simulating a BTC price jump of >10%...\n"
+                f"Reference price: ${reference_price:,.2f}\n"
+                f"Current price: ${current_price:,.2f}\n"
+                f"Change: +{((current_price - reference_price) / reference_price * 100):.2f}%"
+            )
+            
+            # Call the handler to send the image
+            await self.check_btc_price_jump(current_price, reference_price)
+            
+        except Exception as e:
+            logger.error(f"Error simulating BTC price jump: {e}")
             await update.message.reply_text(f"❌ Error: {str(e)}")

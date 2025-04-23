@@ -71,6 +71,10 @@
             "activation_percentage": 1.0,
             "callback_rate": 0.5
         }
+    },
+    "performance_reports": {
+        "weekly_report": true,
+        "monthly_report": true
     }
 }
 

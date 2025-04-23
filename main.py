@@ -19,6 +19,7 @@ from src.database.mongo_client import MongoClient
 from src.telegram.bot import TelegramBot, DINO_ASCII
 from src.trading.order_manager import OrderManager
 from src.utils.logger import setup_logging
+from src.utils.performance_reporter import PerformanceReporter  # Import the PerformanceReporter
 
 # Setup logging first and get config logger
 config_logger = setup_logging()
@@ -180,6 +181,12 @@ def load_config_from_env() -> dict:
     # Add MongoDB load config setting
     mongodb_load_config = os.getenv('MONGODB_LOAD_CONFIG', 'true').lower() == 'true'
     logger.info(f"[CONFIG] Load config from MongoDB: {mongodb_load_config}")
+    
+    # Load performance reports configuration
+    weekly_report = os.getenv('PERFORMANCE_WEEKLY_REPORT', 'true').lower() == 'true'
+    monthly_report = os.getenv('PERFORMANCE_MONTHLY_REPORT', 'true').lower() == 'true'
+    logger.info(f"[CONFIG] Weekly performance reports enabled: {weekly_report}")
+    logger.info(f"[CONFIG] Monthly performance reports enabled: {monthly_report}")
 
     # Combine all configs with both exchange configurations
     config = {
@@ -239,6 +246,10 @@ def load_config_from_env() -> dict:
                 'weekly': [float(x) for x in os.getenv('TRADING_THRESHOLDS_WEEKLY', '5,10,15').split(',') if x],
                 'monthly': [float(x) for x in os.getenv('TRADING_THRESHOLDS_MONTHLY', '10,20,30').split(',') if x]
             }
+        },
+        'performance_reports': {
+            'weekly_report': weekly_report,
+            'monthly_report': monthly_report
         }
     }
     
@@ -456,6 +467,17 @@ async def initialize_services(config):
         # Initialize telegram bot
         await telegram_bot.initialize()
         
+        # Initialize PerformanceReporter
+        performance_reporter = PerformanceReporter(
+            exchange_client=exchange_client,
+            mongo_client=mongo_client,
+            telegram_bot=telegram_bot,
+            config=config
+        )
+        
+        # Link performance reporter to exchange client
+        exchange_client.performance_reporter = performance_reporter
+        
         # Verify reserve balance one more time after all initialization
         logger.info(f"[VERIFY] Final reserve balance: ${exchange_client.reserve_balance:,.2f}")
         
@@ -471,7 +493,8 @@ async def initialize_services(config):
             'mongo_client': mongo_client,
             'exchange_client': exchange_client,
             'telegram_bot': telegram_bot,
-            'order_manager': order_manager
+            'order_manager': order_manager,
+            'performance_reporter': performance_reporter
         }
     except Exception as e:
         logger.error(f"Error initializing services: {e}", exc_info=True)

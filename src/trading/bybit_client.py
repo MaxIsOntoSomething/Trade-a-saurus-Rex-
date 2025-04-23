@@ -21,6 +21,7 @@ from ..database.mongo_client import MongoClient
 from ..utils.rate_limiter import RateLimiter
 from ..utils.chart_generator import ChartGenerator
 from ..utils.yahoo_scrapooooor_sp500 import YahooSP500Scraper
+from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
@@ -29,15 +30,63 @@ class BybitClient:
         self.api_key = api_key
         self.api_secret = api_secret
         self.testnet = testnet
+        self.telegram_bot = telegram_bot
+        self.mongo_client = mongo_client
+        self.config = config or {}
         self.client = None
-        self.ws_client = None
+        self.time_offset = 0
         
-        # Fix for "Illegal category" error
-        # For testnet, use "linear" category, for production use "spot"
-        # linear refers to USDT perpetual futures which is available on testnet
-        # spot refers to spot trading which is not available on testnet
-        self.trading_category = "linear" if testnet else "spot"
-        logger.info(f"[INIT] Using trading category: {self.trading_category} for {'testnet' if testnet else 'mainnet'}")
+        # Trading properties
+        self.base_currency = self.config['trading'].get('base_currency', 'USDT')
+        self.reserve_balance = float(self.config['trading'].get('reserve_balance', 500))
+        self.only_lower_entries = self.config['trading'].get('only_lower_entries', True)
+        
+        # TP/SL settings
+        self.default_tp_percentage = self._parse_tp_sl_setting(
+            self.config['trading'].get('take_profit', '5%')
+        )
+        self.default_sl_percentage = self._parse_tp_sl_setting(
+            self.config['trading'].get('stop_loss', '3%')
+        )
+        
+        # Trading settings
+        self.thresholds = self.config['trading'].get('thresholds', {
+            'daily': [1, 2, 5],
+            'weekly': [5, 10, 15],
+            'monthly': [10, 20, 30]
+        })
+        
+        # Exchange info
+        self.exchange_info = None
+        self.client_initialized = False
+        self.symbol_details = {}
+        self.invalid_symbols = set()
+        
+        # State management for thresholds
+        self.triggered_thresholds = defaultdict(lambda: {
+            TimeFrame.DAILY: set(),
+            TimeFrame.WEEKLY: set(),
+            TimeFrame.MONTHLY: set()
+        })
+        
+        # Store reference timestamps and prices for timeframes
+        self.reference_timestamps = {
+            TimeFrame.DAILY: None,
+            TimeFrame.WEEKLY: None,
+            TimeFrame.MONTHLY: None
+        }
+        self.reference_prices = {}
+        
+        # Performance reporter for generating period reports
+        self.performance_reporter = None
+        
+        # Determine category based on testnet status
+        # IMPORTANT: testnet uses "linear" category, mainnet uses "spot" for spot trading
+        self._trading_category = "linear" if self.testnet else "spot"
+        
+        logger.info(f"Initialized BybitClient with testnet={testnet}, "
+                   f"trading_category={self._trading_category}, "
+                   f"base_currency={self.base_currency}")
         
         # Add clear warning if using testnet with USDC pairs
         if testnet and config and 'trading' in config:
@@ -46,69 +95,26 @@ class BybitClient:
                 logger.warning(f"[INIT] ⚠️ WARNING: USDC spot trading is NOT available on Bybit Testnet!")
                 logger.warning(f"[INIT] Please switch to USDT as base currency when using testnet, or switch to mainnet for USDC trading.")
         
-        self.reference_prices = {}
-        self.triggered_thresholds = {}
         self.rate_limiter = RateLimiter()
         self.symbol_info = {}
         self.last_reset = {
             tf: datetime.utcnow() for tf in TimeFrame
         }
         self.balance_cache = {}
-        self.reference_timestamps = {
-            TimeFrame.DAILY: None,
-            TimeFrame.WEEKLY: None,
-            TimeFrame.MONTHLY: None
-        }
-        # Add time synchronization variables
-        self.time_offset = 0  # Offset between local and server time in milliseconds
-        self.time_offset_updated = False  # Whether we've updated the time offset
-        
-        logger.setLevel(logging.DEBUG)
-        self.telegram_bot = telegram_bot
-        self.chart_generator = ChartGenerator()
-        self.mongo_client = mongo_client
-        self.config = config
-        
-        # Initialize invalid symbols set
-        self.invalid_symbols = set()
         self.removed_symbols_this_cycle = set()
         
         # Set API environment info
         environment = "TESTNET" if testnet else "MAINNET"
         logger.info(f"[INIT] Using Bybit {environment} API")
         
-        # Set reserve balance and base currency directly from config
-        self.base_currency = None
-        self.reserve_balance = 0
-        self.default_tp_percentage = 5.0  # Default 5% take profit
-        self.default_sl_percentage = 3.0  # Default 3% stop loss
-        
-        if config and 'trading' in config:
-            self.base_currency = config['trading'].get('base_currency', 'USDT')
-            self.reserve_balance = float(config['trading'].get('reserve_balance', 0))
-            
-            # Parse the take profit/stop loss settings
-            tp_setting = config['trading'].get('take_profit', '5%')
-            sl_setting = config['trading'].get('stop_loss', '3%')
-            
-            if isinstance(tp_setting, str) and '%' in tp_setting:
-                self.default_tp_percentage = float(tp_setting.replace('%', ''))
-            elif isinstance(tp_setting, (int, float)):
-                self.default_tp_percentage = float(tp_setting)
-                
-            if isinstance(sl_setting, str) and '%' in sl_setting:
-                self.default_sl_percentage = float(sl_setting.replace('%', ''))
-            elif isinstance(sl_setting, (int, float)):
-                self.default_sl_percentage = float(sl_setting)
-                
-            logger.info(f"[INIT] Config loaded directly: Base Currency={self.base_currency}, Reserve=${self.reserve_balance:,.2f}")
-            logger.info(f"[INIT] Take Profit: {self.default_tp_percentage}%, Stop Loss: {self.default_sl_percentage}%")
-        
         # Initialize Yahoo SP500 scraper
         self.yahoo_scraper = YahooSP500Scraper()
         
         # Initialize thresholds dictionary with nested structure to track triggered thresholds
         self.triggered_thresholds = {}
+        
+        # Performance reporter for generating period reports
+        self.performance_reporter = None
         
     def set_telegram_bot(self, bot):
         """Set the Telegram bot reference after initialization"""
@@ -174,15 +180,15 @@ class BybitClient:
             
             # Initialize WebSocket client if needed
             if self.testnet:
-                ws_endpoint = f"wss://stream-testnet.bybit.com/v5/public/{self.trading_category}"
+                ws_endpoint = f"wss://stream-testnet.bybit.com/v5/public/{self._trading_category}"
             else:
-                ws_endpoint = f"wss://stream.bybit.com/v5/public/{self.trading_category}"
+                ws_endpoint = f"wss://stream.bybit.com/v5/public/{self._trading_category}"
                 
             self.ws_client = WebSocket(
                 testnet=self.testnet,
                 api_key=self.api_key,
                 api_secret=self.api_secret,
-                channel_type=self.trading_category
+                channel_type=self._trading_category
             )
             
             # Initialize rate limiter
@@ -195,7 +201,7 @@ class BybitClient:
             try:
                 await self.rate_limiter.acquire()
                 # Get instruments info for the specified trading category
-                response = await self.make_request('get_instruments_info', params={"category": self.trading_category})
+                response = await self.make_request('get_instruments_info', params={"category": self._trading_category})
                 
                 if response and isinstance(response, dict) and response.get('retCode') == 0:
                     instruments = response.get('result', {}).get('list', [])
@@ -287,62 +293,97 @@ class BybitClient:
         logger.info("Bybit client connections closed")
             
     async def check_timeframe_reset(self, timeframe: TimeFrame) -> bool:
-        """Check if a timeframe needs to be reset and perform the reset if needed"""
+        """Check if a timeframe needs to be reset and handle the reset if needed"""
         try:
-            current_time = datetime.utcnow()
-            last_reset = self.last_reset.get(timeframe, datetime.utcnow())
-            reset_occurred = False
+            logger.debug(f"Checking {timeframe.value} timeframe reset")
             
-            # Time-based reset logic
+            # Get the current time in UTC
+            current_time = datetime.utcnow()
+            
+            # Check if this timeframe needs to be reset based on current time
             if timeframe == TimeFrame.DAILY:
-                # Reset daily if we crossed midnight UTC
-                if current_time.day != last_reset.day or current_time.month != last_reset.month:
-                    reset_occurred = True
-                    
-            elif timeframe == TimeFrame.WEEKLY:
-                # Reset weekly if we crossed from one week to another (Monday is day 0)
-                current_week = current_time.isocalendar()[1]  # Week number
-                last_week = last_reset.isocalendar()[1]
-                if current_week != last_week:
-                    reset_occurred = True
-                    
-            elif timeframe == TimeFrame.MONTHLY:
-                # Reset monthly if we crossed to a new month
-                if current_time.month != last_reset.month or current_time.year != last_reset.year:
-                    reset_occurred = True
-                    
-            # If a reset should occur, perform it
-            if reset_occurred:
-                logger.info(f"Timeframe reset detected for {timeframe.value}")
+                # Reset at the beginning of each day
+                reset_needed = current_time.hour == 0 and current_time.minute < 5
                 
-                # Reset all thresholds for this timeframe in database if available
-                if self.mongo_client:
-                    await self.mongo_client.reset_timeframe_thresholds(timeframe.value)
-                    
-                # Reset all reference prices for this timeframe
-                for symbol in list(self.reference_prices.keys()):
-                    if timeframe in self.reference_prices[symbol]:
-                        # Don't delete, but mark for update
-                        self.reference_prices[symbol][timeframe] = None
-                        
-                # Update the last reset time
-                self.last_reset[timeframe] = current_time
+            elif timeframe == TimeFrame.WEEKLY:
+                # Reset on Monday (weekday 0) at the beginning of the day
+                reset_needed = current_time.weekday() == 0 and current_time.hour == 0 and current_time.minute < 5
+                
+            elif timeframe == TimeFrame.MONTHLY:
+                # Reset on the first day of the month at the beginning of the day
+                reset_needed = current_time.day == 1 and current_time.hour == 0 and current_time.minute < 5
+                
+            else:
+                logger.error(f"Unknown timeframe: {timeframe}")
+                return False
+                
+            if reset_needed:
+                logger.info(f"Resetting {timeframe.value} timeframe thresholds")
+                
+                # Clear triggered thresholds for this timeframe
+                await self.reset_timeframe_thresholds(timeframe.value)
                 
                 # Update reference timestamps
-                self.reference_timestamps[timeframe] = None
+                self.reference_timestamps[timeframe] = int(current_time.timestamp() * 1000)
                 
-                # Reset triggered thresholds for this timeframe
-                for symbol in list(self.triggered_thresholds.keys()):
-                    if timeframe.value in self.triggered_thresholds[symbol]:
-                        self.triggered_thresholds[symbol][timeframe.value] = []
+                # Update reference prices
+                symbols = self.config['trading'].get('pairs', [])
+                
+                # Create a list for pair information to send with the notification
+                pairs_info = []
+                
+                # Filter out invalid symbols first
+                valid_symbols = []
+                for symbol in symbols:
+                    if self._is_valid_symbol_format(symbol) and symbol not in self.invalid_symbols:
+                        valid_symbols.append(symbol)
+                    else:
+                        logger.warning(f"Skipping invalid symbol: {symbol}")
+                
+                # Update reference prices for each valid symbol
+                for symbol in valid_symbols:
+                    try:
+                        # Get current price to use as the new reference
+                        current_price = await self.get_current_price(symbol)
                         
-                # Send reset notification if telegram bot is available
+                        if current_price:
+                            # Store the new reference price
+                            if symbol not in self.reference_prices:
+                                self.reference_prices[symbol] = {}
+                                
+                            self.reference_prices[symbol][timeframe] = current_price
+                            logger.info(f"Updated {timeframe.value} reference price for {symbol}: ${float(current_price):,.2f}")
+                            
+                            # Save to database
+                            if self.mongo_client:
+                                await self.mongo_client.save_reference_price(
+                                    symbol, timeframe.value, float(current_price)
+                                )
+                            
+                            # Add to pairs info for notification
+                            pairs_info.append({
+                                'symbol': symbol,
+                                'reference_price': float(current_price),
+                                'thresholds': self.thresholds[timeframe.value]
+                            })
+                    except Exception as e:
+                        logger.error(f"Error updating reference price for {symbol}: {e}")
+                
+                # Send notification if telegram bot is available
                 if self.telegram_bot:
                     reset_data = {
                         'timeframe': timeframe.value,
-                        'timestamp': current_time.isoformat(),
+                        'timestamp': current_time,
+                        'pairs': pairs_info
                     }
                     await self.telegram_bot.send_timeframe_reset_notification(reset_data)
+                
+                # Generate performance report if applicable and performance reporter is available
+                if self.performance_reporter:
+                    try:
+                        await self.performance_reporter.handle_timeframe_reset(timeframe, reset_data)
+                    except Exception as e:
+                        logger.error(f"Error generating performance report for {timeframe.value}: {e}")
                 
                 return True
                 
@@ -368,11 +409,55 @@ class BybitClient:
             if self.mongo_client:
                 await self.mongo_client.reset_timeframe_thresholds(timeframe_str)
                 
+            # Get current time for notification
+            current_time = datetime.utcnow()
+            
+            # Create list of pairs with reference prices for notification
+            symbols = self.config['trading'].get('pairs', [])
+            pairs_info = []
+            
+            # Only include valid symbols
+            valid_symbols = [s for s in symbols 
+                            if self._is_valid_symbol_format(s) and s not in self.invalid_symbols]
+            
+            # Get reference prices for all valid symbols
+            for symbol in valid_symbols:
+                try:
+                    # Use existing reference price or get current price
+                    if (symbol in self.reference_prices and 
+                        TimeFrame_enum in self.reference_prices[symbol]):
+                        ref_price = float(self.reference_prices[symbol][TimeFrame_enum])
+                    else:
+                        current_price = await self.get_current_price(symbol)
+                        ref_price = float(current_price) if current_price else 0.0
+                    
+                    # Add to pairs info for notification
+                    if ref_price > 0:
+                        pairs_info.append({
+                            'symbol': symbol,
+                            'reference_price': ref_price,
+                            'thresholds': self.thresholds[timeframe_str]
+                        })
+                except Exception as e:
+                    logger.error(f"Error getting reference price for {symbol}: {e}")
+            
+            # Prepare reset data
+            reset_data = {
+                "timeframe": timeframe_str,
+                "timestamp": current_time,
+                "pairs": pairs_info
+            }
+            
             # Send notification if telegram bot is available
             if self.telegram_bot:
-                await self.telegram_bot.send_timeframe_reset_notification({
-                    "timeframe": timeframe_str
-                })
+                await self.telegram_bot.send_timeframe_reset_notification(reset_data)
+                
+            # Generate performance report if applicable
+            if self.performance_reporter:
+                try:
+                    await self.performance_reporter.handle_timeframe_reset(TimeFrame_enum, reset_data)
+                except Exception as e:
+                    logger.error(f"Error generating performance report for {timeframe_str}: {e}")
                 
             logger.info(f"Successfully reset thresholds for {timeframe_str}")
             return True
@@ -527,6 +612,16 @@ class BybitClient:
             # Calculate price change as a percentage
             price_change = ((current_price_dec - reference_price_dec) / reference_price_dec) * Decimal('100')
             
+            # Check for BTC price jump if this is BTCUSDT/BTCUSDC
+            if symbol.startswith('BTC') and timeframe == TimeFrame.DAILY and self.telegram_bot:
+                # Convert to float for easier comparison
+                price_change_float = float(price_change)
+                if price_change_float > 10:
+                    # BTC has increased by more than 10% - call the method to send image
+                    await self.telegram_bot.check_btc_price_jump(
+                        float(current_price_dec), float(reference_price_dec)
+                    )
+            
             # Get thresholds for this timeframe
             thresholds = self.config['trading']['thresholds'][timeframe.value]
             
@@ -537,34 +632,32 @@ class BybitClient:
                 # Convert threshold to Decimal for comparison
                 threshold_dec = Decimal(str(threshold))
                 
-                # Skip if this threshold has already been triggered
-                if (
-                    symbol in self.triggered_thresholds and
-                    timeframe.value in self.triggered_thresholds[symbol] and
-                    threshold in self.triggered_thresholds[symbol][timeframe.value]
-                ):
-                    logger.debug(f"Threshold {threshold}% for {symbol} {timeframe.value} already triggered")
-                    continue
-                    
-                # Check if price dropped by the threshold percentage or more
+                # Check if price has decreased by more than the threshold percentage
+                # and we haven't triggered this threshold before
                 if price_change <= -threshold_dec:
-                    triggered.append(threshold)
-                    logger.info(f"✅ Threshold triggered: {symbol} {threshold}% on {timeframe.value}")
-                    
-                    # Mark threshold as triggered
-                    await self.mark_threshold_triggered(symbol, timeframe, threshold)
-                    
-                    # Send notification if we have a telegram bot
-                    if hasattr(self, 'telegram_bot') and self.telegram_bot:
-                        await self.telegram_bot.send_threshold_notification(
-                            symbol, timeframe, threshold, 
-                            float(current_price_dec), float(reference_price_dec), float(price_change)
+                    # Only trade on dropping prices if configured
+                    if self.only_lower_entries or price_change <= 0:
+                        is_triggered = await self.mongo_client.check_triggered_threshold(
+                            symbol, timeframe.value, threshold
                         )
+                        
+                        if not is_triggered:
+                            # Mark as triggered and save
+                            await self.mark_threshold_triggered(symbol, timeframe, threshold)
+                            triggered.append(threshold)
+                            
+                            # Log and send notification
+                            logger.info(f"Threshold triggered for {symbol} {timeframe.value} {threshold}%: {price_change}%")
+                            if self.telegram_bot:
+                                await self.telegram_bot.send_threshold_notification(
+                                    symbol, timeframe, threshold,
+                                    float(current_price_dec), float(reference_price_dec), float(price_change)
+                                )
             
             return triggered
             
         except Exception as e:
-            logger.error(f"Error checking thresholds for {symbol} {timeframe.value}: {e}")
+            logger.error(f"Error checking thresholds for {symbol}: {e}")
             return []
             
     async def mark_threshold_triggered(self, symbol: str, timeframe: TimeFrame, threshold: float):
@@ -719,7 +812,7 @@ class BybitClient:
                 
             # Prepare order creation parameters for Bybit API
             order_params = {
-                "category": self.trading_category,
+                "category": self._trading_category,
                 "symbol": symbol,
                 "side": "Buy",
                 "orderType": "Limit",
@@ -776,7 +869,7 @@ class BybitClient:
             
             # Cancelling order through Bybit API
             response = self.client.cancel_order(
-                category=self.trading_category,
+                category=self._trading_category,
                 symbol=symbol,
                 orderId=order_id
             )
@@ -799,7 +892,7 @@ class BybitClient:
             
             # Get order details from Bybit API
             response = self.client.get_order_history(
-                category=self.trading_category,
+                category=self._trading_category,
                 symbol=symbol,
                 orderId=order_id
             )
@@ -895,7 +988,7 @@ class BybitClient:
             await self.rate_limiter.acquire()
             response = await self.make_request(
                 method="get_tickers",
-                params={"category": self.trading_category, "symbol": symbol}
+                params={"category": self._trading_category, "symbol": symbol}
             )
             
             # Validate response
@@ -1076,14 +1169,14 @@ class BybitClient:
         """Check if a symbol is valid on Bybit"""
         try:
             # First try to get ticker info
-            response = await self.make_request('get_tickers', params={"category": self.trading_category, "symbol": symbol})
+            response = await self.make_request('get_tickers', params={"category": self._trading_category, "symbol": symbol})
             
             if response['retCode'] == 0 and response['result']:
                 logger.info(f"Symbol {symbol} validated via ticker info")
                 return True
             
             # If ticker fails, try instruments info
-            instruments_response = await self.make_request('get_instruments_info', params={"category": self.trading_category, "symbol": symbol})
+            instruments_response = await self.make_request('get_instruments_info', params={"category": self._trading_category, "symbol": symbol})
             
             if instruments_response['retCode'] == 0 and instruments_response['result']:
                 logger.info(f"Symbol {symbol} validated via instruments info")
@@ -1414,7 +1507,7 @@ class BybitClient:
             # Get kline/candle data from Bybit
             await self.rate_limiter.acquire()
             response = self.client.get_kline(
-                category=self.trading_category,
+                category=self._trading_category,
                 symbol=symbol,
                 interval=bybit_interval,
                 limit=count + 5  # Request a few extra candles
@@ -1540,7 +1633,7 @@ class BybitClient:
             # Use daily klines for longer periods
             await self.rate_limiter.acquire()
             response = self.client.get_kline(
-                category=self.trading_category,
+                category=self._trading_category,
                 symbol=symbol,
                 interval="D",  # Daily candles
                 limit=200  # Maximum allowed by Bybit
@@ -1811,7 +1904,7 @@ class BybitClient:
                         params = {}
                     # Make sure we have the proper category parameter
                     if 'category' not in params:
-                        params['category'] = self.trading_category
+                        params['category'] = self._trading_category
                 
                 # Handle direct client method calls vs HTTP methods
                 try:
