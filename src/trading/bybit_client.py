@@ -107,6 +107,9 @@ class BybitClient:
         environment = "TESTNET" if testnet else "MAINNET"
         logger.info(f"[INIT] Using Bybit {environment} API")
         
+        # Initialize chart generator
+        self.chart_generator = ChartGenerator()
+        
         # Initialize Yahoo SP500 scraper
         self.yahoo_scraper = YahooSP500Scraper()
         

@@ -1010,6 +1010,11 @@ Type /help for detailed command information.
                     
                     # Calculate price change if reference price exists
                     if ref_price and current_price:
+                        # Convert ref_price to float if it's a Decimal to avoid type error
+                        if isinstance(ref_price, Decimal):
+                            ref_price = float(ref_price)
+                        # Ensure both values are floats before calculation
+                        current_price = float(current_price)
                         price_change = ((current_price - ref_price) / ref_price) * 100
                         price_info = f"Open: ${ref_price:,.2f} | Current: ${current_price:,.2f} ({price_change:+.2f}%)"
                     elif current_price:
@@ -4119,9 +4124,15 @@ To change this setting:
         self.application.add_handler(CommandHandler("tpsl", self.show_tp_sl))
         self.application.add_handler(CommandHandler("trailing", self.show_trailing_sl))
         self.application.add_handler(CommandHandler("lowerentries", self.show_lower_entries))
+        self.application.add_handler(CommandHandler("viz", self.show_viz_menu))
         
         # Debug command to simulate BTC price jump
         self.application.add_handler(CommandHandler("btcjump", self.simulate_btc_jump))
+        
+        # Register callback query handlers
+        self.application.add_handler(CallbackQueryHandler(self.handle_viz_selection, pattern='^(daily_volume|profit_distribution|order_types|hourly_activity|balance_chart|roi_comparison|sp500_vs_btc|portfolio_composition|gold_comparison)$'))
+        self.application.add_handler(CallbackQueryHandler(self.handle_threshold_selection, pattern='^reset_(daily|weekly|monthly)$'))
+        self.application.add_handler(CallbackQueryHandler(self.handle_symbol_callback, pattern='^symbol_'))
 
     async def is_user_authorized(self, update: Update) -> bool:
         """Check if user is authorized to use the bot"""
