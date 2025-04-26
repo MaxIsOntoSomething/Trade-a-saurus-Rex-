@@ -1,0 +1,7 @@
+did you also fix this?
+Max, [25.04.2025 09:45]
+/profits
+
+Trade-a-saurus Rex, [25.04.2025 09:45]
+❌ Error calculating profits: 'HTTP' object has no attribute 'get_symbol_ticker'
+

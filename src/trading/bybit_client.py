@@ -22,10 +22,68 @@ from ..utils.rate_limiter import RateLimiter
 from ..utils.chart_generator import ChartGenerator
 from ..utils.yahoo_scrapooooor_sp500 import YahooSP500Scraper
 from collections import defaultdict
+import random
+import hmac
+import hashlib
+import aiohttp
 
 logger = logging.getLogger(__name__)
 
 class BybitClient:
+    """Bybit API client implementation
+    
+    Implements BaseClient interface for Bybit exchange
+    """
+    
+    # Common Bybit API error codes
+    ERROR_CODES = {
+        # Auth errors
+        10001: "Invalid parameter(s)",
+        10002: "Invalid request",
+        10003: "Invalid API key",
+        10004: "Invalid sign",
+        10005: "Permission denied (API key has insufficient permissions)",
+        10006: "Too many requests (rate limit exceeded)",
+        10007: "API key expired",
+        10010: "IP request restricted",
+        
+        # System errors
+        10016: "Service unavailable (internal system error)",
+        10017: "Service timeout",
+        10018: "Service is currently updating",
+        
+        # Order errors
+        110001: "Order does not exist",
+        110003: "Order price exceeds limits",
+        110004: "Insufficient wallet balance",
+        110005: "Position in closing process",
+        110006: "Not in trading time",
+        110007: "Invalid order type for current instruction",
+        110008: "Invalid trading pair/contract",
+        
+        # Other errors
+        170001: "Internal error",
+        170005: "Duplication request ID"
+    }
+    
+    # Error codes that should trigger retries
+    RETRY_ERROR_CODES = [10016, 10006, 10004, 10017, 10018, 170001]
+    
+    # Error codes that are related to API limits but not server issues
+    LIMIT_ERROR_CODES = [10006, 10010]
+    
+    # Error codes that indicate invalid credentials but a working API
+    AUTH_ERROR_CODES = [10003, 10004, 10005, 10007]
+    
+    # Map from system error codes to retry times in seconds
+    ERROR_RETRY_MAP = {
+        10006: 1,   # Rate limit - retry quickly
+        10016: 5,   # System error - wait a bit longer
+        10017: 3,   # Service timeout - medium wait
+        10018: 10,  # Service updating - wait longer
+        170001: 5,  # Internal error - wait a bit longer
+    }
+    
     def __init__(self, api_key: str, api_secret: str, telegram_bot=None, mongo_client=None, config=None, testnet: bool = True):
         self.api_key = api_key
         self.api_secret = api_secret
@@ -1578,54 +1636,70 @@ class BybitClient:
             logger.error(f"Error generating trade chart: {e}")
             return None
 
-    async def check_connection(self) -> dict:
-        """Check connection to Bybit and return status data for health checks"""
+    async def check_connection(self, retries=3):
+        """Check connection to Bybit API with robust error handling.
+        
+        Args:
+            retries: Number of retries to attempt
+            
+        Returns:
+            bool: True if connection is valid, False otherwise
+        """
+        logger.debug("Checking connection to Bybit API...")
+        
+        # First check: Get server time
+        server_time = await self.get_server_time()
+        if not server_time:
+            logger.error("Failed to get server time from Bybit API")
+            
+            # Try one more time with longer timeout
+            logger.debug("Retrying server time check with longer timeout...")
+            server_time = await self.get_server_time()
+            if not server_time:
+                return False
+            
+        # Second check: Try to get ticker or balances
         try:
-            # Test connection by getting server time
-            time_response = self.client.get_server_time()
-            if not time_response or not isinstance(time_response, dict) or time_response.get('retCode') != 0:
-                raise Exception(f"Failed to get server time: {time_response}")
-            
-            server_time = datetime.fromtimestamp(int(time_response['result']['timeNano']) // 1000000000)
-            
-            # Get wallet balance
-            balance_response = self.client.get_wallet_balance(
-                accountType="UNIFIED"
-            )
-            
-            if not balance_response or not isinstance(balance_response, dict) or balance_response.get('retCode') != 0:
-                raise Exception(f"Failed to get wallet balance: {balance_response}")
-            
-            # Extract balances
-            balances = {}
-            if 'result' in balance_response and 'list' in balance_response['result']:
-                for account in balance_response['result']['list']:
-                    for coin in account.get('coin', []):
-                        coin_name = coin['coin']
-                        free_balance = float(coin['free'])
-                        if free_balance > 0:
-                            balances[coin_name] = free_balance
-            
-            # Get base currency balance
-            base_cur = self.base_currency or 'USDT'
-            base_balance = balances.get(base_cur, 0)
-            
-            return {
-                "status": "connected",
-                "server_time": server_time.isoformat(),
-                "base_currency": base_cur,
-                "base_balance": base_balance,
-                "reserve_balance": self.reserve_balance,
-                "balances": balances,
-                "is_paused": self.telegram_bot.is_paused if self.telegram_bot else True,
-                "invalid_symbols": list(self.invalid_symbols)
-            }
+            if self.authenticated:
+                # Try to get wallet balances - we're not concerned with the actual values,
+                # just whether the API responds properly
+                balance_response = await self.get_balances()
+                
+                if not balance_response or (isinstance(balance_response, dict) and balance_response.get('retCode', -1) != 0):
+                    # If we get an auth error but server is responding, consider it "connected"
+                    if isinstance(balance_response, dict) and balance_response.get('retCode') in self.AUTH_ERROR_CODES:
+                        logger.warning(f"API credentials issue: {balance_response.get('retMsg', 'Unknown error')}")
+                        return True
+                        
+                    # Fall back to public endpoint check if auth fails
+                    logger.warning("Authenticated request failed, falling back to public endpoint check")
+                    ticker = await self.get_ticker("BTCUSDT")
+                    
+                    if not ticker or not isinstance(ticker, dict) or len(ticker) == 0:
+                        logger.error("Failed to get BTCUSDT ticker from Bybit API")
+                        return False
+                        
+                    logger.info("Successfully connected to Bybit API (public endpoints only)")
+                    return True
+                    
+                # If we got a successful response, connection is good
+                logger.debug("Successfully connected to Bybit API (authenticated)")
+                return True
+            else:
+                # For unauthenticated clients, just check if we can get public data
+                # Try multiple major coins in case one has API issues
+                for test_symbol in ["BTCUSDT", "ETHUSDT", "SOLUSDT"]:
+                    ticker = await self.get_ticker(test_symbol)
+                    if ticker and isinstance(ticker, dict) and len(ticker) > 0:
+                        logger.debug(f"Successfully connected to Bybit API using {test_symbol} ticker")
+                        return True
+                
+                logger.error("Failed to get any test ticker from Bybit API")
+                return False
+                
         except Exception as e:
-            logger.error(f"Connection check failed: {e}")
-            return {
-                "status": "error",
-                "error": str(e)
-            }
+            logger.error(f"Error checking connection to Bybit API: {str(e)}")
+            return False
 
     async def get_historical_prices(self, symbol: str, days: int = 30) -> List[Dict]:
         """Get historical price data for a symbol for specified number of days"""
@@ -1874,127 +1948,176 @@ class BybitClient:
             logger.error(f"Error generating YTD comparison chart: {e}")
             return None
 
-    async def make_request(self, method, endpoint=None, params=None, *args, **kwargs):
-        """Make a request to the API with time synchronization
+    async def make_request(self, method_name, params=None, retry_count=3, initial_backoff=1):
+        """Make a request to the Bybit API with improved error handling and retry logic.
         
         Args:
-            method: Either a client method name or HTTP method ('GET', 'POST', etc)
-            endpoint: Optional REST API endpoint. If None, method is treated as client method
-            params: Optional parameters for REST API calls
-            *args, **kwargs: Additional arguments passed to client methods
+            method_name: API method name
+            params: Request parameters
+            retry_count: Number of retries for certain errors
+            initial_backoff: Initial backoff time in seconds
             
         Returns:
-            dict: Standardized response with retCode and result
+            API response or None if failed
         """
-        retries = 3
+        if not self.session:
+            self.session = self.create_session()
+            
+        if method_name not in self.methods:
+            logger.error(f"Method {method_name} not found in Bybit API methods")
+            return None
+            
+        method = self.methods[method_name]
+        
+        # Setup default parameters and merge with provided ones
+        request_params = {}
+        if params:
+            request_params.update(params)
+            
         current_retry = 0
-        last_error = None
+        max_retries = retry_count
         
-        while current_retry < retries:
+        # For system errors (10016), use more aggressive retry strategy
+        system_error_retry_count = 0
+        max_system_error_retries = 5  # Allow more retries for system errors
+        
+        while current_retry <= max_retries:
             try:
-                # Update time offset if not already done
-                if not self.time_offset_updated:
-                    await self.update_time_offset()
-                
-                # Add the timestamp offset to the recv_window parameter if needed
-                if 'recv_window' not in kwargs:
-                    # Start with a moderate window of 10000ms
-                    kwargs['recv_window'] = 10000 + (5000 * current_retry)
-                
-                # Ensure category parameter is correctly set for relevant methods
-                if method == 'get_instruments_info' or method == 'get_tickers':
-                    if params is None:
-                        params = {}
-                    # Make sure we have the proper category parameter
-                    if 'category' not in params:
-                        params['category'] = self._trading_category
-                
-                # Handle direct client method calls vs HTTP methods
-                try:
-                    if endpoint:
-                        # For REST API calls, use the client's methods directly
-                        if method.upper() == 'GET':
-                            # For GET requests, combine endpoint and params into a single method call
-                            method_name = endpoint.strip('/').replace('/', '_')
-                            if params:
-                                response = getattr(self.client, method_name)(**params)
-                            else:
-                                response = getattr(self.client, method_name)()
-                        else:
-                            raise ValueError(f"Unsupported HTTP method: {method}")
+                # Different structure for GET vs POST
+                if method['method'] == 'GET':
+                    if 'header' in method and method['header']:
+                        # Authenticated request
+                        timestamp = int(time.time() * 1000)
+                        request_params['timestamp'] = timestamp
+                        
+                        # Add authentication headers
+                        headers = self.generate_headers(request_params)
+                        
+                        url = f"{self.api_url}{method['url']}"
+                        if request_params:
+                            # Convert params to query string
+                            query = '&'.join([f"{k}={v}" for k, v in request_params.items()])
+                            url = f"{url}?{query}"
+                            
+                        async with self.session.get(url, headers=headers) as response:
+                            response_json = await response.json()
                     else:
-                        # This is a direct client method call
-                        if not hasattr(self.client, method):
-                            raise ValueError(f"Unknown client method: {method}")
-                        func = getattr(self.client, method)
-                        # Add the parameters to the method call if they exist
-                        if params:
-                            response = func(*args, **params, **kwargs)
-                        else:
-                            response = func(*args, **kwargs)
+                        # Public request
+                        url = f"{self.api_url}{method['url']}"
+                        if request_params:
+                            # Convert params to query string
+                            query = '&'.join([f"{k}={v}" for k, v in request_params.items()])
+                            url = f"{url}?{query}"
+                            
+                        async with self.session.get(url) as response:
+                            response_json = await response.json()
+                else:
+                    # POST request
+                    url = f"{self.api_url}{method['url']}"
+                    timestamp = int(time.time() * 1000)
+                    request_params['timestamp'] = timestamp
                     
-                    # Standardize response format
-                    if isinstance(response, dict):
-                        if 'retCode' not in response:
-                            # Wrap raw response in standard format
-                            response = {
-                                'retCode': 0,
-                                'result': response
-                            }
-                    else:
-                        # Non-dict response, wrap it
-                        response = {
-                            'retCode': 0,
-                            'result': response
-                        }
+                    headers = self.generate_headers(request_params)
                     
-                    # Check if the response indicates a timestamp error
-                    if response.get('retCode') == 10002:
-                        # This is a timestamp error, update the offset and retry
-                        logger.warning(f"Timestamp synchronization issue: {response.get('retMsg')}")
-                        await self.update_time_offset()
-                        current_retry += 1
-                        last_error = response.get('retMsg')
-                        # Increase the recv_window for the next attempt
-                        kwargs['recv_window'] = kwargs.get('recv_window', 10000) + 5000
-                        continue
-                    
-                    # Return successful response
-                    return response
-                    
-                except ValueError as ve:
-                    # Re-raise validation errors
-                    raise ve
-                except Exception as e:
-                    # Log the specific error and continue to retry
-                    logger.error(f"API request failed: {method} - {str(e)}")
-                    raise e
+                    async with self.session.post(url, headers=headers, data=json.dumps(request_params)) as response:
+                        response_json = await response.json()
                 
+                # Check for specific error codes that should trigger retry
+                if isinstance(response_json, dict) and 'retCode' in response_json:
+                    retcode = response_json['retCode']
+                    
+                    # Special handling for different error types
+                    if retcode in self.RETRY_ERROR_CODES:
+                        # For critical system errors, use dedicated retry strategy
+                        if retcode == 10016:  # Internal system error
+                            if system_error_retry_count < max_system_error_retries:
+                                # Use longer backoff times for system errors, with increasing duration
+                                backoff_time = initial_backoff * (2 ** system_error_retry_count) + random.uniform(1, 3)
+                                logger.warning(f"Bybit system error (10016) for {method_name}. Applying special retry strategy in {backoff_time:.2f}s ({system_error_retry_count+1}/{max_system_error_retries})")
+                                await asyncio.sleep(backoff_time)
+                                system_error_retry_count += 1
+                                # Don't increment the regular retry counter, use separate counter
+                                continue
+                        # For rate limit errors, use specific backoff
+                        elif retcode in self.LIMIT_ERROR_CODES:
+                            if current_retry < max_retries:
+                                # Use longer backoff for rate limits
+                                backoff_time = max(initial_backoff * (2 ** current_retry), 3) + random.uniform(0, 1)
+                                logger.warning(f"Bybit rate limit error {retcode} for {method_name}. Retrying in {backoff_time:.2f}s ({current_retry+1}/{max_retries})")
+                                await asyncio.sleep(backoff_time)
+                                current_retry += 1
+                                continue
+                        # For other retryable errors
+                        elif current_retry < max_retries:
+                            backoff_time = initial_backoff * (2 ** current_retry) + random.uniform(0, 1)
+                            logger.warning(f"Bybit API error {retcode} for {method_name}. Retrying in {backoff_time:.2f}s ({current_retry+1}/{max_retries})")
+                            await asyncio.sleep(backoff_time)
+                            current_retry += 1
+                            continue
+                
+                return response_json
+                
+            except aiohttp.ClientConnectionError as e:
+                # Network connection errors should have aggressive retry
+                if current_retry < max_retries:
+                    backoff_time = initial_backoff * (2 ** current_retry) + random.uniform(0, 2)
+                    logger.error(f"Connection error for {method_name}: {str(e)}. Retrying in {backoff_time:.2f}s ({current_retry+1}/{max_retries})")
+                    await asyncio.sleep(backoff_time)
+                    current_retry += 1
+                else:
+                    logger.error(f"Connection error for {method_name} after {max_retries} retries: {str(e)}")
+                    return None
+                    
             except Exception as e:
-                logger.error(f"Error in API request {method}: {e}")
-                current_retry += 1
-                last_error = str(e)
-                await asyncio.sleep(1)  # Wait before retrying
+                if current_retry < max_retries:
+                    # Calculate backoff with exponential increase and jitter
+                    backoff_time = initial_backoff * (2 ** current_retry) + random.uniform(0, 1)
+                    logger.error(f"Error making request to {method_name}: {str(e)}. Retrying in {backoff_time:.2f}s ({current_retry+1}/{max_retries})")
+                    await asyncio.sleep(backoff_time)
+                    current_retry += 1
+                else:
+                    logger.error(f"Failed to make request to {method_name} after {max_retries} retries: {str(e)}")
+                    return None
         
-        # All retries failed
-        logger.error(f"Failed after {retries} retries. Last error: {last_error}")
-        return {
-            'retCode': -1, 
-            'retMsg': f"Failed after {retries} retries: {last_error}",
-            'result': None
-        }
-        
+        # If we get here, we've exhausted retries
+        if system_error_retry_count >= max_system_error_retries:
+            logger.error(f"Exhausted {max_system_error_retries} system error retries for {method_name}")
+        else:
+            logger.error(f"Exhausted {max_retries} retries for {method_name}")
+            
+        return None
+
     async def get_server_time(self):
-        """Get the server time from Bybit"""
+        """Get server time with improved error handling.
+        
+        Returns:
+            int: Server timestamp in milliseconds or None if failed
+        """
         try:
-            # Use the time endpoint directly
-            response = self.client.get_server_time()
-            if isinstance(response, dict) and 'retCode' in response:
-                return response
-            return {'retCode': 0, 'result': response}
+            response = await self.make_request('server_time', retry_count=3)
+            
+            if not response:
+                logger.warning("Empty response when requesting server time")
+                return None
+                
+            if isinstance(response, dict):
+                if 'retCode' in response and response['retCode'] != 0:
+                    error_code = response.get('retCode')
+                    error_msg = response.get('retMsg', 'Unknown error')
+                    
+                    error_desc = self.ERROR_CODES.get(error_code, "Unknown error")
+                    logger.error(f"Error getting server time: {error_msg} (Code: {error_code} - {error_desc})")
+                    return None
+                    
+                if 'result' in response and 'timeSecond' in response['result']:
+                    return int(response['result']['timeSecond']) * 1000
+                
+            logger.warning("Failed to extract server time from response")
+            return None
+            
         except Exception as e:
-            logger.error(f"Error getting server time: {e}")
-            return {'retCode': -1, 'retMsg': str(e)}
+            logger.error(f"Error getting server time: {str(e)}")
+            return None
 
     def _parse_tp_sl_setting(self, setting) -> float:
         """Parse take profit or stop loss setting that can be in percentage format or numeric
@@ -2019,3 +2142,200 @@ class BybitClient:
         except Exception as e:
             logger.error(f"Error parsing TP/SL setting '{setting}': {e}")
             return 0.0
+
+    async def get_balances(self, asset=None):
+        """Get account balances with improved error handling.
+        
+        Args:
+            asset: Optional specific asset to get balance for
+            
+        Returns:
+            dict: Account balances or empty dict if failed
+        """
+        try:
+            params = {"accountType": "UNIFIED"}
+            if self.category == "spot":
+                params["accountType"] = "SPOT"
+            elif self.category == "linear":
+                params["accountType"] = "CONTRACT"
+                
+            response = await self.make_request('get_wallet_balance', params=params, retry_count=3)
+                
+            if not response:
+                logger.warning("Empty response when requesting balances")
+                return {}
+                
+            # Check for API errors
+            if isinstance(response, dict) and 'retCode' in response:
+                if response['retCode'] != 0:
+                    error_code = response.get('retCode')
+                    error_msg = response.get('retMsg', 'Unknown error')
+                    
+                    error_desc = self.ERROR_CODES.get(error_code, "Unknown error")
+                    
+                    # Special handling for internal system errors
+                    if error_code == 10016:
+                        logger.error(f"Bybit internal system error (10016) when getting balances: {error_msg}")
+                        # Return empty dict to prevent downstream errors
+                        return {}
+                    else:
+                        logger.error(f"Error getting balances: {error_msg} (Code: {error_code} - {error_desc})")
+                        # Return empty dict to prevent downstream errors
+                        return {}
+                        
+            # If we have a specific asset requested, filter the response
+            if asset and response and 'retCode' in response and response['retCode'] == 0:
+                if 'result' in response and 'list' in response['result']:
+                    for account in response['result']['list']:
+                        if 'coin' in account:
+                            for coin_data in account['coin']:
+                                if coin_data.get('coin') == asset:
+                                    # Return the specific asset data
+                                    return {
+                                        asset: {
+                                            'free': float(coin_data.get('free', 0)),
+                                            'locked': float(coin_data.get('locked', 0)),
+                                            'total': float(coin_data.get('walletBalance', 0))
+                                        }
+                                    }
+            
+            # Process full balance response in a consistent format
+            if 'result' in response and 'list' in response['result']:
+                processed_balances = {}
+                
+                for account in response['result']['list']:
+                    if 'coin' in account:
+                        for coin_data in account['coin']:
+                            symbol = coin_data.get('coin')
+                            
+                            if symbol:
+                                processed_balances[symbol] = {
+                                    'free': float(coin_data.get('free', 0)),
+                                    'locked': float(coin_data.get('locked', 0)),
+                                    'total': float(coin_data.get('walletBalance', 0))
+                                }
+                
+                return processed_balances
+            
+            # If we couldn't process the response in a structured way, just return it as-is
+            return response
+            
+        except Exception as e:
+            logger.error(f"Error getting balances: {str(e)}")
+            return {}
+
+    async def get_ticker(self, symbol):
+        """Get current ticker information with robust error handling.
+        
+        Args:
+            symbol: Trading pair symbol (e.g., "BTCUSDT")
+            
+        Returns:
+            dict: Ticker information or empty dict if failed
+        """
+        try:
+            params = {"symbol": symbol, "category": self.category}
+            response = await self.make_request('get_tickers', params=params, retry_count=3)
+            
+            if not response:
+                logger.warning(f"Empty response when requesting ticker for {symbol}")
+                return {}
+                
+            if isinstance(response, dict):
+                if 'retCode' in response and response['retCode'] != 0:
+                    error_code = response.get('retCode')
+                    error_msg = response.get('retMsg', 'Unknown error')
+                    
+                    error_desc = self.ERROR_CODES.get(error_code, "Unknown error")
+                    
+                    # Special handling for system errors that often require more retries or backoff
+                    if error_code == 10016:
+                        logger.error(f"Bybit internal system error when getting ticker for {symbol}: {error_msg}")
+                        # Try an alternative approach if possible
+                        if symbol == "BTCUSDT" and self.category == "spot":
+                            # Fall back to a different endpoint or category
+                            logger.info(f"Trying alternative endpoint for {symbol}")
+                            alt_params = {"symbol": symbol, "category": "linear"}
+                            alt_response = await self.make_request('get_tickers', params=alt_params, retry_count=2)
+                            if alt_response and 'retCode' in alt_response and alt_response['retCode'] == 0:
+                                logger.info(f"Successfully retrieved {symbol} ticker via alternative endpoint")
+                                return self._extract_ticker_data(alt_response)
+                    else:
+                        logger.error(f"Error getting ticker for {symbol}: {error_msg} (Code: {error_code} - {error_desc})")
+                    
+                    # Return empty dict to avoid downstream errors
+                    return {}
+                    
+                return self._extract_ticker_data(response)
+            
+            # If we couldn't extract data properly, return empty dict
+            logger.warning(f"Failed to extract ticker data for {symbol}")
+            return {}
+            
+        except Exception as e:
+            logger.error(f"Error getting ticker for {symbol}: {str(e)}")
+            return {}
+            
+    def _extract_ticker_data(self, response):
+        """Extract ticker data from response.
+        
+        Args:
+            response: API response dictionary
+            
+        Returns:
+            dict: Extracted ticker data or empty dict
+        """
+        try:
+            if 'result' in response and 'list' in response['result']:
+                ticker_list = response['result']['list']
+                if ticker_list and len(ticker_list) > 0:
+                    return ticker_list[0]
+            return {}
+        except Exception as e:
+            logger.error(f"Error extracting ticker data: {str(e)}")
+            return {}
+
+    def create_session(self):
+        """Create an aiohttp session for API requests.
+        
+        Returns:
+            aiohttp.ClientSession: The created session
+        """
+        headers = {
+            'Content-Type': 'application/json',
+            'User-Agent': 'Trade-a-saurus-Rex/1.0'
+        }
+        
+        return aiohttp.ClientSession(headers=headers)
+        
+    def generate_headers(self, params):
+        """Generate authentication headers for API requests.
+        
+        Args:
+            params: The request parameters
+            
+        Returns:
+            dict: Headers with authentication information
+        """
+        # Create a sorted query string
+        query_string = '&'.join([f"{k}={v}" for k, v in sorted(params.items())])
+        
+        # Generate HMAC signature
+        timestamp = str(int(time.time() * 1000))
+        payload = timestamp + self.api_key + str(params.get('recv_window', 5000)) + query_string
+        signature = hmac.new(
+            bytes(self.api_secret, 'utf-8'),
+            msg=bytes(payload, 'utf-8'),
+            digestmod=hashlib.sha256
+        ).hexdigest()
+        
+        # Create headers
+        headers = {
+            'X-BAPI-SIGN': signature,
+            'X-BAPI-API-KEY': self.api_key,
+            'X-BAPI-TIMESTAMP': timestamp,
+            'X-BAPI-RECV-WINDOW': str(params.get('recv_window', 5000)),
+            'Content-Type': 'application/json'
+        }
+        
+        return headers
