@@ -991,22 +991,12 @@ Type /help for detailed command information.
                     # Get current price using the appropriate method for the client type
                     current_price = None
                     
-                    if client_type == 'BinanceClient':
-                        try:
-                            ticker = await self.binance_client.client.get_symbol_ticker(symbol=symbol)
-                            current_price = float(ticker['price'])
-                        except Exception as e:
-                            logging.error(f"Error getting price for {symbol} with BinanceClient: {e}")
-                            current_price = await self.binance_client.get_current_price(symbol)
-                    else:  # BybitClient or other
-                        try:
-                            current_price = await self.binance_client.get_current_price(symbol)
-                            if hasattr(current_price, 'is_nan') and current_price.is_nan():
-                                current_price = None
-                            else:
-                                current_price = float(current_price)
-                        except Exception as e:
-                            logging.error(f"Error getting price for {symbol}: {e}")
+                    try:
+                        price = await self.binance_client.get_current_price(symbol)
+                        if price is not None:
+                            current_price = float(price)
+                    except Exception as e:
+                        logging.error(f"Error getting price for {symbol}: {e}")
                     
                     # Calculate price change if reference price exists
                     if ref_price and current_price:
@@ -1383,8 +1373,10 @@ Type /help for detailed command information.
                     continue
 
                 # Get current price
-                ticker = await self.binance_client.client.get_symbol_ticker(symbol=symbol)
-                current_price = Decimal(ticker['price'])
+                price = await self.binance_client.get_current_price(symbol)
+                if price is None:
+                    continue
+                current_price = Decimal(price)
                 
                 # Calculate profits
                 profit_data = self.mongo_client.calculate_profit_loss(position, current_price)
@@ -3263,8 +3255,10 @@ To change this setting:
                     
                 try:
                     # Get current price for the symbol
-                    ticker = await self.binance_client.client.get_symbol_ticker(symbol=symbol)
-                    current_price = float(ticker['price'])
+                    price = await self.binance_client.get_current_price(symbol)
+                    if price is None:
+                        continue
+                    current_price = float(price)
                     
                     # Calculate current value of the position
                     position_value = float(position['total_quantity']) * current_price
