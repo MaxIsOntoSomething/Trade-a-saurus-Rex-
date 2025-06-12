@@ -107,6 +107,8 @@ This bot watches for significant price drops in cryptocurrencies and automatical
 - **Command Improvements**: Added `/resetthresholds` command for manual reset
 - **Lower Entries Protection**: Added protection to prevent increasing average entry price with commands to control it
 - **TP/SL Management**: Added Take Profit and Stop Loss settings with Telegram commands
+- **Unified Price Retrieval**: Telegram bot now uses a common method to fetch prices from
+  either Binance or Bybit, fixing profit and summary errors when switching exchanges
 
 ## Portfolio Analysis
 
