@@ -348,18 +348,60 @@ class BinanceClient:
             await self.client.close_connection()
             
     async def check_timeframe_reset(self, timeframe: TimeFrame) -> bool:
-        """Check if a timeframe needs to be reset"""
+        """Check if a timeframe needs to be reset.
+
+        The original implementation only performed the reset if the bot was
+        running during the first few minutes of a new period.  If the bot was
+        offline during that window the thresholds would never reset.  To make
+        the logic more robust we also compare the current time with the last
+        reset time and reset if the expected period has elapsed.
+        """
         try:
             current_time = datetime.utcnow()
+            last_reset = self.last_reset.get(timeframe)
+
             reset_needed = False
-            
-            # Determine if reset is needed based on timeframe
+
+            # Determine if reset is needed based on the calendar and elapsed time
             if timeframe == TimeFrame.DAILY:
-                reset_needed = current_time.hour == 0 and current_time.minute < 15
+                scheduled = current_time.hour == 0 and current_time.minute < 15
+                overdue = (
+                    last_reset is None
+                    or (current_time - last_reset) >= TIMEFRAME_INTERVALS['DAILY']
+                ) and (last_reset is None or current_time.date() != last_reset.date())
+                reset_needed = scheduled or overdue
+
             elif timeframe == TimeFrame.WEEKLY:
-                reset_needed = current_time.weekday() == 0 and current_time.hour == 0 and current_time.minute < 15
+                scheduled = (
+                    current_time.weekday() == 0
+                    and current_time.hour == 0
+                    and current_time.minute < 15
+                )
+                overdue = False
+                if last_reset is None:
+                    overdue = True
+                else:
+                    # Check if more than a week has passed or week number changed
+                    overdue = (current_time - last_reset) >= TIMEFRAME_INTERVALS['WEEKLY'] or (
+                        current_time.isocalendar()[1] != last_reset.isocalendar()[1]
+                    )
+                reset_needed = scheduled or overdue
+
             elif timeframe == TimeFrame.MONTHLY:
-                reset_needed = current_time.day == 1 and current_time.hour == 0 and current_time.minute < 15
+                scheduled = (
+                    current_time.day == 1
+                    and current_time.hour == 0
+                    and current_time.minute < 15
+                )
+                overdue = False
+                if last_reset is None:
+                    overdue = True
+                else:
+                    overdue = (
+                        current_time.month != last_reset.month
+                        or current_time.year != last_reset.year
+                    )
+                reset_needed = scheduled or overdue
             
             if reset_needed:
                 logger.info(f"Resetting {timeframe.value} timeframe")
@@ -367,9 +409,12 @@ class BinanceClient:
                 # Reset thresholds in database
                 if self.mongo_client:
                     await self.mongo_client.reset_timeframe_thresholds(timeframe.value)
-                
+
                 # Update reference timestamps
                 self.reference_timestamps[timeframe] = int(current_time.timestamp() * 1000)
+
+                # Update last reset marker so we don't reset again this period
+                self.last_reset[timeframe] = current_time
                 
                 # Update reference prices for all trading pairs
                 symbols = self.config['trading'].get('pairs', [])
