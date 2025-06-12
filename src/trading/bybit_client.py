@@ -354,38 +354,62 @@ class BybitClient:
         logger.info("Bybit client connections closed")
             
     async def check_timeframe_reset(self, timeframe: TimeFrame) -> bool:
-        """Check if a timeframe needs to be reset and handle the reset if needed"""
+        """Check if a timeframe needs to be reset and handle the reset if needed."""
         try:
             logger.debug(f"Checking {timeframe.value} timeframe reset")
-            
-            # Get the current time in UTC
+
             current_time = datetime.utcnow()
-            
-            # Check if this timeframe needs to be reset based on current time
+            last_reset = self.last_reset.get(timeframe)
+
+            # Determine if this timeframe should be reset
             if timeframe == TimeFrame.DAILY:
-                # Reset at the beginning of each day
-                reset_needed = current_time.hour == 0 and current_time.minute < 5
-                
+                scheduled = current_time.hour == 0 and current_time.minute < 5
+                overdue = (
+                    last_reset is None
+                    or (current_time - last_reset) >= TIMEFRAME_INTERVALS['DAILY']
+                ) and (last_reset is None or current_time.date() != last_reset.date())
+                reset_needed = scheduled or overdue
+
             elif timeframe == TimeFrame.WEEKLY:
-                # Reset on Monday (weekday 0) at the beginning of the day
-                reset_needed = current_time.weekday() == 0 and current_time.hour == 0 and current_time.minute < 5
-                
+                scheduled = (
+                    current_time.weekday() == 0
+                    and current_time.hour == 0
+                    and current_time.minute < 5
+                )
+                if last_reset is None:
+                    overdue = True
+                else:
+                    overdue = (current_time - last_reset) >= TIMEFRAME_INTERVALS['WEEKLY'] or (
+                        current_time.isocalendar()[1] != last_reset.isocalendar()[1]
+                    )
+                reset_needed = scheduled or overdue
+
             elif timeframe == TimeFrame.MONTHLY:
-                # Reset on the first day of the month at the beginning of the day
-                reset_needed = current_time.day == 1 and current_time.hour == 0 and current_time.minute < 5
-                
+                scheduled = current_time.day == 1 and current_time.hour == 0 and current_time.minute < 5
+                if last_reset is None:
+                    overdue = True
+                else:
+                    overdue = (
+                        current_time.month != last_reset.month
+                        or current_time.year != last_reset.year
+                    )
+                reset_needed = scheduled or overdue
+
             else:
                 logger.error(f"Unknown timeframe: {timeframe}")
                 return False
                 
             if reset_needed:
                 logger.info(f"Resetting {timeframe.value} timeframe thresholds")
-                
+
                 # Clear triggered thresholds for this timeframe
                 await self.reset_timeframe_thresholds(timeframe.value)
-                
+
                 # Update reference timestamps
                 self.reference_timestamps[timeframe] = int(current_time.timestamp() * 1000)
+
+                # Record last reset time so future checks know this period was processed
+                self.last_reset[timeframe] = current_time
                 
                 # Update reference prices
                 symbols = self.config['trading'].get('pairs', [])
