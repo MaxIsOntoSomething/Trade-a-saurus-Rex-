@@ -22,6 +22,17 @@
         },
         "use_testnet": true
     },
+    "hyperliquid": {
+        "spot_testnet": {
+            "api_key": "your_hyperliquid_testnet_api_key",
+            "api_secret": "your_hyperliquid_testnet_api_secret"
+        },
+        "mainnet": {
+            "api_key": "your_hyperliquid_mainnet_api_key",
+            "api_secret": "your_hyperliquid_mainnet_api_secret"
+        },
+        "use_testnet": true
+    },
     "telegram": {
         "bot_token": "bot_token",
         "allowed_users": ["user_id"]
