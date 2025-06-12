@@ -14,7 +14,8 @@ if sys.platform == 'win32':
 
 from dotenv import load_dotenv
 from src.trading.binance_client import BinanceClient
-from src.trading.bybit_client import BybitClient  # Import the new Bybit client
+from src.trading.bybit_client import BybitClient  # Import the Bybit client
+from src.trading.hyperliquid_client import HyperliquidClient
 from src.database.mongo_client import MongoClient
 from src.telegram.bot import TelegramBot, DINO_ASCII
 from src.trading.order_manager import OrderManager
@@ -29,11 +30,13 @@ def validate_config(config: dict) -> bool:
     """Validate configuration parameters with updated structure"""
     # Check for exchange_type field
     if 'exchange_type' not in config:
-        logger.error("Missing exchange_type in config. Must be either 'binance' or 'bybit'")
+        logger.error("Missing exchange_type in config. Must be either 'binance', 'bybit', or 'hyperliquid'")
         return False
-        
-    if config['exchange_type'] not in ['binance', 'bybit']:
-        logger.error(f"Invalid exchange_type: {config['exchange_type']}. Must be either 'binance' or 'bybit'")
+
+    if config['exchange_type'] not in ['binance', 'bybit', 'hyperliquid']:
+        logger.error(
+            f"Invalid exchange_type: {config['exchange_type']}. Must be 'binance', 'bybit', or 'hyperliquid'"
+        )
         return False
     
     # Validate fields based on selected exchange
@@ -78,8 +81,10 @@ def load_config_from_env() -> dict:
     """Load configuration from environment variables with support for both API sets"""
     # Get the exchange type
     exchange_type = os.getenv('EXCHANGE_TYPE', 'binance').lower()
-    if exchange_type not in ['binance', 'bybit']:
-        logger.warning(f"Invalid EXCHANGE_TYPE: {exchange_type}. Defaulting to 'binance'")
+    if exchange_type not in ['binance', 'bybit', 'hyperliquid']:
+        logger.warning(
+            f"Invalid EXCHANGE_TYPE: {exchange_type}. Defaulting to 'binance'"
+        )
         exchange_type = 'binance'
     
     # Load reserve balance with proper parsing
@@ -212,6 +217,17 @@ def load_config_from_env() -> dict:
                 'api_secret': os.getenv('BYBIT_MAINNET_API_SECRET')
             },
             'use_testnet': os.getenv('BYBIT_USE_TESTNET', 'true').lower() == 'true'
+        },
+        'hyperliquid': {
+            'spot_testnet': {
+                'api_key': os.getenv('HYPERLIQUID_SPOT_TESTNET_API_KEY'),
+                'api_secret': os.getenv('HYPERLIQUID_SPOT_TESTNET_API_SECRET')
+            },
+            'mainnet': {
+                'api_key': os.getenv('HYPERLIQUID_MAINNET_API_KEY'),
+                'api_secret': os.getenv('HYPERLIQUID_MAINNET_API_SECRET')
+            },
+            'use_testnet': os.getenv('HYPERLIQUID_USE_TESTNET', 'true').lower() == 'true'
         },
         'telegram': {
             'bot_token': os.getenv('TELEGRAM_BOT_TOKEN'),
@@ -437,6 +453,14 @@ async def initialize_services(config):
             exchange_client = BybitClient(
                 api_key=config['bybit'][api_env]['api_key'],
                 api_secret=config['bybit'][api_env]['api_secret'],
+                testnet=use_testnet,
+                mongo_client=mongo_client,
+                config=config
+            )
+        elif exchange_type == 'hyperliquid':
+            exchange_client = HyperliquidClient(
+                api_key=config['hyperliquid'][api_env]['api_key'],
+                api_secret=config['hyperliquid'][api_env]['api_secret'],
                 testnet=use_testnet,
                 mongo_client=mongo_client,
                 config=config

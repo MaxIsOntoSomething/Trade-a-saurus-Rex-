@@ -33,7 +33,7 @@
 
 # Trade-a-saurus Rex
 
-A personal hobby project - An automated cryptocurrency trading bot for Binance that monitors price drops across multiple timeframes.
+A personal hobby project - An automated cryptocurrency trading bot for Binance, Bybit and Hyperliquid that monitors price drops across multiple timeframes.
 
 ## 🦖 What is Trade-a-saurus Rex?
 
@@ -62,7 +62,7 @@ This bot watches for significant price drops in cryptocurrencies and automatical
 
 - Python 3.7+
 - MongoDB
-- Binance account
+- Binance, Bybit or Hyperliquid account
 - Telegram bot token
 
 ## Quick Start
@@ -108,7 +108,7 @@ This bot watches for significant price drops in cryptocurrencies and automatical
 - **Lower Entries Protection**: Added protection to prevent increasing average entry price with commands to control it
 - **TP/SL Management**: Added Take Profit and Stop Loss settings with Telegram commands
 - **Unified Price Retrieval**: Telegram bot now uses a common method to fetch prices from
-  either Binance or Bybit, fixing profit and summary errors when switching exchanges
+  either Binance, Bybit or Hyperliquid, fixing profit and summary errors when switching exchanges
 
 ## Portfolio Analysis
 

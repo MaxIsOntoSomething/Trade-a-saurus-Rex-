@@ -9,11 +9,12 @@ from decimal import Decimal  # Add the missing Decimal import
 from ..types.models import Order, OrderStatus, TimeFrame, TPSLStatus, OrderType
 from ..trading.binance_client import BinanceClient
 from ..trading.bybit_client import BybitClient
+from ..trading.hyperliquid_client import HyperliquidClient
 from ..database.mongo_client import MongoClient
 from ..telegram.bot import TelegramBot
 
 # Type alias for exchange clients
-ExchangeClient = Union[BinanceClient, BybitClient]
+ExchangeClient = Union[BinanceClient, BybitClient, HyperliquidClient]
 
 logger = logging.getLogger(__name__)
 
